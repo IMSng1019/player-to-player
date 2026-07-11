@@ -60,6 +60,14 @@ public final class P2PPaths {
     }
 
     /**
+     * [中转服务端] 从上级服务端同步来的环境文件缓存目录（Phase 2）。
+     * 中转端以此目录为根复用 EnvSyncServerHandlers 向客户端分发环境文件。
+     */
+    public Path proxyEnvDir() {
+        return root.resolve("proxy-environment");
+    }
+
+    /**
      * 世界文件夹：{@code root/<IP>+<世界名>}。
      * 规范：当加入世界时，以 IP 地址+世界名称检测是否有相应的文件夹，
      * 之后该世界的一切文件读写都基于该文件夹。

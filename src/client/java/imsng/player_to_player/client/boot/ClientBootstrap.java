@@ -5,8 +5,10 @@ import imsng.player_to_player.compute.ComputeScore;
 import imsng.player_to_player.compute.ComputeScoreProvider;
 import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.core.NodeContext;
+import imsng.player_to_player.group.GroupRuntime;
 import imsng.player_to_player.p2p.NatDetector;
 import imsng.player_to_player.p2p.NatInfo;
+import imsng.player_to_player.util.ThreadPools;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -106,6 +108,15 @@ public final class ClientBootstrap {
         // ---------------------------------------------------------------
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> WorldSession.onJoin(client));
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> WorldSession.onLeave(client));
+
+        // ---------------------------------------------------------------
+        // d. Phase 2：主客户端退出本地组世界时，DISCONNECT 事件先于集成服务端
+        //    完全停止，而停服 saveAll 的最终区块上行必须赶在控制连接关闭之前 ——
+        //    onLeave 对此延迟拆除，由 GroupRuntime 在 SERVER_STOPPED（detach）后
+        //    经本回调补拆。回调在服务器线程触发，拆除转 io 线程执行。
+        // ---------------------------------------------------------------
+        GroupRuntime.setStopListener(() ->
+                ThreadPools.io().execute(WorldSession::teardownSession));
 
         LOGGER.info("客户端引导完成：算力/NAT 探测已在后台进行，世界加入钩子已注册");
     }

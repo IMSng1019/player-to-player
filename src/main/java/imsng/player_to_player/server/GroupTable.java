@@ -1,0 +1,141 @@
+package imsng.player_to_player.server;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * 组客户端表（服务端，Phase 2；规范"组客户端：一个主客户端及其所属的副客户端"）。
+ * <p>
+ * 维护 组 → 主客户端 + 成员 的权威视图，供角色指派（{@link RoleAssignHandler}）
+ * 与断连清理使用。<b>Phase 1/2 约定 groupId == 主客户端 clientId</b>（与
+ * {@code NodeContext.groupId}、{@code ChunkRegistry.releaseAll} 的口径一致）；
+ * 表结构仍显式存 primaryClientId 字段，为 Phase 3 合并时"主客户端迁移、
+ * groupId 延续"预留演化空间。
+ * <p>
+ * 线程模型：写路径以内部锁串行化（组创建/解散/成员迁移是复合操作），
+ * 读走 ConcurrentHashMap 无锁。
+ */
+public final class GroupTable {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger("player_to_player/group-table");
+
+    /** 组信息：主客户端 + 全部成员（含主客户端自身）。 */
+    public record GroupInfo(UUID groupId, UUID primaryClientId, Set<UUID> members) {
+    }
+
+    /** groupId → 组信息。 */
+    private final Map<UUID, GroupInfo> groups = new ConcurrentHashMap<>();
+    /** clientId → 所属 groupId（反向索引）。 */
+    private final Map<UUID, UUID> memberToGroup = new ConcurrentHashMap<>();
+
+    /** 写路径互斥锁。 */
+    private final Object lock = new Object();
+
+    /**
+     * 创建一个以该客户端为主客户端的新组（groupId == primaryClientId）。
+     * 该客户端若已在其他组中，先移出（重复 ROLE_REQUEST / 快速重进的防御）。
+     */
+    public GroupInfo createGroup(UUID primaryClientId) {
+        synchronized (lock) {
+            removeClientLocked(primaryClientId);
+            GroupInfo info = new GroupInfo(primaryClientId, primaryClientId,
+                    ConcurrentHashMap.newKeySet());
+            info.members().add(primaryClientId);
+            groups.put(primaryClientId, info);
+            memberToGroup.put(primaryClientId, primaryClientId);
+            LOGGER.info("组已创建: groupId={} (主客户端)", primaryClientId);
+            return info;
+        }
+    }
+
+    /**
+     * 把客户端加入既有组作为副客户端。
+     *
+     * @return false = 组不存在（调用方应改走建组路径）
+     */
+    public boolean addSecondary(UUID groupId, UUID clientId) {
+        synchronized (lock) {
+            GroupInfo info = groups.get(groupId);
+            if (info == null) {
+                return false;
+            }
+            removeClientLocked(clientId);
+            // removeClientLocked 可能解散了 clientId 自己当主的空组，重查目标组仍在
+            info = groups.get(groupId);
+            if (info == null) {
+                return false;
+            }
+            info.members().add(clientId);
+            memberToGroup.put(clientId, groupId);
+            LOGGER.info("副客户端 {} 加入组 {}", clientId, groupId);
+            return true;
+        }
+    }
+
+    /**
+     * 客户端离线/退出时的清理：副客户端只摘成员；主客户端离线则整组解散
+     * （Phase 2 无迁移 —— 组内副客户端的隧道会随主客户端下线自然断开，
+     * 它们重新加入世界时走全新的角色指派；Phase 3 在此处接入算力再分配）。
+     *
+     * @return 若该客户端是主客户端，返回被解散的组 ID；否则返回 null
+     */
+    public UUID removeClient(UUID clientId) {
+        synchronized (lock) {
+            return removeClientLocked(clientId);
+        }
+    }
+
+    /** 锁内清理实现（见 {@link #removeClient}）。 */
+    private UUID removeClientLocked(UUID clientId) {
+        UUID groupId = memberToGroup.remove(clientId);
+        if (groupId == null) {
+            return null;
+        }
+        GroupInfo info = groups.get(groupId);
+        if (info == null) {
+            return null;
+        }
+        if (info.primaryClientId().equals(clientId)) {
+            // 主客户端离线：整组解散，成员反向索引一并清理
+            groups.remove(groupId);
+            for (UUID member : info.members()) {
+                memberToGroup.remove(member, groupId);
+            }
+            LOGGER.info("组 {} 已解散（主客户端 {} 离线，{} 名成员）",
+                    groupId, clientId, info.members().size());
+            return groupId;
+        }
+        info.members().remove(clientId);
+        LOGGER.info("副客户端 {} 离开组 {}", clientId, groupId);
+        return null;
+    }
+
+    /** 查客户端所属组；无归属返回 null。 */
+    public UUID groupOf(UUID clientId) {
+        return memberToGroup.get(clientId);
+    }
+
+    /** 查组的主客户端；组不存在返回 null。 */
+    public UUID primaryOf(UUID groupId) {
+        GroupInfo info = groups.get(groupId);
+        return info != null ? info.primaryClientId() : null;
+    }
+
+    /** 组是否存在。 */
+    public boolean exists(UUID groupId) {
+        return groups.containsKey(groupId);
+    }
+
+    /** 清空全表（服务停止时调用）。 */
+    public void clear() {
+        synchronized (lock) {
+            groups.clear();
+            memberToGroup.clear();
+        }
+    }
+}

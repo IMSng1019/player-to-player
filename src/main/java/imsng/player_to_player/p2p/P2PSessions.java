@@ -16,8 +16,11 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.net.UnknownHostException;
+import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * 客户端侧 P2P 会话管理（DESIGN.md 第 7 节"打洞流程"，规范"预连接"）。
@@ -32,11 +35,12 @@ import java.util.concurrent.ConcurrentHashMap;
  *       （优先复用 NAT 探测遗留的 socket 命中已有映射，其次按
  *       {@code NodeContext.natInfo().localPort} 新建）；</li>
  *   <li>结果以 {@link MessageType#P2P_RESULT}（sessionId, success）回报服务端；</li>
- *   <li>成功的通道存入静态会话表，上层（预同步/副客户端隧道，Phase 2+）
- *       按 sessionId 领取。</li>
+ *   <li>成功的通道存入静态会话表，上层（副客户端隧道 / Phase 3 预同步）
+ *       经 {@link #addListener 会话监听器} 或 {@link #get} 领取。</li>
  * </ol>
- * 会话表也接收 {@link RelayClient}（中转降级建立后由降级发起方存入），
- * 上层取用时对直连/中转透明。
+ * <b>中转降级（Phase 2）</b>：打洞失败时服务端撮合器向双方下发
+ * {@link MessageType#P2P_USE_RELAY}，本类经 {@link RelayConnector} 建立
+ * {@link RelayClient} 中转会话（同 sessionId）——上层拿到的传输对直连/中转透明。
  */
 public final class P2PSessions {
 
@@ -48,17 +52,40 @@ public final class P2PSessions {
     /** 活跃会话表：sessionId → 传输（P2PChannel 直连或 RelayClient 中转）。 */
     private static final Map<String, P2PTransport> SESSIONS = new ConcurrentHashMap<>();
 
+    /** sessionId → 对端 clientId（EXCHANGE/USE_RELAY 均携带；监听器回调用）。 */
+    private static final Map<String, UUID> SESSION_PEERS = new ConcurrentHashMap<>();
+
+    /** 会话就绪监听器（主客户端组宿主、副客户端加入器挂接）。 */
+    private static final List<SessionListener> LISTENERS = new CopyOnWriteArrayList<>();
+
+    /** 会话就绪回调：直连打洞成功或中转会话建立时触发（io/Netty 线程，不得阻塞）。 */
+    @FunctionalInterface
+    public interface SessionListener {
+        void onSessionReady(String sessionId, UUID peerClientId, P2PTransport transport);
+    }
+
     private P2PSessions() {
     }
 
     /**
-     * 注册 P2P_ENDPOINT_EXCHANGE 处理器。
+     * 注册 P2P 撮合相关处理器（P2P_ENDPOINT_EXCHANGE 与 P2P_USE_RELAY）。
      *
      * @param reg        处理器注册表（ControlClient）
      * @param serverConn 与服务端/中转端的控制连接（P2P_RESULT 从这里回报）
      */
     public static void register(HandlerRegistry reg, ControlConnection serverConn) {
         reg.on(MessageType.P2P_ENDPOINT_EXCHANGE, (conn, msg) -> handleEndpointExchange(serverConn, msg));
+        reg.on(MessageType.P2P_USE_RELAY, (conn, msg) -> handleUseRelay(msg));
+    }
+
+    /** 挂接会话就绪监听器（重复挂接自负；回调线程见 {@link SessionListener}）。 */
+    public static void addListener(SessionListener listener) {
+        LISTENERS.add(listener);
+    }
+
+    /** 摘除会话就绪监听器。 */
+    public static void removeListener(SessionListener listener) {
+        LISTENERS.remove(listener);
     }
 
     /** 按 sessionId 取活跃传输；不存在或已关闭返回 null（已关闭的顺手清出表）。 */
@@ -107,8 +134,29 @@ public final class P2PSessions {
             count++;
         }
         SESSIONS.clear();
+        SESSION_PEERS.clear();
+        LISTENERS.clear();
         if (count > 0) {
             LOGGER.info("已关闭全部 P2P 会话: {} 个", count);
+        }
+    }
+
+    /** 查询会话的对端 clientId；未知返回 null。 */
+    public static UUID peerOf(String sessionId) {
+        return SESSION_PEERS.get(sessionId);
+    }
+
+    /** 会话就绪：登记对端并通知全部监听器（监听器异常互不影响）。 */
+    private static void fireSessionReady(String sessionId, UUID peerClientId, P2PTransport transport) {
+        if (peerClientId != null) {
+            SESSION_PEERS.put(sessionId, peerClientId);
+        }
+        for (SessionListener listener : LISTENERS) {
+            try {
+                listener.onSessionReady(sessionId, peerClientId, transport);
+            } catch (Exception e) {
+                LOGGER.error("会话监听器异常: session={}", sessionId, e);
+            }
         }
     }
 
@@ -124,6 +172,7 @@ public final class P2PSessions {
         String peerIp = JsonUtil.getString(json, "ip", "");
         int peerPort = JsonUtil.getInt(json, "port", 0);
         boolean initiator = JsonUtil.getBoolean(json, "initiator", false);
+        UUID peerClientId = parseUuid(JsonUtil.getString(json, "peerClientId", ""));
 
         // 入站字段校验（不可信数据）：非法直接回报失败，不让后续逻辑带病跑
         if (sessionId.isEmpty() || sessionId.length() > MAX_SESSION_ID_CHARS) {
@@ -164,6 +213,8 @@ public final class P2PSessions {
                 P2PChannel channel = HolePuncher.punch(socket, peerEndpoint, sessionId, initiator);
                 put(sessionId, channel); // 通道已接管 socket 所有权
                 success = true;
+                // 会话就绪通知：组宿主/加入器据此启动隧道（Phase 2）
+                fireSessionReady(sessionId, peerClientId, channel);
             } catch (UnknownHostException e) {
                 LOGGER.warn("会话 {} 对端地址解析失败: {}", sessionId, peerIp);
             } catch (SocketException e) {
@@ -201,6 +252,54 @@ public final class P2PSessions {
             }
         }
         return new DatagramSocket(0);
+    }
+
+    /**
+     * 处理 P2P_USE_RELAY（Phase 2 中转降级；Netty 事件循环 —— 建连阻塞逻辑转 io 线程）。
+     * <p>
+     * 服务端在打洞会话至少一方回报失败且中转可用时向<b>双方</b>下发本消息。
+     * 双方各自经 {@link RelayConnector} 的共享中转连接建立 {@link RelayClient}
+     * 会话（同 sessionId），随后与直连路径一样触发会话就绪通知。
+     * relayAddress 空串 = 服务端兼任中转（RelayConnector 已在 WorldSession
+     * 握手后按 HELLO_ACK 配置好端点，这里的字段仅作覆盖）。
+     */
+    private static void handleUseRelay(ControlMessage msg) {
+        JsonObject json = msg.json();
+        String sessionId = JsonUtil.getString(json, "sessionId", "");
+        UUID peerClientId = parseUuid(JsonUtil.getString(json, "peerClientId", ""));
+        if (sessionId.isEmpty() || sessionId.length() > MAX_SESSION_ID_CHARS || peerClientId == null) {
+            LOGGER.warn("P2P_USE_RELAY 字段非法，忽略");
+            return;
+        }
+        String relayAddress = JsonUtil.getString(json, "relayAddress", "");
+        int relayPort = JsonUtil.getInt(json, "relayPort", 0);
+        if (!relayAddress.isEmpty() && relayPort > 0 && relayPort <= 0xFFFF) {
+            RelayConnector.configure(relayAddress, relayPort); // 服务端指示的端点优先
+        }
+        ThreadPools.io().execute(() -> {
+            try {
+                ControlConnection relayConn = RelayConnector.getOrConnect();
+                UUID selfId = NodeContext.get().clientId();
+                RelayClient transport = new RelayClient(relayConn, selfId, peerClientId, sessionId);
+                put(sessionId, transport);
+                fireSessionReady(sessionId, peerClientId, transport);
+                LOGGER.info("会话 {} 已降级为中转传输 (对端 {})", sessionId, peerClientId);
+            } catch (Exception e) {
+                LOGGER.warn("会话 {} 中转降级失败: {}", sessionId, e.toString());
+            }
+        });
+    }
+
+    /** 防御性 UUID 解析：null / 格式非法返回 null 而非抛异常。 */
+    private static UUID parseUuid(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return UUID.fromString(raw);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
     }
 
     /** 回报打洞结果（P2P_RESULT），服务端据此决定是否启用中转降级。 */

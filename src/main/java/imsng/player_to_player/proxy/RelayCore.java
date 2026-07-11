@@ -49,10 +49,23 @@ public final class RelayCore {
     private volatile ControlServer server;
 
     /**
+     * 额外处理器挂接钩子（start 前设置，Phase 2 中转端环境分发用）：
+     * 中转端把 EnvSyncServerHandlers 挂到同一个 ControlServer 上 ——
+     * 客户端经 RELAY_REGISTER 登记身份（过未鉴权白名单门）后即可在
+     * 同一连接上发起 ENV_MANIFEST_REQUEST / ENV_FILE_REQUEST。
+     */
+    private volatile java.util.function.Consumer<ControlServer> extraHandlers;
+
+    /**
      * @param port 中转监听端口（{@code GlobalConfig.relayPort}，默认 25581）
      */
     public RelayCore(int port) {
         this.port = port;
+    }
+
+    /** 设置额外处理器挂接钩子（必须在 {@link #start} 之前调用才生效）。 */
+    public void setExtraHandlers(java.util.function.Consumer<ControlServer> hook) {
+        this.extraHandlers = hook;
     }
 
     /** 启动中转监听（幂等：已启动则忽略）。 */
@@ -63,6 +76,11 @@ public final class RelayCore {
         ControlServer relay = new ControlServer(port);
         relay.on(MessageType.RELAY_REGISTER, this::handleRegister);
         relay.on(MessageType.RELAY_FORWARD, this::handleForward);
+        // 额外处理器（Phase 2：中转端环境分发把 ENV_* 处理器挂进来）
+        java.util.function.Consumer<ControlServer> hook = extraHandlers;
+        if (hook != null) {
+            hook.accept(relay);
+        }
         // 断连清映射：仅当映射仍指向该连接时移除（防快速重连后误删新连接）
         relay.onDisconnect(conn -> {
             UUID id = conn.peerId();

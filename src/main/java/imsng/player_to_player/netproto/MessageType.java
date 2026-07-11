@@ -70,6 +70,12 @@ public enum MessageType {
     ROLE_ASSIGN(31),
     /** C→S 玩家位置更新（玩家表；json: uuid, dimension, x, y, z）。 */
     PLAYER_POS_UPDATE(32),
+    /**
+     * C→S 角色指派申请（Phase 2）：客户端环境同步完成、准备进入世界时发出。
+     * 服务端按玩家存档位置查区块注册表/组表决定主副角色，以 {@link #ROLE_ASSIGN}
+     * 作为应答（携带 _rid）。
+     */
+    ROLE_REQUEST(33),
 
     // ---------------------------------------------------------- 打洞协助 40-49
     /** C→S 请求与目标组的主客户端建立 P2P（json: targetGroupId 或 targetClientId）。 */
@@ -78,6 +84,13 @@ public enum MessageType {
     P2P_ENDPOINT_EXCHANGE(41),
     /** C→S 打洞结果回报（json: sessionId, success），失败时服务端决定是否启用中转。 */
     P2P_RESULT(42),
+    /**
+     * S→C 中转降级指示（Phase 2）：某次打洞会话至少一方回报失败且中转可用时，
+     * 服务端向<b>双方</b>下发本消息（json: sessionId, peerClientId, relayAddress,
+     * relayPort；relayAddress 空串 = 复用服务端主机地址）。双方各自与中转端建立
+     * {@code RelayClient} 会话（同 sessionId），上层拿到的传输对直连/中转透明。
+     */
+    P2P_USE_RELAY(43),
 
     // -------------------------------------------------------------- 中转 50-59
     /** C→Relay 在中转端注册自己（json: clientId），建立可被寻址的中转会话。 */

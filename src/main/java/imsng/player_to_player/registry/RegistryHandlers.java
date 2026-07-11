@@ -19,13 +19,16 @@ import java.util.UUID;
  *   <li>{@code CHUNK_CLAIM_REQUEST}（json: dimension, x, z, groupId）→
  *       {@code CHUNK_CLAIM_RESPONSE}（granted / 拒绝原因：blockingChunk + blockingGroup；
  *       granted 时附 hasServerData 指示走服务端数据还是种子生成）；</li>
- *   <li>{@code CHUNK_RELEASE}（json: dimension, x, z, groupId）→ {@code CHUNK_RELEASE_ACK}
- *       （binary 携带的最终区块数据留 Phase 2 处理：MCA 单区块写回）；</li>
+ *   <li>{@code CHUNK_RELEASE}（json: dimension, x, z, groupId；binary 可携带最终
+ *       区块数据）→ {@code CHUNK_RELEASE_ACK}。规范"玩家卸载区块……将最后的区块
+ *       数据由主客户端发给服务端"：binary 非空时先经 {@link ChunkWriteback} 写回
+ *       MCA 并刷盘，<b>再</b>释放占用 —— 顺序保证释放一经确认，其他组随后的申请
+ *       立刻能看到 hasServerData=true；</li>
  *   <li>{@code PLAYER_POS_UPDATE}（json: uuid, dimension, x, y, z）：刷新玩家表，无应答。</li>
  * </ul>
  * <p>
- * 线程模型：claim/release 是纯内存操作（ConcurrentHashMap + 轻量锁），直接在
- * Netty 事件循环执行；hasServerData 的磁盘探测在授予路径上发生，转 io() 池后应答。
+ * 线程模型：claim 是纯内存操作 + 授予路径的磁盘探测，转 io() 池后应答；
+ * release 因可能携带写回数据（解压 + MCA 写 + 刷盘），一律转 io() 池。
  */
 public final class RegistryHandlers {
 
@@ -37,13 +40,15 @@ public final class RegistryHandlers {
     /**
      * 把区块注册表相关处理器挂到控制服务器的分发表上。
      *
-     * @param reg      消息路由注册表（ControlServer）
-     * @param registry 区块注册表
-     * @param players  玩家表
+     * @param reg       消息路由注册表（ControlServer）
+     * @param registry  区块注册表
+     * @param players   玩家表
+     * @param writeback 最终区块数据写回（Phase 2；null = 无写回能力，只释放占用）
      */
-    public static void register(HandlerRegistry reg, ChunkRegistry registry, PlayerTable players) {
+    public static void register(HandlerRegistry reg, ChunkRegistry registry, PlayerTable players,
+                                ChunkWriteback writeback) {
         reg.on(MessageType.CHUNK_CLAIM_REQUEST, (conn, msg) -> handleClaim(conn, msg, registry));
-        reg.on(MessageType.CHUNK_RELEASE, (conn, msg) -> handleRelease(conn, msg, registry));
+        reg.on(MessageType.CHUNK_RELEASE, (conn, msg) -> handleRelease(conn, msg, registry, writeback));
         reg.on(MessageType.PLAYER_POS_UPDATE, (conn, msg) -> handlePosUpdate(conn, msg, players));
     }
 
@@ -75,21 +80,36 @@ public final class RegistryHandlers {
 
     // ------------------------------------------------------------ 区块释放
 
-    private static void handleRelease(ControlConnection conn, ControlMessage msg, ChunkRegistry registry) {
+    private static void handleRelease(ControlConnection conn, ControlMessage msg,
+                                      ChunkRegistry registry, ChunkWriteback writeback) {
         ChunkKey key = parseKey(msg.json());
         UUID groupId = parseUuid(JsonUtil.getString(msg.json(), "groupId", ""));
         if (key == null || groupId == null) {
             conn.send(error(msg, "invalid_request", "dimension/x/z/groupId 缺失或非法"));
             return;
         }
-        boolean released = registry.release(key, groupId);
-        if (!released) {
-            LOGGER.warn("区块释放未生效（未占用或占用者不符）: {} 组={}", key.asString(), groupId);
-        }
-        // TODO Phase 2: msg.binary() 携带最终区块数据 → MCA 单区块写回（服务端为写盘权威）
-        JsonObject out = new JsonObject();
-        out.addProperty("released", released);
-        conn.send(msg.reply(MessageType.CHUNK_RELEASE_ACK, out, null));
+        byte[] finalData = msg.binary();
+        // 写回（解压 + MCA 写 + 刷盘）是重活，整体转 io 池；顺序必须是先写回后释放
+        ThreadPools.io().execute(() -> {
+            boolean written = false;
+            if (writeback != null && finalData != null && finalData.length > 0) {
+                // 写回内部会做占用组核验 —— 必须在 release 之前调用，否则核验必失败
+                written = writeback.writeFinalAndFlush(key, groupId, finalData);
+                if (!written) {
+                    // 写回失败不阻断释放：占用泄漏比一次数据回退更伤（区块会被永久锁死）
+                    LOGGER.warn("最终区块数据写回失败（仍继续释放占用）: {} 组={}",
+                            key.asString(), groupId);
+                }
+            }
+            boolean released = registry.release(key, groupId);
+            if (!released) {
+                LOGGER.warn("区块释放未生效（未占用或占用者不符）: {} 组={}", key.asString(), groupId);
+            }
+            JsonObject out = new JsonObject();
+            out.addProperty("released", released);
+            out.addProperty("finalDataWritten", written);
+            conn.send(msg.reply(MessageType.CHUNK_RELEASE_ACK, out, null));
+        });
     }
 
     // ------------------------------------------------------------ 玩家位置

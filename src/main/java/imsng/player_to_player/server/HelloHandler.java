@@ -121,7 +121,7 @@ public final class HelloHandler implements MessageHandler {
         ack.addProperty("envHash", current != null ? current.globalHash() : "");
         ack.addProperty("envReady", current != null);
         ack.addProperty("worldName", worldName);
-        appendRelayInfo(ack);
+        appendRelayInfo(config, ack);
         ack.addProperty("minFreeMemoryBytes", config.minFreeMemoryBytes);
         connection.send(message.reply(MessageType.HELLO_ACK, ack, null));
 
@@ -139,8 +139,9 @@ public final class HelloHandler implements MessageHandler {
      *       已知可达的服务端 IP）；</li>
      *   <li>relayPort == 0 → 无中转可用（规范：服务端选择不作为中转时，打洞不成功则不中转）。</li>
      * </ul>
+     * 包内静态：P2PBrokerHandlers 组装 P2P_USE_RELAY 时复用同一套端点口径。
      */
-    private void appendRelayInfo(JsonObject ack) {
+    static void appendRelayInfo(GlobalConfig config, JsonObject ack) {
         String relayAddress = "";
         int relayPort = config.relayPort;
         String cfgAddr = config.relayServerAddress == null ? "" : config.relayServerAddress.trim();

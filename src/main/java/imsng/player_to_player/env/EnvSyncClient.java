@@ -70,7 +70,10 @@ public final class EnvSyncClient {
      * 把本地环境目录同步到与服务端一致。
      *
      * @param targetEnvDir 本地环境目录（primary/environment 或 secondary/environment）
-     * @param target       分发目标端（决定 mods/ 的前缀过滤视角）
+     * @param target       分发目标端（决定 mods/ 的前缀过滤视角）；
+     *                     <b>null = 不过滤的全量视图</b>（Phase 2 中转端从上级
+     *                     服务端整仓拉取用 —— 中转端要能向任意目标端二次分发，
+     *                     必须持有全量环境，"宁可多发不可漏发"）
      * @return 完成时携带服务端过滤视图全局哈希（filteredHash）的 future；
      *         任何文件下载/校验失败则异常完成
      */
@@ -81,10 +84,14 @@ public final class EnvSyncClient {
 
     /** 同步主流程（运行在 io 线程，可阻塞）。 */
     private String doSync(Path targetEnvDir, ModPrefixResolver.Target target) {
+        // 日志标签：null 目标显示为 FULL（全量视图）
+        String label = target != null ? target.name() : "FULL";
         try {
-            // ---- 1. 拉取服务端清单（按 target 过滤后的视图）----
+            // ---- 1. 拉取服务端清单（按 target 过滤后的视图；无 target 字段 = 全量）----
             JsonObject req = new JsonObject();
-            req.addProperty("target", target.name());
+            if (target != null) {
+                req.addProperty("target", target.name());
+            }
             ControlMessage manifestReply =
                     await(conn.request(ControlMessage.of(MessageType.ENV_MANIFEST_REQUEST, req)));
             requireType(manifestReply, MessageType.ENV_MANIFEST);
@@ -100,7 +107,7 @@ public final class EnvSyncClient {
             long totalBytes = toDownload.stream()
                     .mapToLong(p -> remote.files().get(p).size()).sum();
             LOGGER.info("[{}] 环境同步开始: 远端 {} 个文件, 需下载 {} 个 ({} 字节) → {}",
-                    target, remote.files().size(), toDownload.size(), totalBytes, targetEnvDir);
+                    label, remote.files().size(), toDownload.size(), totalBytes, targetEnvDir);
 
             // ---- 3. 逐文件下载 ----
             Path normalizedDir = targetEnvDir.toAbsolutePath().normalize();
@@ -112,11 +119,11 @@ public final class EnvSyncClient {
                 done++;
                 doneBytes += entry.size();
                 LOGGER.info("[{}] 环境同步进度: {}/{} 文件, {}/{} 字节 — {}",
-                        target, done, toDownload.size(), doneBytes, totalBytes, path);
+                        label, done, toDownload.size(), doneBytes, totalBytes, path);
             }
 
             LOGGER.info("[{}] 环境同步完成: {} 个文件, {} 字节, filteredHash={}",
-                    target, done, doneBytes, filteredHash);
+                    label, done, doneBytes, filteredHash);
             return filteredHash;
         } catch (IOException e) {
             // 统一转非受检异常让 future 异常完成（CompletableFuture 不吃受检异常）

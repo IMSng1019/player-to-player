@@ -12,6 +12,7 @@ import imsng.player_to_player.netproto.ControlServer;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.proxy.RelayCore;
 import imsng.player_to_player.registry.ChunkRegistry;
+import imsng.player_to_player.registry.ChunkWriteback;
 import imsng.player_to_player.registry.PlayerTable;
 import imsng.player_to_player.registry.RegionFileProbe;
 import imsng.player_to_player.registry.RegistryHandlers;
@@ -61,6 +62,7 @@ public final class P2PServerService {
     private static volatile ChunkRegistry chunkRegistry;
     private static volatile PlayerTable playerTable;
     private static volatile ComputeTable computeTable;
+    private static volatile GroupTable groupTable;
     /** 兼任中转时的中转核心；不兼任则为 null。 */
     private static volatile RelayCore relayCore;
 
@@ -115,6 +117,7 @@ public final class P2PServerService {
         registry.startAutoPersist(); // 定期落盘（scheduler 驱动，崩溃最多丢一个周期）
         PlayerTable players = new PlayerTable();
         ComputeTable computes = new ComputeTable();
+        GroupTable groups = new GroupTable();
 
         // 世界名：HELLO_ACK 下发，客户端据此拼 <IP>+<世界名> 世界文件夹
         String worldName = server.getWorldData().getLevelName();
@@ -124,13 +127,19 @@ public final class P2PServerService {
         control.on(MessageType.HELLO,
                 new HelloHandler(config, computes, () -> environmentManifest, worldName));
         EnvSyncServerHandlers.register(control, serverRoot, () -> environmentManifest, config);
-        RegistryHandlers.register(control, registry, players);
+        // 区块数据面（Phase 2）：CHUNK_DATA_REQUEST 下发 / CHUNK_DATA_UPLOAD 实时上行；
+        // 返回的写回接口交给 RegistryHandlers 处理 CHUNK_RELEASE 携带的最终数据
+        ChunkWriteback writeback = ChunkDataHandlers.register(control, server, registry);
+        RegistryHandlers.register(control, registry, players, writeback);
         ComputeHandlers.register(control, computes);
         LogCollector.register(control, paths.logsDir());
-        P2PBrokerHandlers.register(control);
+        P2PBrokerHandlers.register(control, config);
+        // 角色指派（Phase 2）：环境同步完成的客户端按存档位置分主/副
+        control.on(MessageType.ROLE_REQUEST,
+                new RoleAssignHandler(server, config, registry, groups, computes));
 
-        // e. 断连清理：按 peerId 清玩家表/算力表/在线映射，并释放其组的全部区块占用。
-        //    Phase 1 约定 groupId == 主客户端 clientId（NodeContext.groupId 注释同款约定），
+        // e. 断连清理：按 peerId 清玩家表/算力表/组表/在线映射，并释放其组的全部区块占用。
+        //    Phase 1/2 约定 groupId == 主客户端 clientId（NodeContext.groupId 注释同款约定），
         //    因此主客户端掉线时 releaseAll(peerId) 恰好释放其组占用的所有区块；
         //    副客户端的 peerId 不是任何 groupId，releaseAll 自然为空操作，无副作用。
         control.onDisconnect(conn -> {
@@ -152,6 +161,8 @@ public final class P2PServerService {
             players.remove(peerId);
             computes.remove(peerId);
             registry.releaseAll(peerId);
+            // 组表清理（Phase 2）：主客户端离线 → 整组解散；副客户端离线 → 摘成员
+            groups.removeClient(peerId);
             LOGGER.info("客户端断开，已清理其状态: {}", peerId);
         });
         control.start();
@@ -170,6 +181,7 @@ public final class P2PServerService {
         chunkRegistry = registry;
         playerTable = players;
         computeTable = computes;
+        groupTable = groups;
         controlServer = control;
         relayCore = relay;
         running = true;
@@ -242,6 +254,11 @@ public final class P2PServerService {
 
         playerTable = null;
         computeTable = null;
+        GroupTable groups = groupTable;
+        groupTable = null;
+        if (groups != null) {
+            groups.clear();
+        }
         environmentManifest = null;
         HelloHandler.clearAll(); // 清静态在线/NAT 映射，保证下次 start 干净
 

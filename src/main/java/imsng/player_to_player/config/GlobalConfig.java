@@ -58,6 +58,15 @@ public final class GlobalConfig {
     /** P2P UDP 本地端口，0 = 随机分配。 */
     public int p2pUdpPort = 0;
 
+    // ------------------------------------------------------------ 区块与分组
+
+    /**
+     * 区块申请被拒（目标或缓冲层被其他组占用）后的重试间隔（秒，Phase 2）。
+     * 被拒的区块在主客户端侧保持"未加载"（玩家视野空白），按此间隔向服务端
+     * 重新申请；Phase 3 的预连接/合并流程会在此基础上主动触发组合并。
+     */
+    public int chunkClaimRetrySeconds = 10;
+
     // ------------------------------------------------------------ 算力与内存
 
     /**
@@ -84,6 +93,21 @@ public final class GlobalConfig {
      * 超过协议最大帧长会让对端解帧器抛 TooLongFrameException 断连，且原因难排查。
      */
     public int envFileChunkBytes = 1024 * 1024;
+
+    /**
+     * 客户端是否优先从中转服务端同步环境文件（Phase 2，规范：中转服务端
+     * "同时可以给主客户端和副客户端分发模组文件以及配置文件"）。
+     * 仅当 HELLO_ACK 下发了独立中转地址时生效；中转端未就绪/同步失败时
+     * 自动回退为直连服务端同步，不影响可用性。默认关闭（保守）。
+     */
+    public boolean envSyncViaRelay = false;
+
+    /**
+     * 中转服务端从上级服务端重新校验环境清单的间隔（分钟，Phase 2）。
+     * 中转端启动时全量同步一次，此后按该间隔比对上级全局哈希，
+     * 有变化才重新拉取差异文件。
+     */
+    public int proxyEnvResyncMinutes = 10;
 
     /** 分块大小下限（64 KB）：再小传输轮次过多，纯浪费往返。 */
     private static final int MIN_ENV_FILE_CHUNK_BYTES = 64 * 1024;

@@ -2,6 +2,7 @@ package imsng.player_to_player.core;
 
 import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.config.P2PPaths;
+import imsng.player_to_player.group.GroupServerHooks;
 import imsng.player_to_player.proxy.ProxyServerService;
 import imsng.player_to_player.server.P2PServerService;
 import net.fabricmc.api.EnvType;
@@ -85,7 +86,9 @@ public final class P2PBootstrap {
             }
             case CLIENT -> {
                 // 客户端侧引导（算力/NAT 探测、加入世界钩子）由 ClientBootstrap 负责，
-                // 这里不做任何事，保持 src/main 不引用客户端类。
+                // 这里只挂组客户端的集成服务端钩子（Phase 2）：集成服务端类在
+                // common 侧可见，接管/区块释放/位置上报等逻辑无需进 client 源集。
+                GroupServerHooks.register();
             }
         }
     }
