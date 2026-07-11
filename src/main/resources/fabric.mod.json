@@ -2,16 +2,13 @@
 	"schemaVersion": 1,
 	"id": "player_to_player",
 	"version": "${version}",
-	"name": "player_to_player",
-	"description": "This is an example description! Tell everyone what your mod is about!",
+	"name": "Player to Player",
+	"description": "P2P 分布式算力模组：通过玩家间 P2P 打洞连接，将服务器的世界运算全部下放给玩家客户端，由多台客户端分担世界主线程运算。",
 	"authors": [
-		"Me!"
+		"IMSng"
 	],
-	"contact": {
-		"homepage": "https://fabricmc.net/",
-		"sources": "https://github.com/FabricMC/fabric-example-mod"
-	},
-	"license": "CC0-1.0",
+	"contact": {},
+	"license": "MIT",
 	"icon": "assets/player_to_player/icon.png",
 	"environment": "*",
 	"entrypoints": {
