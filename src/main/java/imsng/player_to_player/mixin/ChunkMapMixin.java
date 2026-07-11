@@ -4,6 +4,7 @@ import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.group.ChunkClaimClient;
 import imsng.player_to_player.group.GroupRuntime;
+import imsng.player_to_player.group.PresyncStore;
 import imsng.player_to_player.registry.ChunkKey;
 import net.minecraft.Util;
 import net.minecraft.nbt.CompoundTag;
@@ -96,13 +97,22 @@ public abstract class ChunkMapMixin {
         }
         ChunkKey key = new ChunkKey(this.level.dimension().location().toString(), pos.x, pos.z);
         CompletableFuture<Optional<CompoundTag>> localRead = cir.getReturnValue();
-        // 组合：申请（授予前悬置）→ 有服务端数据则拉取并升级，否则用本地读结果。
-        // 各阶段完成线程为 Netty 事件循环/io 池；NBT 升级（DataFixer）转
-        // Util.backgroundExecutor() —— 与原版 readChunk 的升级调度完全一致。
+        // 组合：申请（授予前悬置）→ 预同步暂存优先（Phase 3 合并接管方：A 经 P2P
+        // 直发的最终态，与服务端存档同源且省一次往返）→ 有服务端数据则拉取并升级，
+        // 否则用本地读结果。各阶段完成线程为 Netty 事件循环/io 池；NBT 升级
+        // （DataFixer）转 Util.backgroundExecutor() —— 与原版 readChunk 的升级调度一致。
         cir.setReturnValue(claims.claimWithRetry(key).thenCompose(outcome -> {
             if (!outcome.hasServerData()) {
-                return localRead;
+                CompoundTag staged = PresyncStore.take(key);
+                if (staged == null) {
+                    return localRead;
+                }
+                return CompletableFuture.completedFuture(Optional.of(staged)).thenApplyAsync(
+                        opt -> opt.map(tag ->
+                                ((ChunkMapAccess) this).player_to_player$upgradeChunkTag(tag)),
+                        Util.backgroundExecutor());
             }
+            // fetchChunkData 内部同样先查预同步暂存，未命中才走 CHUNK_DATA_REQUEST
             return claims.fetchChunkData(key).thenApplyAsync(
                     opt -> opt.map(tag ->
                             ((ChunkMapAccess) this).player_to_player$upgradeChunkTag(tag)),

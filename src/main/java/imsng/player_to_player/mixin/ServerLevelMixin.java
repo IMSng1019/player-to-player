@@ -2,6 +2,7 @@ package imsng.player_to_player.mixin;
 
 import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.core.NodeContext;
+import imsng.player_to_player.group.GroupRuntime;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.entity.PersistentEntitySectionManager;
@@ -101,6 +102,16 @@ public abstract class ServerLevelMixin {
         if (config == null) {
             return;
         }
+        ServerLevel self = (ServerLevel) (Object) this;
+        // Phase 3 合并"原子切换"：让出方 A 的集成服务端在发送尾部增量期间冻结
+        // 世界演算（GroupRuntime.setTickFrozen）。挂起手法与服务端 suspendWorldTick
+        // 完全一致 —— 保留区块服务与实体装载，玩家画面不断连，只是世界静止。
+        if (ctx.isClient() && GroupRuntime.isTickFrozen() && GroupRuntime.isManagedLevel(self)) {
+            self.getChunkSource().tick(hasTimeLeft, false);
+            this.entityManager.tick();
+            ci.cancel();
+            return;
+        }
         if (ctx.isServer() && config.suspendWorldTick) {
             if (!player_to_player$suspendLogged) {
                 player_to_player$suspendLogged = true;
@@ -113,7 +124,7 @@ public abstract class ServerLevelMixin {
             // 1) 区块服务：第二参数 tickChunks=false 跳过 tickChunks()（自然生成/
             //    区块随机演算等世界演算），但保留 DistanceManager ticket 更新与
             //    chunkMap.tick（区块加载/卸载/向玩家发包/存盘）。
-            ((ServerLevel) (Object) this).getChunkSource().tick(hasTimeLeft, false);
+            self.getChunkSource().tick(hasTimeLeft, false);
             // 2) 实体装载：处理实体分区装载队列，让实体能随区块正常入世。
             this.entityManager.tick();
             ci.cancel();

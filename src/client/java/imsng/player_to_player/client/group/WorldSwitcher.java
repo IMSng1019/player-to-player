@@ -54,6 +54,15 @@ public final class WorldSwitcher {
         return SWITCHING.getAndSet(false);
     }
 
+    /**
+     * 置位切换旗标（Phase 3 合并让出方：A 关停本地组世界降级为副客户端时，
+     * 这次 DISCONNECT 同样是编排性断开，不得拆除与物理服务端的控制连接）。
+     * 必须在触发断开<b>之前</b>调用（客户端主线程）。
+     */
+    public static void markSwitching() {
+        SWITCHING.set(true);
+    }
+
     /** 登记副客户端隧道监听端口（SecondaryJoiner 建好隧道后调用；0 = 清除登记）。 */
     public static void markTunnelPort(int port) {
         tunnelPort = port;
@@ -89,8 +98,10 @@ public final class WorldSwitcher {
             throw new IllegalStateException("switchToLocalWorld 必须在客户端主线程调用");
         }
         LOGGER.info("编排性断开物理服务端，打开本地组世界: {}/{}", savesRoot, saveName);
-        SWITCHING.set(true);
+        // 旗标只在真的会触发 DISCONNECT 时置位（level 为 null 时没有断开事件，
+        // 置了也无人消费，会残留到下一次真实退出把会话拆除误吞掉）
         if (minecraft.level != null) {
+            SWITCHING.set(true);
             minecraft.disconnect();
         }
         // 原版"选择世界界面打开存档"的同款入口（签名已 javap 核实）；
@@ -115,8 +126,8 @@ public final class WorldSwitcher {
             throw new IllegalStateException("switchToTunnel 必须在客户端主线程调用");
         }
         LOGGER.info("编排性断开物理服务端，经隧道加入主客户端 {} (127.0.0.1:{})", primaryName, port);
-        SWITCHING.set(true);
         if (minecraft.level != null) {
+            SWITCHING.set(true);
             minecraft.disconnect();
         }
         ServerData data = new ServerData("P2P 组世界（主客户端: " + primaryName + "）",

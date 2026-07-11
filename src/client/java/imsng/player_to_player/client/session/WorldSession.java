@@ -3,6 +3,7 @@ package imsng.player_to_player.client.session;
 import com.google.gson.JsonObject;
 import imsng.player_to_player.client.boot.ClientBootstrap;
 import imsng.player_to_player.client.group.LocalWorldLauncher;
+import imsng.player_to_player.client.group.MergeClient;
 import imsng.player_to_player.client.group.SecondaryJoiner;
 import imsng.player_to_player.client.group.WorldSwitcher;
 import imsng.player_to_player.compute.ComputeScore;
@@ -29,7 +30,9 @@ import net.minecraft.client.multiplayer.ServerData;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -154,6 +157,7 @@ public final class WorldSession {
         // 多次进出世界会持续累积泄漏（P2PChannel/RelayClient 的 close 均幂等，重复关闭安全）
         P2PSessions.closeAll();
         RelayConnector.closeAll();
+        MergeClient.reset(); // 合并触发面/预同步暂存不得跨会话残留
         WorldSwitcher.markTunnelPort(0); // 清除隧道口登记，防旧端口误匹配下次加入
         NodeContext ctx = NodeContext.get();
         ctx.setGroupId(null);
@@ -231,6 +235,14 @@ public final class WorldSession {
             // ---- 4. 挂接 P2P 撮合处理器（服务端可能随时推 P2P_ENDPOINT_EXCHANGE）
             //         并配置中转端点（打洞失败降级 / 经中转环境同步共用）----
             P2PSessions.register(cc, conn);
+            // 合并/分离客户端（Phase 3）：MERGE_PLAN/ABORT/COMMIT 处理器 +
+            // 区块拒绝触发面（服务端可能在角色指派后的任意时刻下发合并计划）
+            MergeClient.register(cc, conn);
+            // 分离晋升（Phase 3）：服务端主动推送的 ROLE_ASSIGN（不带 _rid，
+            // 不会与 requestRoleAndSwitch 的 reply 路径冲突 —— 带 _rid 的应答
+            // 在连接层被 pending future 消费，永远不进处理器分发）
+            cc.on(MessageType.ROLE_ASSIGN, (c, m) ->
+                    handleUnsolicitedRoleAssign(conn, worldFolder, worldName, m));
             String relayAddress = JsonUtil.getString(ackJson, "relayAddress", "");
             int relayPort = JsonUtil.getInt(ackJson, "relayPort", 0);
             // relayAddress 空串 = 服务端兼任中转：复用已知可达的服务端主机
@@ -390,6 +402,73 @@ public final class WorldSession {
     }
 
     // ------------------------------------------------------ 角色申请与世界切换
+
+    /**
+     * 服务端主动推送的 ROLE_ASSIGN（Phase 3 分离晋升；Netty 线程 → 重活转 io）。
+     * <p>
+     * 单端分离达标后服务端把离组副客户端晋升为主（SplitMonitor → SPLIT_ACK →
+     * 服务端直发 ROLE_ASSIGN(primary)）：本端此刻还连着原主的隧道世界，需要
+     * 切到自己的本地组世界。区块数据由服务端供给（原主的实时上行保证新鲜），
+     * 走 LocalWorldLauncher 的既有管线。
+     */
+    private static void handleUnsolicitedRoleAssign(ControlConnection conn, Path worldFolder,
+                                                    String worldName, ControlMessage msg) {
+        String role = JsonUtil.getString(msg.json(), "role", "");
+        if (!"primary".equals(role)) {
+            return; // 主动推送目前只有"晋升为主"一种（降级走 MERGE_COMMIT）
+        }
+        NodeContext ctx = NodeContext.get();
+        if (ctx.clientRole() == ClientRole.PRIMARY) {
+            return; // 已是主客户端：重复/迟到推送，忽略
+        }
+        UUID groupId;
+        try {
+            groupId = UUID.fromString(JsonUtil.getString(msg.json(), "groupId", ""));
+        } catch (IllegalArgumentException e) {
+            return;
+        }
+        LOGGER.info("收到分离晋升指派: 本端成为组 {} 的主客户端，切换到本地组世界", groupId);
+        ctx.setGroupId(groupId);
+        ctx.setClientRole(ClientRole.PRIMARY);
+        ThreadPools.io().execute(() -> {
+            // 晋升前先取回本人最新玩家数据（分离时原主已 PLAYER_DATA_UPLOAD 上传），
+            // 写进本地主存档 —— 否则本地集成服务端会用加入时同步的旧骨架 playerdata
+            // 把玩家放回过时位置。失败只告警（旧数据能玩，位置回退可接受）。
+            pullOwnPlayerData(conn, worldFolder, worldName);
+            LocalWorldLauncher.launch(Minecraft.getInstance(), conn, worldFolder, worldName, groupId);
+        });
+    }
+
+    /** 拉取本人玩家数据写入本地主存档（io 线程；尽力而为，失败不阻断晋升）。 */
+    private static void pullOwnPlayerData(ControlConnection conn, Path worldFolder,
+                                          String worldName) {
+        NodeContext ctx = NodeContext.get();
+        try {
+            JsonObject req = new JsonObject();
+            req.addProperty("playerUuid", ctx.clientId().toString());
+            ControlMessage resp = conn.request(
+                            ControlMessage.of(MessageType.PLAYER_DATA_REQUEST, req))
+                    .get(Protocol.REQUEST_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+            if (resp.type() != MessageType.PLAYER_DATA
+                    || !JsonUtil.getBoolean(resp.json(), "exists", false)
+                    || resp.binary().length == 0) {
+                LOGGER.warn("服务端无本人玩家数据（分离上传未达？），本地存档沿用既有数据");
+                return;
+            }
+            // 本地主存档 playerdata：data/primary/<存档名>/playerdata/<uuid>.dat
+            //（下发内容本就是 gzip NBT，原样落盘；临时文件 + 原子替换防半写）
+            Path playerData = ctx.paths().dataDir(worldFolder, ClientRole.PRIMARY)
+                    .resolve(P2PPaths.sanitize(worldName)).resolve("playerdata");
+            Files.createDirectories(playerData);
+            Path tmp = playerData.resolve(ctx.clientId() + ".dat.p2p-tmp");
+            Files.write(tmp, resp.binary());
+            Files.move(tmp, playerData.resolve(ctx.clientId() + ".dat"),
+                    StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            LOGGER.info("已取回最新玩家数据写入本地存档（{} 字节压缩）", resp.binary().length);
+        } catch (Exception e) {
+            LOGGER.warn("取回玩家数据失败，本地存档沿用既有数据: {}", e.toString());
+        }
+    }
 
     /**
      * 角色申请与世界切换（Phase 2 主流程收尾；io 线程）。

@@ -94,6 +94,26 @@ public final class ChunkClaimClient {
         return claimed.contains(key);
     }
 
+    /** 已授予区块的快照（预同步发送端遍历用；防御性拷贝）。 */
+    public Set<ChunkKey> claimedSnapshot() {
+        return Set.copyOf(claimed);
+    }
+
+    /**
+     * 本地摘除占用记录（Phase 3 分离/合并：区块占用已在<b>服务端侧</b>迁移给
+     * 其他组，本组不再拥有 —— 只清本地集合，不发 CHUNK_RELEASE：发了也会因
+     * 占用者不符被拒）。摘除后该区块的迟到存盘上行被 {@link ChunkUploadService}
+     * 过滤，不产生"上行被拒"日志噪音。
+     */
+    public void forgetLocal(ChunkKey key) {
+        claimed.remove(key);
+    }
+
+    /** 整体摘除全部本地占用记录（合并让出方在关停集成服务端前调用）。 */
+    public void forgetAllLocal() {
+        claimed.clear();
+    }
+
     /** 已占用区块数（诊断用）。 */
     public int claimedCount() {
         return claimed.size();
@@ -133,11 +153,18 @@ public final class ChunkClaimClient {
                         return;
                     }
                     // 被拒：区块保持未加载（规范：其他组占用中），按间隔重试。
-                    // blockingGroup 信息是 Phase 3 预连接/合并的入口，这里先记日志。
+                    // blockingGroup 是规范"预连接"的入口 —— 转发给合并触发桥
+                    // （MergeClient 挂接后决定是否发起 MERGE_REQUEST），并继续重试
+                    // 作兜底：合并期间/失败后区块仍按原节奏申请。
+                    String blockingGroupRaw = JsonUtil.getString(resp.json(), "blockingGroup", "");
                     LOGGER.info("区块申请被拒（{} 秒后重试）: {} 阻塞组={} 阻塞区块={}",
-                            retrySeconds, key.asString(),
-                            JsonUtil.getString(resp.json(), "blockingGroup", "?"),
+                            retrySeconds, key.asString(), blockingGroupRaw,
                             JsonUtil.getString(resp.json(), "blockingChunk", "?"));
+                    try {
+                        MergeTriggers.onClaimBlocked(UUID.fromString(blockingGroupRaw), key);
+                    } catch (IllegalArgumentException ignored) {
+                        // 阻塞组字段非法（入站不可信）：只重试，不触发合并
+                    }
                     scheduleRetry(key, future);
                 });
     }
@@ -153,12 +180,20 @@ public final class ChunkClaimClient {
     /**
      * 拉取区块的服务端数据（CHUNK_DATA_REQUEST → CHUNK_DATA）。
      * <p>
+     * <b>预同步优先（Phase 3）</b>：合并接管方 B 的暂存库（{@link PresyncStore}）
+     * 里若有该区块（A 经 P2P 直发的镜像，与服务端存档同源），直接消费返回，
+     * 省一次服务端往返与下行带宽（规范"继承"）。
+     * <p>
      * 返回 {@code Optional.empty()} 表示服务端确认"无此区块数据"（探测误报），
      * 调用方应回退种子生成。通信失败先快速重试 {@value #FETCH_FAST_RETRIES} 次，
      * 之后转慢速（申请重试间隔）——<b>绝不</b>降级为本地生成：服务端明确说有数据，
      * 擅自重新生成会在下次上行时覆盖服务端存档，属于数据丢失事故。
      */
     public CompletableFuture<Optional<CompoundTag>> fetchChunkData(ChunkKey key) {
+        CompoundTag staged = PresyncStore.take(key);
+        if (staged != null) {
+            return CompletableFuture.completedFuture(Optional.of(staged));
+        }
         CompletableFuture<Optional<CompoundTag>> future = new CompletableFuture<>();
         attemptFetch(key, future, 0);
         return future;

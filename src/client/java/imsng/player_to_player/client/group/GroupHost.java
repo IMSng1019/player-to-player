@@ -14,15 +14,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 组宿主（主客户端，Phase 2）：集成服务端被接管后的对外接待面。
+ * 组宿主（主客户端，Phase 2/3）：集成服务端被接管后的对外接待面。
  * <ol>
  *   <li><b>LAN 发布</b>：{@code IntegratedServer.publishServer}（原版"对局域网开放"
  *       的同款入口，签名已 javap 核实）把集成服务端绑到本机随机 TCP 端口 ——
  *       副客户端的隧道最终桥接到这个端口；</li>
- *   <li><b>接待副客户端</b>：挂 {@link P2PSessions} 会话监听器，每当一条 P2P
- *       会话就绪（直连打洞成功或中转降级），套 {@link ReliableChannel} 读会话头：
- *       {@code op=tunnel_join} → 桥接到 LAN 端口（副客户端的 MC 连接从此经隧道
- *       进入集成服务端）；其他 op 留给 Phase 3（预同步等）扩展。</li>
+ *   <li><b>接待副客户端</b>：挂 {@link P2PSessions} 会话监听器，每当一条<b>入站</b>
+ *       P2P 会话就绪（本端非发起方；发起方标记见 SessionListener Javadoc —— 本端
+ *       主动发起的预同步会话由 MergeClient 认领，不得被接待面误抢），套
+ *       {@link ReliableChannel} 读会话头：{@code op=tunnel_join} → 桥接到 LAN 端口；
+ *       {@code op=presync}（Phase 3 合并接管方）→ 移交 {@link #presyncHandler}。</li>
  * </ol>
  * 会话监听器随 {@code P2PSessions.closeAll()}（世界会话拆除）一起清理；
  * LAN 发布随集成服务端停止自然失效。
@@ -37,7 +38,19 @@ public final class GroupHost {
     /** LAN 端口（volatile：发布在主线程，隧道桥接在 io 线程读）。 */
     private static volatile int lanPort;
 
+    /**
+     * 预同步会话处理器（Phase 3；MergeClient 挂接）：参数为会话头 JSON 与已就绪
+     * 的可靠通道（所有权移交处理器）。null = 未挂接（op=presync 一律拒绝）。
+     */
+    private static volatile java.util.function.BiConsumer<JsonObject, ReliableChannel> presyncHandler;
+
     private GroupHost() {
+    }
+
+    /** 挂接预同步会话处理器（MergeClient 注册时调用；null 清除）。 */
+    public static void setPresyncHandler(
+            java.util.function.BiConsumer<JsonObject, ReliableChannel> handler) {
+        presyncHandler = handler;
     }
 
     /**
@@ -62,13 +75,18 @@ public final class GroupHost {
             }
         });
 
-        // 接待副客户端：会话就绪 → 读会话头 → 桥接
-        P2PSessions.addListener((sessionId, peerClientId, transport) ->
-                ThreadPools.io().execute(() -> accept(sessionId, String.valueOf(peerClientId), transport)));
+        // 接待副客户端：入站会话就绪 → 读会话头 → 按 op 分派。
+        // 只认非发起方会话：本端主动发起的（合并预同步）由 MergeClient 认领
+        P2PSessions.addListener((sessionId, peerClientId, transport, initiator) -> {
+            if (initiator) {
+                return;
+            }
+            ThreadPools.io().execute(() -> accept(sessionId, String.valueOf(peerClientId), transport));
+        });
         LOGGER.info("组宿主已就绪（会话监听器已挂接）");
     }
 
-    /** 接待一条新 P2P 会话（io 线程，可阻塞）。 */
+    /** 接待一条新入站 P2P 会话（io 线程，可阻塞）。 */
     private static void accept(String sessionId, String peer,
                                imsng.player_to_player.p2p.P2PTransport transport) {
         ReliableChannel channel = new ReliableChannel(transport, "host:" + sessionId);
@@ -76,21 +94,34 @@ public final class GroupHost {
             String headerJson = readHeaderWithTimeout(channel);
             JsonObject header = JsonUtil.parseObject(headerJson);
             String op = JsonUtil.getString(header, "op", "");
-            if (!"tunnel_join".equals(op)) {
-                // 未知用途的会话（Phase 3 的预同步等在这里分派）：Phase 2 直接拒绝
-                LOGGER.warn("会话 {} 的用途未知（op={}），关闭", sessionId, op);
-                channel.close();
-                return;
+            switch (op) {
+                case "tunnel_join" -> {
+                    int port = lanPort;
+                    if (port <= 0) {
+                        LOGGER.warn("LAN 端口尚未发布，无法接待副客户端 {}（会话 {} 关闭）",
+                                peer, sessionId);
+                        channel.close();
+                        return;
+                    }
+                    LOGGER.info("副客户端 {} 经会话 {} 请求加入，桥接到 LAN 端口 {}",
+                            JsonUtil.getString(header, "playerName", peer), sessionId, port);
+                    TcpTunnel.bridgeToLocalPort(channel, port, "host:" + sessionId);
+                }
+                case "presync" -> {
+                    // Phase 3 合并：让出方 A 主动连到接管方 B 推送预同步流
+                    var handler = presyncHandler;
+                    if (handler == null) {
+                        LOGGER.warn("收到预同步会话 {} 但本端无合并进行中，关闭", sessionId);
+                        channel.close();
+                        return;
+                    }
+                    handler.accept(header, channel); // 通道所有权移交处理器
+                }
+                default -> {
+                    LOGGER.warn("会话 {} 的用途未知（op={}），关闭", sessionId, op);
+                    channel.close();
+                }
             }
-            int port = lanPort;
-            if (port <= 0) {
-                LOGGER.warn("LAN 端口尚未发布，无法接待副客户端 {}（会话 {} 关闭）", peer, sessionId);
-                channel.close();
-                return;
-            }
-            LOGGER.info("副客户端 {} 经会话 {} 请求加入，桥接到 LAN 端口 {}",
-                    JsonUtil.getString(header, "playerName", peer), sessionId, port);
-            TcpTunnel.bridgeToLocalPort(channel, port, "host:" + sessionId);
         } catch (Exception e) {
             LOGGER.warn("接待会话 {} 失败: {}", sessionId, e.toString());
             channel.close();

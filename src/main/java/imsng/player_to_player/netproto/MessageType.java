@@ -16,6 +16,7 @@ import java.util.Map;
  *   50-59  中转（relay）
  *   60-69  日志
  *   70-79  指令与聊天路由（Phase 4 占位）
+ *   80-89  合并与分离（Phase 3）
  * </pre>
  * 新增类型只增不改号，保证协议向后兼容。
  */
@@ -106,7 +107,61 @@ public enum MessageType {
     /** 指令逐级传递（副→主→中转→服务端→其他主→其他副）。 */
     COMMAND_RELAY(70),
     /** 聊天/系统消息全网分发。 */
-    CHAT_RELAY(71);
+    CHAT_RELAY(71),
+
+    // ---------------------------------------------------- 合并与分离 80-89（Phase 3）
+    /**
+     * C→S 合并申请（json: initiatorGroupId, targetGroupId, reason, blockingChunk）。
+     * 主客户端的区块申请被拒（blockingGroup）或角色指派要求迁移时发出；
+     * 服务端 {@code MergeCoordinator} 校验双方在线后开始撮合，
+     * 以 {@link #MERGE_PLAN}（携带 _rid）应答。
+     */
+    MERGE_REQUEST(80),
+    /**
+     * S→C 合并计划（json: mergeId, newPrimaryClientId, oldPrimaryClientId,
+     * groupAId, groupBId, members[]）：服务端按算力表选出新主客户端
+     * （规范"算力分配"：单核分最高且剩余内存达标者），双方主客户端各收一份。
+     * 收到后 A（让出方）与 B（接管方）开始预同步。
+     */
+    MERGE_PLAN(81),
+    /**
+     * C→S 合并阶段回报（json: mergeId, phase, success, detail）。
+     * phase ∈ presync_started / snapshot_done / caught_up / switched / failed；
+     * 服务端据此推进/回滚合并状态机（失败 → MERGE_ABORT 双方，各自恢复原状）。
+     */
+    MERGE_PROGRESS(82),
+    /**
+     * S→C 合并中止（json: mergeId, reason）：任一方失败/掉线时服务端向双方下发，
+     * A 继续运行，B 丢弃影子实例（规范"若 B 追赶失败或断开，A 继续运行，
+     * 服务端取消合并"）。
+     */
+    MERGE_ABORT(83),
+    /**
+     * S→C 合并完成确认（json: mergeId, groupId, primaryClientId, members[]）：
+     * 服务端在收到 switched 回报后更新组表/注册表归属，向新组全体成员广播
+     * 最终成员视图；副客户端据此把隧道重定向到新主客户端。
+     */
+    MERGE_COMMIT(84),
+    /**
+     * C→S 分离申请（json: groupId, departingClientId, chunks[]）：
+     * 主客户端检测到某副客户端渲染区域与组内其他成员无交集持续达标（规范"分离"）
+     * 后发出；服务端把 chunks[] 的占用从原组迁移到新组（departingClient 自立门户），
+     * 以 {@link #SPLIT_ACK} 应答。
+     */
+    SPLIT_REQUEST(85),
+    /** S→C 分离确认（json: granted, newGroupId, migratedChunks）。 */
+    SPLIT_ACK(86),
+    /**
+     * C→S 玩家数据上行（json: playerUuid, playerName；binary: gzip 玩家 NBT）。
+     * 分离前主客户端上传离组玩家的最终数据；合并/退出时亦可用（Phase 3/4 玩家数据
+     * 上行的收口）。服务端写入世界 playerdata/&lt;uuid&gt;.dat ——
+     * {@code RoleAssignHandler} 的存档定位与环境同步天然消费同一份数据。
+     */
+    PLAYER_DATA_UPLOAD(87),
+    /** C→S 请求玩家数据（json: playerUuid）；本人或其组主客户端可请求。 */
+    PLAYER_DATA_REQUEST(88),
+    /** S→C 玩家数据（json: exists；binary: gzip 玩家 NBT）。 */
+    PLAYER_DATA(89);
 
     private final int id;
 

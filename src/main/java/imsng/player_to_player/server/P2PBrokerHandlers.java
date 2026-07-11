@@ -177,13 +177,14 @@ public final class P2PBrokerHandlers {
             LOGGER.warn("P2P 打洞失败且无中转可用，会话放弃: session={}", sessionId);
             return;
         }
-        sendUseRelay(session.requester(), session.target(), sessionId, relayInfo);
-        sendUseRelay(session.target(), session.requester(), sessionId, relayInfo);
+        sendUseRelay(session.requester(), session.target(), sessionId, relayInfo, true);
+        sendUseRelay(session.target(), session.requester(), sessionId, relayInfo, false);
         LOGGER.info("P2P 会话 {} 降级中转: {} ↔ {}", sessionId, session.requester(), session.target());
     }
 
-    /** 向一方下发 P2P_USE_RELAY（对端字段是"另一方"）。 */
-    private static void sendUseRelay(UUID recipient, UUID peer, UUID sessionId, JsonObject relayInfo) {
+    /** 向一方下发 P2P_USE_RELAY（对端字段是"另一方"；initiator 与直连撮合同口径）。 */
+    private static void sendUseRelay(UUID recipient, UUID peer, UUID sessionId,
+                                     JsonObject relayInfo, boolean initiator) {
         ControlConnection conn = HelloHandler.connectionOf(recipient);
         if (conn == null || !conn.isOpen()) {
             LOGGER.warn("P2P_USE_RELAY 无法送达（已离线）: {}", recipient);
@@ -192,6 +193,7 @@ public final class P2PBrokerHandlers {
         JsonObject json = new JsonObject();
         json.addProperty("sessionId", sessionId.toString());
         json.addProperty("peerClientId", peer.toString());
+        json.addProperty("initiator", initiator);
         json.addProperty("relayAddress", JsonUtil.getString(relayInfo, "relayAddress", ""));
         json.addProperty("relayPort", JsonUtil.getInt(relayInfo, "relayPort", 0));
         conn.send(ControlMessage.of(MessageType.P2P_USE_RELAY, json));

@@ -40,10 +40,16 @@ import java.util.UUID;
  *       客户端据此发起 P2P 预连接走隧道加入）；</li>
  *   <li>未被占用 → 指派为<b>主客户端</b>（新建组，groupId == clientId）。</li>
  * </ol>
- * <b>Phase 2 简化（Phase 3 收口）</b>：规范要求"加入玩家算力更强则与原主客户端
- * 预连接预同步合并、迁移主客户端"——迁移依赖影子实例热迁移（Phase 3），本期
- * 固定"既有主客户端不动摇"，加入者一律为副；算力表仅用于主客户端资格的内存
- * 门槛告警。
+ * <b>Phase 3 收口（规范"玩家加入世界"的算力比较段）</b>：目标区块被在线组占用时
+ * 比较加入者与该组主客户端的算力 ——
+ * <ul>
+ *   <li>加入者<b>更强</b>（单核分更高且满足内存门槛）→ 指派为<b>主客户端</b>
+ *       （自建新组）。其集成服务端随后的区块申请必然被占用组挡住 →
+ *       {@code MergeTriggers} → MERGE_REQUEST → {@code MergeCoordinator} 按算力
+ *       选它为新主 → 原主预同步让出 —— 恰好组合出规范"与原主客户端进行预连接
+ *       以及预同步 合并为一个组客户端"的完整链路，无需专用协议；</li>
+ *   <li>否则 → 副客户端加入该组（Phase 2 路径）。</li>
+ * </ul>
  * <p>
  * 线程模型：handle 在 Netty 事件循环，playerdata 磁盘读转 {@link ThreadPools#io()}。
  */
@@ -97,20 +103,30 @@ public final class RoleAssignHandler implements MessageHandler {
 
         JsonObject out = new JsonObject();
         if (owningGroup != null) {
-            // ---- 3. 有在线组占用 → 副客户端加入该组 ----
+            // ---- 3. 有在线组占用：算力比较决定加入方式（规范"玩家加入世界"）----
             UUID primary = groups.primaryOf(owningGroup);
-            if (primary != null && groups.addSecondary(owningGroup, peer)) {
-                out.addProperty("role", "secondary");
-                out.addProperty("groupId", owningGroup.toString());
-                out.addProperty("primaryClientId", primary.toString());
-                conn.send(msg.reply(MessageType.ROLE_ASSIGN, out, null));
-                LOGGER.info("角色指派: {} → 副客户端（组 {}，目标区块 {}）",
-                        peer, owningGroup, target.asString());
-                return;
+            if (primary != null && !joinerIsStronger(peer, primary)) {
+                // 加入者不更强（或算力未知）→ 副客户端加入该组（Phase 2 路径）
+                if (groups.addSecondary(owningGroup, peer)) {
+                    out.addProperty("role", "secondary");
+                    out.addProperty("groupId", owningGroup.toString());
+                    out.addProperty("primaryClientId", primary.toString());
+                    conn.send(msg.reply(MessageType.ROLE_ASSIGN, out, null));
+                    LOGGER.info("角色指派: {} → 副客户端（组 {}，目标区块 {}）",
+                            peer, owningGroup, target.asString());
+                    return;
+                }
+                // 组表与注册表短暂不一致（主客户端刚掉线等）：落到建组路径
+                LOGGER.warn("区块 {} 的占用组 {} 已不在线，改走主客户端指派",
+                        target.asString(), owningGroup);
+            } else if (primary != null) {
+                // 加入者更强 → 主客户端建组（Phase 3）：其后续区块申请被占用组
+                // 挡住时自动触发 MERGE_REQUEST，合并选主必选它 —— 组合出规范
+                // "加入玩家算力更强则与原主预连接预同步合并"的完整链路
+                LOGGER.info("加入者 {} 算力强于占用组 {} 的主客户端 {}，"
+                        + "指派为主客户端（合并流程将随区块申请自动触发）",
+                        peer, owningGroup, primary);
             }
-            // 组表与注册表短暂不一致（主客户端刚掉线等）：落到建组路径
-            LOGGER.warn("区块 {} 的占用组 {} 已不在线，改走主客户端指派",
-                    target.asString(), owningGroup);
         }
 
         // ---- 4. 无人占用 → 主客户端（规范：主客户端资格含剩余内存门槛）----
@@ -129,6 +145,18 @@ public final class RoleAssignHandler implements MessageHandler {
         out.addProperty("primaryClientId", peer.toString());
         conn.send(msg.reply(MessageType.ROLE_ASSIGN, out, null));
         LOGGER.info("角色指派: {} → 主客户端（目标区块 {}）", peer, target.asString());
+    }
+
+    /**
+     * 加入者是否算力更强（规范"如果加入玩家的算力更强则将该玩家作为主客户端"）：
+     * 用 {@link ComputeTable#selectPrimary} 的同一套规则（单核分 + 内存门槛 +
+     * UUID 决胜）在两人之间选主，胜者恰为加入者才算"更强" —— 与合并选主
+     * （MergeCoordinator）口径完全一致，两处决策永不分叉。
+     */
+    private boolean joinerIsStronger(UUID joiner, UUID incumbentPrimary) {
+        UUID winner = computeTable.selectPrimary(
+                java.util.List.of(joiner, incumbentPrimary), config.minFreeMemoryBytes);
+        return joiner.equals(winner);
     }
 
     /**

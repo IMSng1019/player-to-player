@@ -62,7 +62,10 @@ public final class GroupServerHooks {
         // 解除接管挂在 SERVER_STOPPED（而非 STOPPING）：stopServer 过程中的
         // saveAllChunks 仍会经上行捕获 Mixin 入队发送 —— 过早解除会让停服前的
         // 最终区块状态丢失上行；完全停止后再解除并通知会话层做延迟拆除
-        ServerLifecycleEvents.SERVER_STOPPED.register(GroupRuntime::detach);
+        ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
+            SplitMonitor.reset(); // 分离计时状态不得跨世界残留
+            GroupRuntime.detach(server);
+        });
 
         ServerChunkEvents.CHUNK_UNLOAD.register((level, chunk) -> {
             if (!GroupRuntime.isManagedLevel(level)) {
@@ -95,7 +98,7 @@ public final class GroupServerHooks {
         LOGGER.info("组客户端事件钩子已注册");
     }
 
-    /** 周期位置上报（服务器主线程；纯 JSON 组装 + 异步发送，微秒级）。 */
+    /** 周期位置上报 + 分离检测（服务器主线程；纯 JSON 组装 + 异步发送，微秒级）。 */
     private static void reportPositions(MinecraftServer server) {
         if (!GroupRuntime.isManagedServer(server)) {
             return;
@@ -103,6 +106,8 @@ public final class GroupServerHooks {
         if (++tickCounter % POS_REPORT_INTERVAL_TICKS != 0) {
             return;
         }
+        // 分离检测（Phase 3）：每秒一轮的渲染区域交集判定（矩形运算，微秒级）
+        SplitMonitor.tick(server);
         ControlConnection conn = GroupRuntime.conn();
         if (conn == null || !conn.isOpen()) {
             return;

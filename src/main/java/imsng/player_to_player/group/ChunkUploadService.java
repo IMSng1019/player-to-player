@@ -72,6 +72,9 @@ public final class ChunkUploadService {
         if (shutdown) {
             return;
         }
+        // 预同步分接（Phase 3）：合并/分离的发送端在此拿到快照后的全部增量
+        // （无消费者时是一次空列表遍历，可忽略）
+        PresyncTaps.offer(key, tag);
         synchronized (queue) {
             queue.put(key, tag);
             if (queue.size() > MAX_PENDING_CHUNKS) {

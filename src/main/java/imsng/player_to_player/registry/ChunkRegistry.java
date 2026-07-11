@@ -12,6 +12,7 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -157,6 +158,79 @@ public final class ChunkRegistry {
             LOGGER.info("已释放组 {} 的 {} 个区块占用", groupId, released);
         }
         return released;
+    }
+
+    /**
+     * 整组迁移（Phase 3 合并）：把 from 组占用的<b>全部</b>区块原子地改挂到 to 组名下。
+     * <p>
+     * 与"释放再申请"相比，迁移不存在中间空窗 —— 释放瞬间第三组恰好申请到这些
+     * 区块会让合并双方都拿不到；原子改挂则保证合并期间区块归属始终有主。
+     *
+     * @return 迁移的区块数
+     */
+    public int migrateAll(UUID from, UUID to) {
+        if (from == null || to == null || from.equals(to)) {
+            return 0;
+        }
+        int migrated = 0;
+        synchronized (claimLock) {
+            for (Map.Entry<ChunkKey, ClaimInfo> e : claims.entrySet()) {
+                if (from.equals(e.getValue().groupId())) {
+                    e.setValue(new ClaimInfo(to, System.currentTimeMillis()));
+                    migrated++;
+                }
+            }
+            if (migrated > 0) {
+                dirty = true;
+            }
+        }
+        if (migrated > 0) {
+            LOGGER.info("区块占用整组迁移: {} → {} ({} 个区块)", from, to, migrated);
+        }
+        return migrated;
+    }
+
+    /**
+     * 指定区块迁移（Phase 3 分离）：把列表中<b>仍属 from 组</b>的区块改挂到 to 组。
+     * 不属 from 组的条目静默跳过（分离请求与实际占用之间允许弱一致）。
+     *
+     * @return 实际迁移的区块数
+     */
+    public int migrate(Collection<ChunkKey> keys, UUID from, UUID to) {
+        if (keys == null || keys.isEmpty() || from == null || to == null || from.equals(to)) {
+            return 0;
+        }
+        int migrated = 0;
+        synchronized (claimLock) {
+            for (ChunkKey key : keys) {
+                ClaimInfo info = claims.get(key);
+                if (info != null && from.equals(info.groupId())) {
+                    claims.put(key, new ClaimInfo(to, System.currentTimeMillis()));
+                    migrated++;
+                }
+            }
+            if (migrated > 0) {
+                dirty = true;
+            }
+        }
+        if (migrated > 0) {
+            LOGGER.info("区块占用定向迁移: {} → {} ({} / {} 个区块)", from, to, migrated, keys.size());
+        }
+        return migrated;
+    }
+
+    /** 某组当前占用的全部区块（快照；诊断与合并规模评估用）。 */
+    public List<ChunkKey> claimsOf(UUID groupId) {
+        List<ChunkKey> result = new ArrayList<>();
+        if (groupId == null) {
+            return result;
+        }
+        for (Map.Entry<ChunkKey, ClaimInfo> e : claims.entrySet()) {
+            if (groupId.equals(e.getValue().groupId())) {
+                result.add(e.getKey());
+            }
+        }
+        return result;
     }
 
     /** 查询区块占用组；空闲返回 null。 */

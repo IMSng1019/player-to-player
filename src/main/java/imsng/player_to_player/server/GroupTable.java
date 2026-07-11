@@ -126,6 +126,80 @@ public final class GroupTable {
         return info != null ? info.primaryClientId() : null;
     }
 
+    /** 组成员快照（防御性拷贝）；组不存在返回空集。 */
+    public Set<UUID> membersOf(UUID groupId) {
+        GroupInfo info = groups.get(groupId);
+        return info != null ? Set.copyOf(info.members()) : Set.of();
+    }
+
+    /**
+     * 合并两组（Phase 3，规范"合并"）：groupA 与 groupB 的全部成员并入一个新组，
+     * 主客户端为 newPrimary（算力分配的胜者）。<b>groupId 约定延续 Phase 1/2 口径
+     * （groupId == 新主客户端 clientId）</b>——注册表迁移（{@code ChunkRegistry.migrateAll}）
+     * 与断连清理（releaseAll(peerId)）都依赖该口径，不在本期打破。
+     *
+     * @return 合并后的组信息；任一组不存在或 newPrimary 不在两组成员内返回 null
+     */
+    public GroupInfo mergeGroups(UUID groupA, UUID groupB, UUID newPrimary) {
+        synchronized (lock) {
+            GroupInfo a = groups.get(groupA);
+            GroupInfo b = groups.get(groupB);
+            if (a == null || b == null) {
+                return null;
+            }
+            if (!a.members().contains(newPrimary) && !b.members().contains(newPrimary)) {
+                return null; // 新主必须来自合并双方（防状态漂移）
+            }
+            // 摘除两旧组（含反向索引），组建新组
+            groups.remove(groupA);
+            groups.remove(groupB);
+            GroupInfo merged = new GroupInfo(newPrimary, newPrimary,
+                    ConcurrentHashMap.newKeySet());
+            merged.members().addAll(a.members());
+            merged.members().addAll(b.members());
+            groups.put(newPrimary, merged);
+            for (UUID member : merged.members()) {
+                memberToGroup.put(member, newPrimary);
+            }
+            LOGGER.info("组已合并: {} + {} → {} (主客户端 {}, {} 名成员)",
+                    groupA, groupB, newPrimary, newPrimary, merged.members().size());
+            return merged;
+        }
+    }
+
+    /**
+     * 组分离（Phase 3，规范"分离"）：把 departing 成员集从原组摘出，
+     * 组成以 newPrimary 为主的新组（groupId == newPrimary）。
+     * <p>
+     * 单端分离是 departing 只有一个成员的特例。原组主客户端不允许被分走
+     * （规范语义：分离的是"渲染区域无交集的副客户端"；主客户端迁移走合并流程）。
+     *
+     * @return 新组信息；原组不存在 / departing 含原组主 / newPrimary 不在 departing
+     *         内时返回 null（调用方回 ERROR）
+     */
+    public GroupInfo splitGroup(UUID groupId, Set<UUID> departing, UUID newPrimary) {
+        synchronized (lock) {
+            GroupInfo info = groups.get(groupId);
+            if (info == null || departing == null || departing.isEmpty()
+                    || !departing.contains(newPrimary)
+                    || departing.contains(info.primaryClientId())
+                    || !info.members().containsAll(departing)) {
+                return null;
+            }
+            info.members().removeAll(departing);
+            GroupInfo fresh = new GroupInfo(newPrimary, newPrimary,
+                    ConcurrentHashMap.newKeySet());
+            fresh.members().addAll(departing);
+            groups.put(newPrimary, fresh);
+            for (UUID member : departing) {
+                memberToGroup.put(member, newPrimary);
+            }
+            LOGGER.info("组已分离: {} 名成员离开组 {} 组成新组 {}（主客户端 {}）",
+                    departing.size(), groupId, newPrimary, newPrimary);
+            return fresh;
+        }
+    }
+
     /** 组是否存在。 */
     public boolean exists(UUID groupId) {
         return groups.containsKey(groupId);

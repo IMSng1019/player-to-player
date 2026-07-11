@@ -63,6 +63,8 @@ public final class P2PServerService {
     private static volatile PlayerTable playerTable;
     private static volatile ComputeTable computeTable;
     private static volatile GroupTable groupTable;
+    /** 合并/分离协调器（Phase 3）。 */
+    private static volatile MergeCoordinator mergeCoordinator;
     /** 兼任中转时的中转核心；不兼任则为 null。 */
     private static volatile RelayCore relayCore;
 
@@ -137,6 +139,11 @@ public final class P2PServerService {
         // 角色指派（Phase 2）：环境同步完成的客户端按存档位置分主/副
         control.on(MessageType.ROLE_REQUEST,
                 new RoleAssignHandler(server, config, registry, groups, computes));
+        // 合并/分离协调器（Phase 3）：MERGE_REQUEST/PROGRESS + SPLIT_REQUEST
+        MergeCoordinator merges = MergeCoordinator.register(
+                control, config, registry, groups, computes, players);
+        // 玩家数据面（Phase 3）：分离/合并前的玩家 NBT 上行与下发
+        PlayerDataHandlers.register(control, server, groups);
 
         // e. 断连清理：按 peerId 清玩家表/算力表/组表/在线映射，并释放其组的全部区块占用。
         //    Phase 1/2 约定 groupId == 主客户端 clientId（NodeContext.groupId 注释同款约定），
@@ -161,6 +168,8 @@ public final class P2PServerService {
             players.remove(peerId);
             computes.remove(peerId);
             registry.releaseAll(peerId);
+            // 合并会话清理（Phase 3）：当事方掉线 → 中止其卷入的合并（A 继续运行）
+            merges.abortInvolving(peerId);
             // 组表清理（Phase 2）：主客户端离线 → 整组解散；副客户端离线 → 摘成员
             groups.removeClient(peerId);
             LOGGER.info("客户端断开，已清理其状态: {}", peerId);
@@ -182,6 +191,7 @@ public final class P2PServerService {
         playerTable = players;
         computeTable = computes;
         groupTable = groups;
+        mergeCoordinator = merges;
         controlServer = control;
         relayCore = relay;
         running = true;
@@ -254,6 +264,11 @@ public final class P2PServerService {
 
         playerTable = null;
         computeTable = null;
+        MergeCoordinator merges = mergeCoordinator;
+        mergeCoordinator = null;
+        if (merges != null) {
+            merges.shutdown();
+        }
         GroupTable groups = groupTable;
         groupTable = null;
         if (groups != null) {

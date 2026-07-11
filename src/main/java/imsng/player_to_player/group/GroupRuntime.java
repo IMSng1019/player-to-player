@@ -68,6 +68,13 @@ public final class GroupRuntime {
      */
     private static volatile Runnable stopListener;
 
+    /**
+     * 一次性抑制旗标（Phase 3 合并）：让出方 A 提交后要关掉自己的集成服务端并以
+     * 副客户端身份重连新主 —— 这次 SERVER_STOPPED 不代表"玩家离开世界"，
+     * 会话层的停止回调应跳过拆除（与物理服务端的控制连接必须继续存活）。
+     */
+    private static volatile boolean suppressNextStopTeardown;
+
     private GroupRuntime() {
     }
 
@@ -121,6 +128,7 @@ public final class GroupRuntime {
         serverConn = null;
         groupId = null;
         managedServer = null;
+        tickFrozen = false; // 冻结旗标不得跨接管残留
         if (claims != null) {
             claims.shutdown();
         }
@@ -128,6 +136,13 @@ public final class GroupRuntime {
             uploads.shutdown();
         }
         LOGGER.info("组运行时已解除对集成服务端的接管");
+        if (suppressNextStopTeardown) {
+            // Phase 3 合并让出方：本次停止属于"主→副降级切换"而非离开世界，
+            // 会话层的拆除回调跳过一次（旗标一次性消费）
+            suppressNextStopTeardown = false;
+            LOGGER.info("主客户端让出切换中，跳过本次会话拆除回调");
+            return;
+        }
         Runnable listener = stopListener;
         if (listener != null) {
             try {
@@ -136,6 +151,35 @@ public final class GroupRuntime {
                 LOGGER.error("集成服务端停止回调异常", e);
             }
         }
+    }
+
+    /** 置位"下一次停止不拆会话"旗标（合并让出方在关闭集成服务端前调用）。 */
+    public static void suppressNextStopTeardown() {
+        suppressNextStopTeardown = true;
+    }
+
+    // ------------------------------------------------------------ tick 冻结
+
+    /**
+     * 集成服务端世界 tick 冻结旗标（Phase 3 合并"原子切换"）：让出方 A 在发送
+     * 尾部增量前置位 —— {@code ServerLevelMixin} 读到后挂起世界演算（保留区块
+     * 服务与实体装载，与服务端 suspendWorldTick 同款语义），保证尾部增量就是
+     * 最终态。冻结窗口 = 尾部序列化 + 传输 + ACK 往返，正常在数百毫秒内。
+     */
+    private static volatile boolean tickFrozen;
+
+    /** 冻结/解冻被接管集成服务端的世界 tick（任意线程；Mixin 每 tick 一次 volatile 读）。 */
+    public static void setTickFrozen(boolean frozen) {
+        if (tickFrozen == frozen) {
+            return; // 幂等去噪：失败/中止路径可能重复解冻
+        }
+        tickFrozen = frozen;
+        LOGGER.info("集成服务端世界 tick {}", frozen ? "已冻结（合并切换窗口）" : "已解冻");
+    }
+
+    /** 世界 tick 是否处于冻结状态。 */
+    public static boolean isTickFrozen() {
+        return tickFrozen;
     }
 
     /** 挂接集成服务端完全停止后的回调（客户端会话层调用，进程内挂一次即可）。 */
@@ -160,6 +204,11 @@ public final class GroupRuntime {
     public static boolean isManagedLevel(ServerLevel level) {
         MinecraftServer managed = managedServer;
         return managed != null && level != null && level.getServer() == managed;
+    }
+
+    /** 被接管的集成服务端实例；未接管为 null（预同步/分离监视等 Phase 3 组件用）。 */
+    public static MinecraftServer server() {
+        return managedServer;
     }
 
     /** 区块申请客户端；未接管时为 null（调用方须判空）。 */

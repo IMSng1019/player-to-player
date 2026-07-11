@@ -11,9 +11,9 @@
 | 期 | 内容 | 状态 |
 |----|------|------|
 | **Phase 1** | 基础设施：角色/配置/目录、控制协议(Netty)、环境文件扫描与同步、区块注册表、算力评分、NAT 检测与 UDP 打洞、服务端/中转端服务骨架、客户端引导、服务端世界 tick 挂起 | 已完成 |
-| **Phase 2** | 主客户端集成服务端接管、副客户端经 P2P 隧道加入主客户端、区块数据上行与 MCA 单区块写回、中转端环境分发 | **本期实现**（详见第 11 节） |
-| Phase 3 | 预连接→预同步→合并（影子实例 + 快照 + 增量追赶 + 原子切换）、单端/组分离、算力再分配 | 未开始 |
-| Phase 4 | 指令/聊天逐级路由、传送门跨维度加载、末影珍珠特殊加载、日志收集完善、MySQL 注册表后端 | 未开始 |
+| **Phase 2** | 主客户端集成服务端接管、副客户端经 P2P 隧道加入主客户端、区块数据上行与 MCA 单区块写回、中转端环境分发 | 已完成（详见第 11 节） |
+| **Phase 3** | 预连接→预同步→合并（快照 + 增量追赶 + 冻结原子切换）、单端分离、算力再分配选主、玩家数据上行 | **本期实现**（详见第 12 节） |
+| Phase 4 | 指令/聊天逐级路由、传送门跨维度加载、末影珍珠特殊加载、组分离（多端）、日志收集完善、MySQL 注册表后端 | 未开始 |
 
 ## 1. 节点模型
 
@@ -221,7 +221,89 @@ MC 原版 TCP 协议字节
 
 ### 11.4 Phase 2 已知边界（Phase 3+ 收口）
 
-- 角色指派固定"既有主客户端不动摇"，算力更强者加入不触发主客户端迁移（Phase 3 合并）；
+- ~~角色指派固定"既有主客户端不动摇"~~ → Phase 3 已收口：算力更强者加入指派为主，
+  合并流程随区块申请自动触发（见 12.2）；
 - 游离实体（poi/、entities/ 独立存储）不跨端同步 —— 方块实体（箱子等）在区块 NBT 内不受影响；
-- 玩家背包在组世界内由主客户端存档保存，不回传物理服务端（Phase 3/4 玩家数据上行）；
-- 副客户端渲染区域与组无重叠 10s 的分离（split）未实现（Phase 3）。
+- ~~玩家背包在组世界内由主客户端存档保存，不回传物理服务端~~ → Phase 3 已收口：
+  PLAYER_DATA_UPLOAD/REQUEST 数据面 + 预同步 PLAYER 记录（见 12.3/12.5）；
+- ~~副客户端渲染区域与组无重叠 10s 的分离（split）未实现~~ → Phase 3 已收口（见 12.5）。
+
+## 12. Phase 3：合并与分离（预连接→预同步→原子切换）
+
+### 12.1 协议扩展（80-89 段）
+
+```
+MERGE_REQUEST(80)   C→S 合并申请（区块被拒触发；targetGroupId + blockingChunk）
+MERGE_PLAN(81)      S→C 合并计划（算力分配选出 newPrimary；双方主客户端各一份）
+MERGE_PROGRESS(82)  C→S 阶段回报（presync_started/snapshot_done/caught_up/switched/failed）
+MERGE_ABORT(83)     S→C 中止（任一方失败/掉线/超时；A 继续运行）
+MERGE_COMMIT(84)    S→C 提交（新组最终成员视图；副客户端据此重定向隧道）
+SPLIT_REQUEST(85)   C→S 分离申请（主客户端检测达标后发；携带迁移区块清单）
+SPLIT_ACK(86)       S→C 分离确认
+PLAYER_DATA_UPLOAD(87) / PLAYER_DATA_REQUEST(88) / PLAYER_DATA(89)  玩家数据面
+```
+
+### 12.2 合并全景（server.MergeCoordinator + client.MergeClient）
+
+```
+A 组主客户端区块申请被拒（blockingGroup）
+  → MergeTriggers（去抖 + 分离后抑制窗口）→ MERGE_REQUEST
+  → MergeCoordinator：在线校验 + 冷却 + 忙碌互斥 → ComputeTable.selectPrimary
+    （单核分 + 内存门槛 + UUID 决胜 —— 与 RoleAssignHandler 完全同口径）
+  → MERGE_PLAN 下发双方 → 让出方 A（oldPrimary）/接管方 B（newPrimary）分工：
+      A：P2P 预连接（P2P_CONNECT_REQUEST，失败自动中转降级）
+         → 会话头 op=presync → PresyncSender
+      B：GroupHost 按会话头 op=presync 分派 → PresyncReceiver
+  → A 回报 switched → 服务端 GroupTable.mergeGroups + ChunkRegistry.migrateAll
+    （原子改挂，无"释放-再申请"空窗）→ MERGE_COMMIT 广播新组
+  → A 关停集成服务端（suppressNextStopTeardown 保住控制连接）
+    → SecondaryJoiner 经隧道加入 B（Phase 2 同一条管线）
+  → 原 A 组副客户端收到 MERGE_COMMIT 后主动向 B 发起 P2P 重定向
+```
+
+- **触发面二**：算力更强者加入世界（RoleAssignHandler 指派其为主 → 其区块申请
+  必然被占用组挡住 → 走上面同一条链路），规范"加入玩家算力更强则合并"零专用协议。
+- 失败语义（规范）：任何阶段失败/超时（300s）/当事方掉线 → MERGE_ABORT 双方，
+  A 解冻继续运行；组对冷却 30s 防重试风暴。
+
+### 12.3 预同步（group.PresyncSender / PresyncReceiver / PresyncProtocol）
+
+- **对规范"影子实例"的工程取舍**：客户端 JVM 同时只能有一个集成服务端（原版单例
+  结构），真起第二实例需类加载器隔离，脆弱且吃内存。改用**数据等价**方案：区块级
+  全量覆盖幂等（同键后到覆盖先到），"重放到影子世界"与"暂存最新 NBT、接管后按需
+  装载"最终态一致 —— B 的集成服务端全程不中断，接管即生效。
+- 流程：**先挂增量分接（PresyncTaps，寄生在 ChunkUploadService.enqueue 咽喉）再拍
+  快照**（快照期写盘不漏）→ 快照逐区块主线程序列化（微秒级/块，不卡游戏）→
+  SNAPSHOT_DONE/ACK → 增量追赶循环至吃空 → **冻结**（GroupRuntime.setTickFrozen，
+  ServerLevelMixin 挂起演算但保留区块服务）→ 主线程 saveAllChunks（脏区块经写盘
+  咽喉产生最终增量）→ 尾部 + 玩家 NBT → TAIL_DONE/ACK → switched。
+  冻结窗口 = 存盘 + 尾部传输 + 一次 ACK 往返（规范目标 300ms 量级）。
+- B 侧入库：区块 → PresyncStore（4096 上限，超限丢弃回退服务端拉取）；玩家 →
+  B 本地存档 playerdata（原子写）。ChunkMapMixin 门控授予后**优先消费暂存**
+  （与服务端存档同源，省一次往返 —— 规范"继承"减轻服务端带宽）。
+
+### 12.4 会话复用与所有权（P2PSessions.initiator 标记）
+
+SessionListener 增加 initiator 参数（P2P_USE_RELAY 也随帧下发）：主客户端同时
+是"被动接待方"（GroupHost，只认非发起会话）与"主动发起方"（MergeClient 预连接，
+只认自己发起的），两类监听器按标记分流，互不误抢。
+
+### 12.5 单端分离（group.SplitMonitor）
+
+- 判据：规范"渲染区块的周围4格的周围4格无交集持续 10s" ≡ 两渲染矩形曼哈顿间隙
+  > 2（O(1) 矩形运算，GroupServerHooks 每秒驱动一轮）；交集恢复即计时归零。
+- 达标：主客户端上传离组玩家 NBT（PLAYER_DATA_UPLOAD）→ SPLIT_REQUEST（携带其
+  渲染区内本组占用区块）→ 服务端 GroupTable.splitGroup + ChunkRegistry.migrate
+  （定向迁移）→ 直发离组客户端 ROLE_ASSIGN(primary) → 其 WorldSession 处理主动
+  推送的指派（不带 _rid，与 request 应答路径天然不冲突）→ LocalWorldLauncher
+  切本地组世界；原主 forgetLocal 已迁移区块 + MergeTriggers.suppressFor(30s)
+  防分离↔合并震荡。
+- **简化（对规范"10s 期间预同步"）**：离组者区块数据由服务端供给（原主实时上行
+  保证新鲜），一致性等价；代价是一次本地世界加载（数秒）。组分离（多端同时离组）
+  留待 Phase 4。
+
+### 12.6 注册表迁移原语（ChunkRegistry）
+
+- `migrateAll(from, to)`：整组占用原子改挂（合并提交用）—— 相比"释放再申请"
+  不存在第三组趁隙抢占的空窗；
+- `migrate(keys, from, to)`：定向迁移（分离用），非 from 组的条目静默跳过（弱一致容忍）。

@@ -54,8 +54,10 @@ public final class SecondaryJoiner {
     public static void join(Minecraft minecraft, ControlConnection conn, UUID primaryClientId) {
         // ---- 1. 先监听后请求（时序见类 Javadoc）----
         CompletableFuture<P2PTransport> ready = new CompletableFuture<>();
-        P2PSessions.SessionListener listener = (sessionId, peerClientId, transport) -> {
-            if (primaryClientId.equals(peerClientId)) {
+        P2PSessions.SessionListener listener = (sessionId, peerClientId, transport, initiator) -> {
+            // 本端是撮合请求方（initiator=true）且对端是目标主客户端才认领 ——
+            // 主客户端向本端发起的其他会话（Phase 3 预同步等）不得被误抢
+            if (initiator && primaryClientId.equals(peerClientId)) {
                 ready.complete(transport); // 已完成时的重复 complete 是 no-op
             }
         };
