@@ -2,6 +2,7 @@ package imsng.player_to_player.core;
 
 import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.config.P2PPaths;
+import imsng.player_to_player.group.ChatRelay;
 import imsng.player_to_player.group.GroupServerHooks;
 import imsng.player_to_player.proxy.ProxyServerService;
 import imsng.player_to_player.server.P2PServerService;
@@ -89,6 +90,8 @@ public final class P2PBootstrap {
                 // 这里只挂组客户端的集成服务端钩子（Phase 2）：集成服务端类在
                 // common 侧可见，接管/区块释放/位置上报等逻辑无需进 client 源集。
                 GroupServerHooks.register();
+                // 跨组聊天捕获（Phase 4）：同为集成服务端事件，事件体内按接管状态门控
+                ChatRelay.installHooks();
             }
         }
     }

@@ -92,6 +92,18 @@ public final class MergeCoordinator {
     /** 冷却表："小组id|大组id"（有序拼接）→ 上次尝试时刻。惰性清理。 */
     private final Map<String, Long> cooldowns = new ConcurrentHashMap<>();
 
+    /**
+     * 组分离（多端）的暂存重定向：新组 groupId → 待重定向的副客户端集合（Phase 4）。
+     * 新主的组世界没就绪前推送 ROLE_ASSIGN(secondary) 必然导致副客户端隧道连接失败
+     * （LAN 端口尚未发布），故暂存至收到该组的 {@code GROUP_WORLD_READY} 再冲刷；
+     * {@value #REDIRECT_FLUSH_TIMEOUT_SECONDS} 秒未就绪则兜底冲刷（副客户端侧
+     * P2P/隧道自带超时与失败留守，宁可尝试也不让玩家吊死在旧组的冻结视野里）。
+     */
+    private final Map<UUID, Set<UUID>> pendingRedirects = new ConcurrentHashMap<>();
+
+    /** 暂存重定向的兜底冲刷时限（秒）：覆盖新主首次建世界（拷贝骨架+开服）的上界。 */
+    private static final long REDIRECT_FLUSH_TIMEOUT_SECONDS = 60;
+
     private final GlobalConfig config;
     private final ChunkRegistry registry;
     private final GroupTable groups;
@@ -120,6 +132,7 @@ public final class MergeCoordinator {
         reg.on(MessageType.MERGE_REQUEST, coordinator::handleMergeRequest);
         reg.on(MessageType.MERGE_PROGRESS, coordinator::handleProgress);
         reg.on(MessageType.SPLIT_REQUEST, coordinator::handleSplitRequest);
+        reg.on(MessageType.GROUP_WORLD_READY, coordinator::handleGroupWorldReady);
         return coordinator;
     }
 
@@ -336,6 +349,13 @@ public final class MergeCoordinator {
      * 只做权威切换：组表 splitGroup + 注册表定向迁移 departing 名下区块。
      * departing 成员在申请前已完成预同步（10s 窗口内后台进行），SPLIT_ACK 到达
      * 即可各自为政。
+     * <p>
+     * <b>组分离（多端，Phase 4）</b>：{@code departingClientIds} 携带多名离组成员时，
+     * 服务端在离组集合内做算力分配（规范"分为两个组客户端……每个组内进行算力分配"，
+     * {@link ComputeTable#selectPrimary} 与合并选主同一套规则），胜者直发
+     * ROLE_ASSIGN(primary) 自立门户；其余成员的 ROLE_ASSIGN(secondary) 重定向指派
+     * <b>暂存</b>到新主回报 {@code GROUP_WORLD_READY}（LAN 已发布）后冲刷 ——
+     * 见 {@link #pendingRedirects}。单成员分离（departing=1）是其特例，无暂存环节。
      */
     private void handleSplitRequest(ControlConnection conn, ControlMessage msg) {
         UUID requester = conn.peerId();
@@ -344,9 +364,23 @@ public final class MergeCoordinator {
             return;
         }
         UUID groupId = parseUuid(JsonUtil.getString(msg.json(), "groupId", ""));
-        UUID departing = parseUuid(JsonUtil.getString(msg.json(), "departingClientId", ""));
-        if (groupId == null || departing == null) {
-            conn.send(error(msg, "invalid_request", "groupId/departingClientId 缺失或非法"));
+        // Phase 4：优先读多成员数组；缺失时回退 Phase 3 的单成员字段
+        Set<UUID> departingSet = new HashSet<>();
+        if (msg.json().has("departingClientIds") && msg.json().get("departingClientIds").isJsonArray()) {
+            for (var el : msg.json().getAsJsonArray("departingClientIds")) {
+                try {
+                    departingSet.add(UUID.fromString(el.getAsString()));
+                } catch (Exception ignored) {
+                    // 单条坏数据跳过（入站不可信）
+                }
+            }
+        }
+        UUID single = parseUuid(JsonUtil.getString(msg.json(), "departingClientId", ""));
+        if (single != null) {
+            departingSet.add(single);
+        }
+        if (groupId == null || departingSet.isEmpty()) {
+            conn.send(error(msg, "invalid_request", "groupId/departingClientId(s) 缺失或非法"));
             return;
         }
         if (!requester.equals(groups.primaryOf(groupId))) {
@@ -360,7 +394,7 @@ public final class MergeCoordinator {
                 return;
             }
         }
-        // 解析随请求声明的迁移区块（departing 的渲染区块；服务端只迁"确属原组"的）
+        // 解析随请求声明的迁移区块（departing 成员的渲染区块；服务端只迁"确属原组"的）
         List<ChunkKey> chunks = new ArrayList<>();
         if (msg.json().has("chunks") && msg.json().get("chunks").isJsonArray()) {
             for (var el : msg.json().getAsJsonArray("chunks")) {
@@ -371,32 +405,93 @@ public final class MergeCoordinator {
                 }
             }
         }
-        Set<UUID> departingSet = new HashSet<>(Set.of(departing));
-        GroupTable.GroupInfo fresh = groups.splitGroup(groupId, departingSet, departing);
+        // 离组集合内算力分配（规范"每个组内进行算力分配"）；无算力数据时取
+        // UUID 字典序最小者兜底 —— 与 ComputeTable 决胜规则同源，保证确定性
+        UUID newPrimary = computes.selectPrimary(departingSet, config.minFreeMemoryBytes);
+        if (newPrimary == null) {
+            newPrimary = departingSet.stream().min(UUID::compareTo).orElseThrow();
+            LOGGER.warn("离组成员无可用算力数据，按 UUID 字典序兜底选主: {}", newPrimary);
+        }
+        GroupTable.GroupInfo fresh = groups.splitGroup(groupId, departingSet, newPrimary);
         JsonObject out = new JsonObject();
         if (fresh == null) {
             out.addProperty("granted", false);
             conn.send(msg.reply(MessageType.SPLIT_ACK, out, null));
-            LOGGER.warn("分离申请被拒（组不存在/成员不符）: 组={} 离组={}", groupId, departing);
+            LOGGER.warn("分离申请被拒（组不存在/成员不符）: 组={} 离组={}", groupId, departingSet);
             return;
         }
         int migrated = registry.migrate(chunks, groupId, fresh.groupId());
-        players.updateGroupRole(departing, fresh.groupId(), "primary");
+        for (UUID member : departingSet) {
+            players.updateGroupRole(member, fresh.groupId(),
+                    member.equals(newPrimary) ? "primary" : "secondary");
+        }
         out.addProperty("granted", true);
         out.addProperty("newGroupId", fresh.groupId().toString());
+        out.addProperty("newPrimaryClientId", newPrimary.toString());
         out.addProperty("migratedChunks", migrated);
         conn.send(msg.reply(MessageType.SPLIT_ACK, out, null));
-        // 通知离组客户端它已是新组的主（它可能在等 SPLIT_ACK 的转发，直发更可靠）
-        ControlConnection departingConn = HelloHandler.connectionOf(departing);
-        if (departingConn != null && departingConn.isOpen()) {
+        // 通知新主它已是新组的主（它可能在等 SPLIT_ACK 的转发，直发更可靠）
+        ControlConnection primaryConn = HelloHandler.connectionOf(newPrimary);
+        if (primaryConn != null && primaryConn.isOpen()) {
             JsonObject assign = new JsonObject();
             assign.addProperty("role", "primary");
             assign.addProperty("groupId", fresh.groupId().toString());
-            assign.addProperty("primaryClientId", departing.toString());
-            departingConn.send(ControlMessage.of(MessageType.ROLE_ASSIGN, assign));
+            assign.addProperty("primaryClientId", newPrimary.toString());
+            primaryConn.send(ControlMessage.of(MessageType.ROLE_ASSIGN, assign));
         }
-        LOGGER.info("分离已执行: 组 {} → 离组成员 {} 自立新组（迁移 {} 个区块）",
-                groupId, departing, migrated);
+        // 其余离组成员：暂存重定向，等新主世界就绪（GROUP_WORLD_READY）再冲刷
+        Set<UUID> followers = new HashSet<>(departingSet);
+        followers.remove(newPrimary);
+        if (!followers.isEmpty()) {
+            UUID newGroupId = fresh.groupId();
+            pendingRedirects.put(newGroupId, followers);
+            ThreadPools.scheduler().schedule(
+                    () -> flushRedirects(newGroupId, "超时兜底"),
+                    REDIRECT_FLUSH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+        LOGGER.info("分离已执行: 组 {} → {} 名离组成员自立新组 {}（新主 {}，迁移 {} 个区块）",
+                groupId, departingSet.size(), fresh.groupId(), newPrimary, migrated);
+    }
+
+    /**
+     * GROUP_WORLD_READY：主客户端的组世界完成 LAN 发布（Phase 4）。
+     * 冲刷该组暂存的副客户端重定向 —— 此刻新主已可接待隧道，重定向不再扑空。
+     * 普通主客户端（无暂存项）的就绪通告是无害的空操作。
+     */
+    private void handleGroupWorldReady(ControlConnection conn, ControlMessage msg) {
+        UUID reporter = conn.peerId();
+        if (reporter == null) {
+            return; // 未握手连接：忽略（推送语义无应答）
+        }
+        // 口径：groupId == 主客户端 clientId，就绪方即组 id
+        flushRedirects(reporter, "世界就绪");
+    }
+
+    /** 冲刷某组暂存的副客户端重定向（就绪通告与超时兜底竞争，remove 保证只发一次）。 */
+    private void flushRedirects(UUID newGroupId, String cause) {
+        Set<UUID> followers = pendingRedirects.remove(newGroupId);
+        if (followers == null || followers.isEmpty()) {
+            return;
+        }
+        UUID newPrimary = groups.primaryOf(newGroupId);
+        if (newPrimary == null) {
+            LOGGER.warn("重定向冲刷时新组 {} 已不存在，放弃（触发: {}）", newGroupId, cause);
+            return;
+        }
+        JsonObject assign = new JsonObject();
+        assign.addProperty("role", "secondary");
+        assign.addProperty("groupId", newGroupId.toString());
+        assign.addProperty("primaryClientId", newPrimary.toString());
+        int sent = 0;
+        for (UUID follower : followers) {
+            ControlConnection c = HelloHandler.connectionOf(follower);
+            if (c != null && c.isOpen()) {
+                c.send(ControlMessage.of(MessageType.ROLE_ASSIGN, assign.deepCopy()));
+                sent++;
+            }
+        }
+        LOGGER.info("组分离重定向已冲刷: 新组 {} 新主 {}，通知 {}/{} 名副客户端（触发: {}）",
+                newGroupId, newPrimary, sent, followers.size(), cause);
     }
 
     // ------------------------------------------------------------ 工具
@@ -408,6 +503,7 @@ public final class MergeCoordinator {
         }
         sessions.clear();
         cooldowns.clear();
+        pendingRedirects.clear();
     }
 
     private void cancelTimeout(MergeSession session) {

@@ -13,9 +13,12 @@ import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.proxy.RelayCore;
 import imsng.player_to_player.registry.ChunkRegistry;
 import imsng.player_to_player.registry.ChunkWriteback;
+import imsng.player_to_player.registry.JsonRegistryStore;
+import imsng.player_to_player.registry.MysqlRegistryStore;
 import imsng.player_to_player.registry.PlayerTable;
 import imsng.player_to_player.registry.RegionFileProbe;
 import imsng.player_to_player.registry.RegistryHandlers;
+import imsng.player_to_player.registry.RegistryStore;
 import imsng.player_to_player.util.ThreadPools;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.server.MinecraftServer;
@@ -113,8 +116,21 @@ public final class P2PServerService {
             }
         });
 
-        // c. 区块注册表：持久化目录 + 世界 region 文件探测器（hasServerData 判定用）
-        ChunkRegistry registry = new ChunkRegistry(paths.registryDir(), new RegionFileProbe(worldRoot));
+        // c. 区块注册表：后端选择（Phase 4：MySQL 可选，连接失败回退 JSON —— 注册表
+        //    可用性优先于后端偏好）+ 世界 region 文件探测器（hasServerData 判定用）
+        RegistryStore store = null;
+        if (config.mysql != null && config.mysql.enabled) {
+            try {
+                store = MysqlRegistryStore.connect(config.mysql);
+                LOGGER.info("区块注册表使用 MySQL 后端: {}", store.describe());
+            } catch (Exception e) {
+                LOGGER.error("MySQL 注册表后端连接失败，回退 JSON 文件后端", e);
+            }
+        }
+        if (store == null) {
+            store = new JsonRegistryStore(paths.registryDir());
+        }
+        ChunkRegistry registry = new ChunkRegistry(store, new RegionFileProbe(worldRoot));
         registry.load();            // 恢复上次运行的占用状态（服务端重启不丢注册表）
         registry.startAutoPersist(); // 定期落盘（scheduler 驱动，崩溃最多丢一个周期）
         PlayerTable players = new PlayerTable();
@@ -144,6 +160,10 @@ public final class P2PServerService {
                 control, config, registry, groups, computes, players);
         // 玩家数据面（Phase 3）：分离/合并前的玩家 NBT 上行与下发
         PlayerDataHandlers.register(control, server, groups);
+        // 指令/聊天逐级路由（Phase 4）：COMMAND_RELAY 特例处理 + 泛化下放，CHAT_RELAY 全网分发
+        CommandChatHandlers.register(control, server, groups, players);
+        // 末影珍珠交接路由（Phase 4）：PEARL_HANDOFF 转发目标组 / PEARL_LANDED 回程抛出者组
+        PearlHandlers.register(control, groups);
 
         // e. 断连清理：按 peerId 清玩家表/算力表/组表/在线映射，并释放其组的全部区块占用。
         //    Phase 1/2 约定 groupId == 主客户端 clientId（NodeContext.groupId 注释同款约定），

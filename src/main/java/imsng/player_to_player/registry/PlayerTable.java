@@ -84,6 +84,22 @@ public final class PlayerTable {
         return playerId == null ? null : players.get(playerId);
     }
 
+    /**
+     * 按玩家名查询（Phase 4 指令路由：/tp、/msg 的目标解析"如同原版一样"基于
+     * 玩家表）。大小写不敏感；在线玩家量级为几十到几百，线性扫描足够。
+     */
+    public PlayerEntry byName(String playerName) {
+        if (playerName == null || playerName.isBlank()) {
+            return null;
+        }
+        for (PlayerEntry entry : players.values()) {
+            if (playerName.equalsIgnoreCase(entry.playerName())) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
     /** 移除玩家（断连清理）。 */
     public void remove(UUID playerId) {
         if (playerId != null) {

@@ -1,22 +1,14 @@
 package imsng.player_to_player.registry;
 
-import com.google.gson.JsonObject;
-import imsng.player_to_player.config.P2PPaths;
-import imsng.player_to_player.util.JsonUtil;
 import imsng.player_to_player.util.ThreadPools;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
-import java.nio.file.DirectoryStream;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
@@ -29,13 +21,14 @@ import java.util.concurrent.TimeUnit;
  * <ul>
  *   <li>{@link #tryClaim}：<b>原子地</b>检查目标区块 + 东西南北四邻（规范的"缓冲层"）
  *       是否被<b>其他组</b>占用，全部空闲（或属本组）才授予并登记目标区块；</li>
+ *   <li>{@link #probe}：与 tryClaim 同一套检查但<b>不登记</b>（Phase 4 传送门预检 /
+ *       末影珍珠交接判定用 —— 只想知道"能不能占"，不想真的占）；</li>
  *   <li>{@link #release}：单区块释放（仅占用组本人可释放）；</li>
  *   <li>{@link #releaseAll}：整组释放（主客户端掉线时服务端调用）。</li>
  * </ul>
  * <p>
- * <b>持久化</b>：{@code player-to-player/registry/<维度>.json}（维度名经
- * {@link P2PPaths#sanitize} 合法化），定期落盘 + 关闭时落盘，服务端重启不丢占用状态。
- * MySQL 后端留待 Phase 4（{@code GlobalConfig.mysql} 已预留配置）。
+ * <b>持久化</b>：经 {@link RegistryStore} 后端（本地 JSON 或 MySQL，Phase 4），
+ * 定期落盘 + 关闭时落盘，服务端重启不丢占用状态。
  * <p>
  * <b>线程模型</b>：claim/release 来自 Netty 事件循环，落盘在 scheduler/调用线程 ——
  * 写路径以内部锁串行化（五格检查+登记必须原子），读走 ConcurrentHashMap 无锁。
@@ -74,8 +67,8 @@ public final class ChunkRegistry {
     /** 写路径互斥锁：五格检查 + 登记必须是不可分割的整体。 */
     private final Object claimLock = new Object();
 
-    /** 持久化目录（{@code player-to-player/registry/}）。 */
-    private final Path persistDir;
+    /** 持久化后端（本地 JSON / MySQL，Phase 4 可插拔）。 */
+    private final RegistryStore store;
 
     /** region 文件探测器（hasServerData 判定）。 */
     private final RegionFileProbe probe;
@@ -86,8 +79,8 @@ public final class ChunkRegistry {
     /** 自动落盘任务句柄；shutdown 时取消。 */
     private volatile ScheduledFuture<?> autoPersistTask;
 
-    public ChunkRegistry(Path persistDir, RegionFileProbe probe) {
-        this.persistDir = persistDir;
+    public ChunkRegistry(RegistryStore store, RegionFileProbe probe) {
+        this.store = store;
         this.probe = probe;
     }
 
@@ -99,17 +92,9 @@ public final class ChunkRegistry {
      */
     public ClaimResult tryClaim(ChunkKey key, UUID groupId) {
         synchronized (claimLock) {
-            // 目标区块本身：被其他组占用即拒绝
-            ClaimInfo existing = claims.get(key);
-            if (existing != null && !existing.groupId().equals(groupId)) {
-                return ClaimResult.rejected(key, existing.groupId());
-            }
-            // 缓冲层（东西南北四邻）：任何一格被其他组占用即拒绝
-            for (ChunkKey neighbor : key.neighbors4()) {
-                ClaimInfo info = claims.get(neighbor);
-                if (info != null && !info.groupId().equals(groupId)) {
-                    return ClaimResult.rejected(neighbor, info.groupId());
-                }
+            ClaimResult blocked = checkBlockedLocked(key, groupId);
+            if (blocked != null) {
+                return blocked;
             }
             // 授予：登记目标区块（重复申请刷新占用时间，幂等）
             claims.put(key, new ClaimInfo(groupId, System.currentTimeMillis()));
@@ -117,6 +102,35 @@ public final class ChunkRegistry {
         }
         // hasServerData 是磁盘探测，放锁外做（不占 claimLock，避免拖慢并发申请）
         return ClaimResult.grantedResult(probe != null && probe.hasServerData(key));
+    }
+
+    /**
+     * 只读探测（Phase 4）：与 {@link #tryClaim} 同一套"目标 + 四邻"检查，
+     * 但<b>不登记任何占用</b>。传送门预检与末影珍珠交接判定用 —— 若走 tryClaim，
+     * 探测本身就会占下一个永远不会被加载（也就永远不会随卸载释放）的区块，泄漏占用。
+     */
+    public ClaimResult probe(ChunkKey key, UUID groupId) {
+        synchronized (claimLock) {
+            ClaimResult blocked = checkBlockedLocked(key, groupId);
+            return blocked != null ? blocked : ClaimResult.grantedResult(false);
+        }
+    }
+
+    /** 锁内的"目标 + 四邻"占用检查；被阻塞返回拒绝结果，可占返回 null。 */
+    private ClaimResult checkBlockedLocked(ChunkKey key, UUID groupId) {
+        // 目标区块本身：被其他组占用即拒绝
+        ClaimInfo existing = claims.get(key);
+        if (existing != null && !existing.groupId().equals(groupId)) {
+            return ClaimResult.rejected(key, existing.groupId());
+        }
+        // 缓冲层（东西南北四邻）：任何一格被其他组占用即拒绝
+        for (ChunkKey neighbor : key.neighbors4()) {
+            ClaimInfo info = claims.get(neighbor);
+            if (info != null && !info.groupId().equals(groupId)) {
+                return ClaimResult.rejected(neighbor, info.groupId());
+            }
+        }
+        return null;
     }
 
     /**
@@ -247,49 +261,18 @@ public final class ChunkRegistry {
     // ------------------------------------------------------------ 持久化
 
     /**
-     * 从持久化目录恢复上次运行的占用状态（服务端启动时调用一次）。
-     * 单条坏数据跳过不中断（宁可丢一条记录也不能让服务端起不来）。
+     * 从持久化后端恢复上次运行的占用状态（服务端启动时调用一次）。
+     * 坏数据由后端自行跳过（宁可丢一条记录也不能让服务端起不来）。
      */
     public void load() {
-        if (!Files.isDirectory(persistDir)) {
-            return; // 首次运行还没有注册表目录
-        }
-        int loaded = 0;
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(persistDir, "*.json")) {
-            for (Path file : stream) {
-                loaded += loadFile(file);
+        Map<ChunkKey, UUID> loaded = store.load();
+        long now = System.currentTimeMillis();
+        synchronized (claimLock) {
+            for (Map.Entry<ChunkKey, UUID> e : loaded.entrySet()) {
+                claims.put(e.getKey(), new ClaimInfo(e.getValue(), now));
             }
-        } catch (IOException e) {
-            LOGGER.error("区块注册表目录读取失败: {}", persistDir, e);
         }
-        LOGGER.info("区块注册表已恢复 {} 条占用记录", loaded);
-    }
-
-    /** 读单个维度文件；返回恢复的记录数。 */
-    private int loadFile(Path file) {
-        int count = 0;
-        try {
-            JsonObject root = JsonUtil.readFile(file, JsonObject.class);
-            if (root == null || !root.has("claims") || !root.get("claims").isJsonObject()) {
-                return 0;
-            }
-            JsonObject claimsObj = root.getAsJsonObject("claims");
-            synchronized (claimLock) {
-                for (String keyString : claimsObj.keySet()) {
-                    try {
-                        ChunkKey key = ChunkKey.parse(keyString);
-                        UUID groupId = UUID.fromString(claimsObj.get(keyString).getAsString());
-                        claims.put(key, new ClaimInfo(groupId, System.currentTimeMillis()));
-                        count++;
-                    } catch (Exception e) {
-                        LOGGER.warn("跳过注册表坏记录: {} ({})", keyString, e.toString());
-                    }
-                }
-            }
-        } catch (Exception e) {
-            LOGGER.warn("注册表文件读取失败，跳过: {}", file, e);
-        }
-        return count;
+        LOGGER.info("区块注册表已恢复 {} 条占用记录（后端: {}）", loaded.size(), store.describe());
     }
 
     /** 启动定期落盘（scheduler 驱动；幂等）。 */
@@ -314,6 +297,7 @@ public final class ChunkRegistry {
             task.cancel(false);
         }
         persist();
+        store.close();
     }
 
     /** 有变更才落盘（定期任务用）。 */
@@ -323,47 +307,17 @@ public final class ChunkRegistry {
         }
     }
 
-    /**
-     * 全量落盘：按维度分组写 {@code <维度>.json}（原子写）。
-     * 已清空的维度也要写空文件覆盖旧内容（否则重启会复活已释放的占用）。
-     */
+    /** 全量落盘：锁内取快照（与 claim/release 互斥），锁外交给后端做序列化与 IO。 */
     public void persist() {
-        // 锁内取快照（保证与 claim/release 互斥），锁外做序列化与磁盘 IO
-        Map<ChunkKey, ClaimInfo> snapshot;
+        Map<ChunkKey, UUID> snapshot;
         synchronized (claimLock) {
-            snapshot = new HashMap<>(claims);
+            snapshot = new HashMap<>();
+            for (Map.Entry<ChunkKey, ClaimInfo> e : claims.entrySet()) {
+                snapshot.put(e.getKey(), e.getValue().groupId());
+            }
             dirty = false;
         }
-        // 按维度分组（TreeMap：输出键序稳定，便于人工 diff）
-        Map<String, Map<String, String>> byDimension = new TreeMap<>();
-        for (Map.Entry<ChunkKey, ClaimInfo> e : snapshot.entrySet()) {
-            byDimension.computeIfAbsent(e.getKey().dimension(), d -> new TreeMap<>())
-                    .put(e.getKey().asString(), e.getValue().groupId().toString());
-        }
-        try {
-            Files.createDirectories(persistDir);
-            // 现存文件对应的维度若本轮没有占用，也要写空覆盖（见方法 Javadoc）
-            List<Path> existing = new ArrayList<>();
-            try (DirectoryStream<Path> stream = Files.newDirectoryStream(persistDir, "*.json")) {
-                stream.forEach(existing::add);
-            }
-            for (Map.Entry<String, Map<String, String>> e : byDimension.entrySet()) {
-                Path file = persistDir.resolve(P2PPaths.sanitize(e.getKey()) + ".json");
-                JsonObject root = new JsonObject();
-                JsonObject claimsObj = new JsonObject();
-                e.getValue().forEach(claimsObj::addProperty);
-                root.add("claims", claimsObj);
-                JsonUtil.writeFileAtomic(file, root);
-                existing.remove(file.toAbsolutePath().normalize());
-                existing.remove(file);
-            }
-            for (Path stale : existing) {
-                // 该维度已无任何占用：删除旧文件（等价写空）
-                Files.deleteIfExists(stale);
-            }
-        } catch (IOException e) {
-            LOGGER.error("区块注册表落盘失败: {}", persistDir, e);
-        }
+        store.save(snapshot);
     }
 
     /** 当前占用总数（诊断/测试用）。 */

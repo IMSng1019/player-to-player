@@ -14,7 +14,11 @@ import imsng.player_to_player.core.ClientRole;
 import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.env.EnvSyncClient;
 import imsng.player_to_player.env.ModPrefixResolver;
+import imsng.player_to_player.group.ChatRelay;
+import imsng.player_to_player.group.CommandRelayClient;
 import imsng.player_to_player.group.GroupRuntime;
+import imsng.player_to_player.group.PearlHandoff;
+import imsng.player_to_player.group.PortalPreloader;
 import imsng.player_to_player.netproto.ControlClient;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
@@ -158,6 +162,10 @@ public final class WorldSession {
         P2PSessions.closeAll();
         RelayConnector.closeAll();
         MergeClient.reset(); // 合并触发面/预同步暂存不得跨会话残留
+        // Phase 4 各子系统的限速/在途状态同样不得跨会话残留（全部幂等）
+        CommandRelayClient.reset();
+        PearlHandoff.reset();
+        PortalPreloader.reset();
         WorldSwitcher.markTunnelPort(0); // 清除隧道口登记，防旧端口误匹配下次加入
         NodeContext ctx = NodeContext.get();
         ctx.setGroupId(null);
@@ -177,6 +185,7 @@ public final class WorldSession {
             return;
         }
         ctx.setClientId(playerId);
+        ctx.setPlayerName(playerName); // 日志上传等落盘命名用（Phase 4）
 
         // ---- 1. 解析服务端主机（地址可能是 "host:MC端口"，控制端口独立于 MC 端口）----
         String host = stripPort(rawAddress);
@@ -238,6 +247,12 @@ public final class WorldSession {
             // 合并/分离客户端（Phase 3）：MERGE_PLAN/ABORT/COMMIT 处理器 +
             // 区块拒绝触发面（服务端可能在角色指派后的任意时刻下发合并计划）
             MergeClient.register(cc, conn);
+            // Phase 4 逐级路由入站面：其他组指令的转发执行、跨组聊天/私聊重放、
+            // 末影珍珠交接/落点回报（处理器内部按"是否有被接管集成服务端"门控，
+            // 副客户端收到这些推送时 GroupRuntime.server()==null，安全忽略）
+            CommandRelayClient.register(cc);
+            ChatRelay.register(cc);
+            PearlHandoff.register(cc);
             // 分离晋升（Phase 3）：服务端主动推送的 ROLE_ASSIGN（不带 _rid，
             // 不会与 requestRoleAndSwitch 的 reply 路径冲突 —— 带 _rid 的应答
             // 在连接层被 pending future 消费，永远不进处理器分发）

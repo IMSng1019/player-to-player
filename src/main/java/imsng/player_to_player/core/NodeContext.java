@@ -28,6 +28,8 @@ public final class NodeContext {
     private volatile UUID clientId;
     /** 本客户端所属组客户端的标识（约定为当前主客户端的 clientId）。 */
     private volatile UUID groupId;
+    /** 本客户端玩家名（加入世界时由会话层写入；日志上传等落盘命名用）。 */
+    private volatile String playerName;
     /** 本机算力评分（模组加载时异步测得，加入世界时上报服务端）。 */
     private volatile ComputeScore computeScore;
     /** NAT 探测结果（模组加载时异步测得）。 */
@@ -74,6 +76,14 @@ public final class NodeContext {
 
     public void setGroupId(UUID groupId) {
         this.groupId = groupId;
+    }
+
+    public String playerName() {
+        return playerName;
+    }
+
+    public void setPlayerName(String playerName) {
+        this.playerName = playerName;
     }
 
     public ComputeScore computeScore() {

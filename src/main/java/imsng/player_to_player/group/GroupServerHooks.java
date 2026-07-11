@@ -64,6 +64,8 @@ public final class GroupServerHooks {
         // 最终区块状态丢失上行；完全停止后再解除并通知会话层做延迟拆除
         ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
             SplitMonitor.reset(); // 分离计时状态不得跨世界残留
+            PearlHandoff.reset(); // 珍珠探测/交接在途状态同理（Phase 4）
+            PortalPreloader.reset(); // 传送门预检限速表同理（Phase 4）
             GroupRuntime.detach(server);
         });
 

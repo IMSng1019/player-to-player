@@ -205,6 +205,18 @@ public final class GroupTable {
         return groups.containsKey(groupId);
     }
 
+    /**
+     * 全部在线组的主客户端快照（Phase 4 指令/聊天分发用：服务端把消息下放给
+     * "其他的主客户端"）。防御性拷贝，调用方可自由过滤。
+     */
+    public Map<UUID, UUID> primariesSnapshot() {
+        Map<UUID, UUID> result = new java.util.HashMap<>();
+        for (GroupInfo info : groups.values()) {
+            result.put(info.groupId(), info.primaryClientId());
+        }
+        return result;
+    }
+
     /** 清空全表（服务停止时调用）。 */
     public void clear() {
         synchronized (lock) {

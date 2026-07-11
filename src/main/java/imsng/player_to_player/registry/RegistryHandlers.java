@@ -24,6 +24,10 @@ import java.util.UUID;
  *       数据由主客户端发给服务端"：binary 非空时先经 {@link ChunkWriteback} 写回
  *       MCA 并刷盘，<b>再</b>释放占用 —— 顺序保证释放一经确认，其他组随后的申请
  *       立刻能看到 hasServerData=true；</li>
+ *   <li>{@code CHUNK_PROBE_REQUEST}（json: dimension, x, z, groupId）→
+ *       {@code CHUNK_PROBE_RESPONSE}（blocked / blockingChunk / blockingGroup）：
+ *       与申请同一套"目标+四邻"检查但<b>不登记占用</b>（Phase 4 传送门预检、
+ *       末影珍珠交接判定用，纯内存查表）；</li>
  *   <li>{@code PLAYER_POS_UPDATE}（json: uuid, dimension, x, y, z）：刷新玩家表，无应答。</li>
  * </ul>
  * <p>
@@ -49,6 +53,7 @@ public final class RegistryHandlers {
                                 ChunkWriteback writeback) {
         reg.on(MessageType.CHUNK_CLAIM_REQUEST, (conn, msg) -> handleClaim(conn, msg, registry));
         reg.on(MessageType.CHUNK_RELEASE, (conn, msg) -> handleRelease(conn, msg, registry, writeback));
+        reg.on(MessageType.CHUNK_PROBE_REQUEST, (conn, msg) -> handleProbe(conn, msg, registry));
         reg.on(MessageType.PLAYER_POS_UPDATE, (conn, msg) -> handlePosUpdate(conn, msg, players));
     }
 
@@ -110,6 +115,26 @@ public final class RegistryHandlers {
             out.addProperty("finalDataWritten", written);
             conn.send(msg.reply(MessageType.CHUNK_RELEASE_ACK, out, null));
         });
+    }
+
+    // ------------------------------------------------------------ 区块探测
+
+    /** 只读探测（Phase 4）：纯内存查表，Netty 线程直接应答，无磁盘 IO。 */
+    private static void handleProbe(ControlConnection conn, ControlMessage msg, ChunkRegistry registry) {
+        ChunkKey key = parseKey(msg.json());
+        UUID groupId = parseUuid(JsonUtil.getString(msg.json(), "groupId", ""));
+        if (key == null || groupId == null) {
+            conn.send(error(msg, "invalid_request", "dimension/x/z/groupId 缺失或非法"));
+            return;
+        }
+        ChunkRegistry.ClaimResult result = registry.probe(key, groupId);
+        JsonObject out = new JsonObject();
+        out.addProperty("blocked", !result.granted());
+        if (!result.granted()) {
+            out.addProperty("blockingChunk", result.blockingChunk().asString());
+            out.addProperty("blockingGroup", result.blockingGroup().toString());
+        }
+        conn.send(msg.reply(MessageType.CHUNK_PROBE_RESPONSE, out, null));
     }
 
     // ------------------------------------------------------------ 玩家位置

@@ -10,13 +10,14 @@ import java.util.Map;
  * <pre>
  *   1-9    连接管理（握手/心跳/错误）
  *   10-19  环境文件同步与 mod 分发
- *   20-29  区块注册表（申请/释放/数据）
+ *   20-29  区块注册表（申请/释放/数据/探测）
  *   30-39  算力与角色
  *   40-49  P2P 打洞协助
  *   50-59  中转（relay）
  *   60-69  日志
- *   70-79  指令与聊天路由（Phase 4 占位）
+ *   70-79  指令与聊天路由（Phase 4）
  *   80-89  合并与分离（Phase 3）
+ *   90-99  特殊加载：末影珍珠/传送门（Phase 4）
  * </pre>
  * 新增类型只增不改号，保证协议向后兼容。
  */
@@ -63,6 +64,15 @@ public enum MessageType {
     CHUNK_DATA_REQUEST(25),
     /** S→C 区块数据（binary: 区块 NBT）。 */
     CHUNK_DATA(26),
+    /**
+     * C→S 区块占用<b>只读探测</b>（Phase 4；json: dimension, x, z, groupId）：
+     * 与 {@link #CHUNK_CLAIM_REQUEST} 同一套"目标 + 四邻"检查，但<b>不登记任何占用</b>。
+     * 传送门预检（玩家站进传送门时提前检查对面维度是否被其他组占用，被占则提前
+     * 触发预连接/合并）与末影珍珠交接判定（珍珠即将飞入的区块归属查询）共用。
+     */
+    CHUNK_PROBE_REQUEST(27),
+    /** S→C 探测结果（json: blocked, blockingChunk, blockingGroup；空闲时 blocked=false）。 */
+    CHUNK_PROBE_RESPONSE(28),
 
     // ---------------------------------------------------------- 算力角色 30-39
     /** C→S 算力上报（json: ComputeScore 序列化）。 */
@@ -77,6 +87,12 @@ public enum MessageType {
      * 作为应答（携带 _rid）。
      */
     ROLE_REQUEST(33),
+    /**
+     * C→S 组世界就绪通告（Phase 4）：主客户端的集成服务端完成 LAN 发布、可以
+     * 接待副客户端隧道时发出（json: groupId）。服务端据此冲刷组分离时暂存的
+     * 副客户端重定向指派（新主的世界没就绪前推送重定向必然失败）。
+     */
+    GROUP_WORLD_READY(34),
 
     // ---------------------------------------------------------- 打洞协助 40-49
     /** C→S 请求与目标组的主客户端建立 P2P（json: targetGroupId 或 targetClientId）。 */
@@ -104,9 +120,32 @@ public enum MessageType {
     LOG_UPLOAD(60),
 
     // ------------------------------------------------ 指令与聊天路由 70-79（Phase 4）
-    /** 指令逐级传递（副→主→中转→服务端→其他主→其他副）。 */
+    /**
+     * 指令逐级传递（规范"服务器的指令处理"：副→主→中转→服务端→其他主→其他副）。
+     * 三种用法靠 JSON 字段区分，应答一律 reply 同类型（_rid 关联）：
+     * <ul>
+     *   <li><b>上送</b> C→S（json: playerUuid, playerName, command）：主客户端把本组
+     *       集成服务端执行失败的玩家指令上送（副客户端的指令经隧道在主客户端的
+     *       集成服务端执行，失败信号在主客户端捕获 —— "副→主"一级是原版语义）；</li>
+     *   <li><b>转发执行</b> S→C（json: execute=true, command, sourceName,
+     *       permissionLevel）：服务端把指令分发给其他组的主客户端尝试执行，
+     *       应答 {executed, message}；</li>
+     *   <li><b>上送应答</b> S→C reply（json: handled, message, action?）：handled=true 且
+     *       action="teleport" 时附 dimension/x/y/z —— 服务端按玩家表解析出的跨组 tp，
+     *       由发起方主客户端在本地执行传送（随后的移动由加载门控/分离监视接管）。</li>
+     * </ul>
+     */
     COMMAND_RELAY(70),
-    /** 聊天/系统消息全网分发。 */
+    /**
+     * 聊天/系统消息全网分发（规范"服务器的信息处理"）。
+     * <ul>
+     *   <li>C→S（json: playerUuid, playerName, text）：主客户端上送本组聊天
+     *       （含副客户端 —— 它们的聊天经隧道天然汇聚到主客户端的集成服务端）；</li>
+     *   <li>S→C（json: playerName, text [, privateTo]）：服务端向其他组的主客户端
+     *       推送，主客户端在本组集成服务端内广播（副客户端经原版链路看到）；
+     *       privateTo 非空 = 跨组私聊（/msg），只投递给该玩家。</li>
+     * </ul>
+     */
     CHAT_RELAY(71),
 
     // ---------------------------------------------------- 合并与分离 80-89（Phase 3）
@@ -161,7 +200,28 @@ public enum MessageType {
     /** C→S 请求玩家数据（json: playerUuid）；本人或其组主客户端可请求。 */
     PLAYER_DATA_REQUEST(88),
     /** S→C 玩家数据（json: exists；binary: gzip 玩家 NBT）。 */
-    PLAYER_DATA(89);
+    PLAYER_DATA(89),
+
+    // ---------------------------------------------------- 特殊加载 90-99（Phase 4）
+    /**
+     * 末影珍珠交接（规范"末影珍珠"特殊加载）。双向复用：
+     * <ul>
+     *   <li>C→S（json: targetGroupId, dimension, throwerUuid, throwerName；
+     *       binary: gzip 珍珠 NBT）：珍珠即将飞入被其他组占用/缓冲的区块时，
+     *       抛出者所在组把珍珠实体整体交给目标组演算（避免为一颗珍珠触发合并 ——
+     *       规范"该加载方案可以使合并次数大量减少"）；</li>
+     *   <li>S→C（同 json + binary）：服务端转发给目标组主客户端，其在本组
+     *       集成服务端内重生成珍珠实体继续飞行。</li>
+     * </ul>
+     */
+    PEARL_HANDOFF(90),
+    /**
+     * 末影珍珠落点回报（json: throwerUuid, dimension, x, y, z）。
+     * 落点组主客户端→S→抛出者所在组主客户端：规范"当末影珍珠落地后则看做一个
+     * 小型的 tp 指令"——抛出者的主客户端把玩家传送到落点（含跨维度 + 原版 5 点
+     * 摔落伤害），随后的合并/分离由加载门控与分离监视自然接管。
+     */
+    PEARL_LANDED(91);
 
     private final int id;
 

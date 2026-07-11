@@ -1,5 +1,6 @@
 package imsng.player_to_player.group;
 
+import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.netproto.ControlConnection;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -107,6 +108,8 @@ public final class GroupRuntime {
         uploadService = new ChunkUploadService(plan.serverConn(), plan.groupId());
         serverConn = plan.serverConn();
         groupId = plan.groupId();
+        // Phase 4：主客户端日志上行（规范"主客户端的日志需要发给服务端储存"）
+        LogUploader.start(plan.serverConn(), NodeContext.get().playerName());
         LOGGER.info("集成服务端已被组运行时接管: groupId={}", plan.groupId());
         try {
             plan.onServerStarted().accept(server);
@@ -129,6 +132,7 @@ public final class GroupRuntime {
         groupId = null;
         managedServer = null;
         tickFrozen = false; // 冻结旗标不得跨接管残留
+        LogUploader.stop(); // Phase 4：日志上行随接管终止
         if (claims != null) {
             claims.shutdown();
         }

@@ -1,6 +1,10 @@
 package imsng.player_to_player.client.group;
 
 import com.google.gson.JsonObject;
+import imsng.player_to_player.group.GroupRuntime;
+import imsng.player_to_player.netproto.ControlConnection;
+import imsng.player_to_player.netproto.ControlMessage;
+import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.p2p.P2PSessions;
 import imsng.player_to_player.p2p.ReliableChannel;
 import imsng.player_to_player.p2p.TcpTunnel;
@@ -12,6 +16,8 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.util.HttpUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.util.UUID;
 
 /**
  * 组宿主（主客户端，Phase 2/3）：集成服务端被接管后的对外接待面。
@@ -70,6 +76,16 @@ public final class GroupHost {
             if (integrated.publishServer(server.getDefaultGameType(), false, port)) {
                 lanPort = port;
                 LOGGER.info("集成服务端已发布 LAN 端口 {}，等待副客户端经隧道加入", port);
+                // Phase 4 组分离：向服务端通告"组世界就绪"——它据此冲刷分离时
+                // 暂存的副客户端重定向（早于此刻推送 ROLE_ASSIGN 隧道必然扑空）。
+                // 无暂存项时服务端按空操作处理，普通开组也发无妨
+                ControlConnection conn = GroupRuntime.conn();
+                UUID groupId = GroupRuntime.activeGroupId();
+                if (conn != null && conn.isOpen() && groupId != null) {
+                    JsonObject ready = new JsonObject();
+                    ready.addProperty("groupId", groupId.toString());
+                    conn.send(ControlMessage.of(MessageType.GROUP_WORLD_READY, ready));
+                }
             } else {
                 LOGGER.error("集成服务端 LAN 发布失败（端口 {}），副客户端将无法加入", port);
             }

@@ -6,8 +6,11 @@
 		"ChunkMapAccess",
 		"ChunkMapMixin",
 		"ChunkStorageMixin",
+		"CommandsMixin",
+		"EntityPortalMixin",
 		"MinecraftServerMixin",
-		"ServerLevelMixin"
+		"ServerLevelMixin",
+		"ThrownEnderpearlMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

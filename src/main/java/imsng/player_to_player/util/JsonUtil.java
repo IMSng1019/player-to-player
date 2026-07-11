@@ -109,4 +109,18 @@ public final class JsonUtil {
             return fallback;
         }
     }
+
+    /** 安全读取双精度字段，缺失或类型不符返回默认值。 */
+    public static double getDouble(JsonObject obj, String key, double fallback) {
+        JsonElement el = obj.get(key);
+        if (el == null || !el.isJsonPrimitive()) {
+            return fallback;
+        }
+        try {
+            return el.getAsDouble();
+        } catch (NumberFormatException | UnsupportedOperationException e) {
+            // 同 getInt：入站 JSON 不可信，非数字原始值按缺失处理
+            return fallback;
+        }
+    }
 }
