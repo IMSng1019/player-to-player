@@ -13,15 +13,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.channels.SeekableByteChannel;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.Arrays;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.function.Supplier;
 
 /**
  * 环境同步 —— 服务端侧消息处理器（Phase 1 仅挂接在服务端；规范允许中转服务端也
@@ -37,9 +31,9 @@ import java.util.function.Supplier;
  *       （块大小 {@link GlobalConfig#envFileChunkBytes}）；</li>
  *   <li>{@link MessageType#MOD_LIST_REQUEST}：mods/ 目录清单 + 前缀解析结果。</li>
  * </ul>
- * <b>安全</b>：入站路径一律做目录穿越校验（normalize 后必须仍在 serverRoot 内
- * <b>且</b>在清单中）—— 清单是白名单，凡是没被扫描进清单的文件（被排除的
- * world/region、player-to-player 私有数据等）即使物理存在也拒绝下发。
+ * <b>一致性与安全</b>：清单响应携带 {@code snapshotId}，后续每个文件请求必须指定
+ * 同一 ID；文件内容只从该不可变快照的内容寻址 Blob 读取。路径仍以快照清单为白名单，
+ * 请求方无法借相对路径访问源目录中的任意文件。
  * <p>
  * <b>线程</b>：handle 运行在 Netty 事件循环，磁盘读一律转 {@link ThreadPools#io()}。
  */
@@ -57,21 +51,17 @@ public final class EnvSyncServerHandlers {
      * 注册全部环境同步处理器。
      *
      * @param reg        消息路由注册表（ControlServer）
-     * @param serverRoot 服务端根目录（环境文件的物理位置，清单路径都相对它）
-     * @param manifest   环境清单提供者（服务端启动时扫描生成；用 Supplier 以便
-     *                   将来环境文件更新后热替换清单，处理器无需重新注册）
-     * @param config     总配置（分块大小等）
+     * @param snapshots 不可变环境快照管理器
+     * @param config    总配置（分块大小等）
      */
-    public static void register(HandlerRegistry reg, Path serverRoot,
-                                Supplier<EnvironmentManifest> manifest, GlobalConfig config) {
-        Path normalizedRoot = serverRoot.toAbsolutePath().normalize();
-
+    public static void register(HandlerRegistry reg, EnvironmentSnapshotManager snapshots,
+                                GlobalConfig config) {
         reg.on(MessageType.ENV_MANIFEST_REQUEST, (conn, msg) ->
-                handleManifestRequest(conn, msg, manifest));
+                handleManifestRequest(conn, msg, snapshots));
         reg.on(MessageType.ENV_FILE_REQUEST, (conn, msg) ->
-                handleFileRequest(conn, msg, normalizedRoot, manifest, config));
+                handleFileRequest(conn, msg, snapshots, config));
         reg.on(MessageType.MOD_LIST_REQUEST, (conn, msg) ->
-                handleModListRequest(conn, msg, manifest));
+                handleModListRequest(conn, msg, snapshots));
     }
 
     // ------------------------------------------------------------ ENV_MANIFEST
@@ -89,14 +79,13 @@ public final class EnvSyncServerHandlers {
      * </ul>
      */
     private static void handleManifestRequest(ControlConnection conn, ControlMessage msg,
-                                              Supplier<EnvironmentManifest> manifest) {
-        // 扫描未完成/失败时清单为 null：显式回 ERROR 让客户端请求快速失败，
-        // 不能让 NPE 在 Netty 事件循环上被吞掉导致对端傻等 15 秒超时
-        EnvironmentManifest full = manifest.get();
-        if (full == null) {
+                                              EnvironmentSnapshotManager snapshots) {
+        EnvironmentSnapshot snapshot = snapshots.current();
+        if (snapshot == null) {
             conn.send(error(msg, "env_not_ready", "环境清单尚未就绪（扫描中或扫描失败）"));
             return;
         }
+        EnvironmentManifest full = snapshot.manifest();
         String targetName = JsonUtil.getString(msg.json(), "target", "");
         ModPrefixResolver.Target target = parseTarget(targetName);
         // 过滤要重建 TreeMap 并重算全局哈希，大清单下非零成本，转 io() 池执行
@@ -104,6 +93,7 @@ public final class EnvSyncServerHandlers {
             try {
                 EnvironmentManifest filtered = filterForTarget(full, target);
                 JsonObject out = new JsonObject();
+                out.addProperty("snapshotId", snapshot.snapshotId());
                 out.addProperty("globalHash", full.globalHash());
                 out.addProperty("filteredHash", filtered.globalHash());
                 out.add("manifest", filtered.toJson());
@@ -151,32 +141,29 @@ public final class EnvSyncServerHandlers {
      * 客户端断线重连后可从任意 offset 续传。
      */
     private static void handleFileRequest(ControlConnection conn, ControlMessage msg,
-                                          Path serverRoot, Supplier<EnvironmentManifest> manifest,
+                                          EnvironmentSnapshotManager snapshots,
                                           GlobalConfig config) {
+        String snapshotId = JsonUtil.getString(msg.json(), "snapshotId", "");
         String path = JsonUtil.getString(msg.json(), "path", "");
         long offset = JsonUtil.getLong(msg.json(), "offset", -1L);
 
-        // ---- 就绪校验：扫描未完成/失败时清单为 null，回 ERROR 快速失败 ----
-        // （恶意客户端可无视 envReady=false 直接请求，NPE 会在事件循环上被吞、对端傻等 15 秒）
-        EnvironmentManifest current = manifest.get();
-        if (current == null) {
-            conn.send(error(msg, "env_not_ready", "环境清单尚未就绪（扫描中或扫描失败）"));
+        if (snapshotId.isBlank()) {
+            conn.send(error(msg, "invalid_snapshot", "缺少 snapshotId"));
             return;
         }
-        // ---- 白名单校验：必须在清单中（清单键即合法路径全集）----
-        if (path.isEmpty() || !current.files().containsKey(path)) {
+        EnvironmentSnapshot snapshot = snapshots.find(snapshotId);
+        if (snapshot == null) {
+            conn.send(error(msg, "snapshot_not_found", "环境快照不存在或已过期: " + snapshotId));
+            return;
+        }
+        EnvironmentManifest.Entry entry;
+        try {
+            entry = snapshots.entry(snapshot, path);
+        } catch (IOException e) {
             conn.send(error(msg, "not_in_manifest", "路径不在环境清单中: " + path));
             return;
         }
-        // ---- 目录穿越校验：normalize 后仍须位于 serverRoot 内 ----
-        // （清单键理论上都合法，此处防御清单生成逻辑被绕过/路径中夹带 ".."）
-        Path resolved = serverRoot.resolve(path).normalize();
-        if (!resolved.startsWith(serverRoot)) {
-            LOGGER.warn("拒绝目录穿越请求: {} (来自 {})", path, conn.remoteAddress());
-            conn.send(error(msg, "invalid_path", "非法路径"));
-            return;
-        }
-        if (offset < 0) {
+        if (offset < 0 || offset > entry.size()) {
             conn.send(error(msg, "invalid_offset", "offset 非法: " + offset));
             return;
         }
@@ -184,44 +171,23 @@ public final class EnvSyncServerHandlers {
         // 磁盘读转 io() 池，绝不占用 Netty 事件循环
         ThreadPools.io().execute(() -> {
             try {
-                long total = Files.size(resolved);
-                if (offset > total) {
-                    conn.send(error(msg, "invalid_offset", "offset 超出文件大小"));
-                    return;
-                }
                 int chunkBytes = Math.max(1, config.envFileChunkBytes);
-                int toRead = (int) Math.min(chunkBytes, total - offset);
-                byte[] chunk = readAt(resolved, offset, toRead);
-                boolean last = offset + chunk.length >= total;
+                byte[] chunk = snapshots.readChunk(snapshot, path, offset, chunkBytes);
+                boolean last = offset + chunk.length >= entry.size();
 
                 JsonObject out = new JsonObject();
+                out.addProperty("snapshotId", snapshot.snapshotId());
                 out.addProperty("path", path);
                 out.addProperty("offset", offset);
-                out.addProperty("total", total);
+                out.addProperty("total", entry.size());
                 out.addProperty("last", last);
                 conn.send(msg.reply(MessageType.ENV_FILE_DATA, out, chunk));
             } catch (IOException e) {
-                LOGGER.warn("环境文件读取失败: {}", path, e);
+                LOGGER.warn("环境快照文件读取失败: {}@{}", snapshotId, path, e);
+                snapshots.requestRefresh();
                 conn.send(error(msg, "read_failed", e.toString()));
             }
         });
-    }
-
-    /** 从指定偏移读取定长字节（文件尾部不足时返回实际读到的长度）。 */
-    private static byte[] readAt(Path file, long offset, int length) throws IOException {
-        try (SeekableByteChannel channel = Files.newByteChannel(file)) {
-            channel.position(offset);
-            ByteBuffer buffer = ByteBuffer.allocate(length);
-            while (buffer.hasRemaining()) {
-                if (channel.read(buffer) < 0) {
-                    break; // EOF：文件比清单记录的小（同步窗口内被改动），按实际返回
-                }
-            }
-            buffer.flip();
-            return buffer.limit() == length
-                    ? buffer.array()
-                    : Arrays.copyOf(buffer.array(), buffer.limit());
-        }
     }
 
     // ------------------------------------------------------------ MOD_LIST
@@ -234,13 +200,13 @@ public final class EnvSyncServerHandlers {
      * target 缺失/未知时列出全部（与清单过滤同样的容忍策略）。
      */
     private static void handleModListRequest(ControlConnection conn, ControlMessage msg,
-                                             Supplier<EnvironmentManifest> manifest) {
-        // 就绪校验：同 handleFileRequest —— 清单为 null 时回 ERROR，不让客户端傻等超时
-        EnvironmentManifest current = manifest.get();
-        if (current == null) {
+                                             EnvironmentSnapshotManager snapshots) {
+        EnvironmentSnapshot snapshot = snapshots.current();
+        if (snapshot == null) {
             conn.send(error(msg, "env_not_ready", "环境清单尚未就绪（扫描中或扫描失败）"));
             return;
         }
+        EnvironmentManifest current = snapshot.manifest();
         String targetName = JsonUtil.getString(msg.json(), "target", "");
         ModPrefixResolver.Target target = parseTarget(targetName);
         ThreadPools.io().execute(() -> {

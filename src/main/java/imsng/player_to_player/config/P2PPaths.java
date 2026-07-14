@@ -59,6 +59,26 @@ public final class P2PPaths {
         return root.resolve("logs");
     }
 
+    /** [服务端/中转端] 版本化不可变环境快照仓库。 */
+    public Path environmentSnapshotsDir() {
+        return root.resolve("environment-snapshots");
+    }
+
+    /** 快照内容寻址 Blob 目录。 */
+    public Path environmentSnapshotBlobsDir() {
+        return environmentSnapshotsDir().resolve("blobs");
+    }
+
+    /** 已发布快照清单目录。 */
+    public Path environmentSnapshotManifestsDir() {
+        return environmentSnapshotsDir().resolve("manifests");
+    }
+
+    /** 快照构建临时目录；其中内容在发布前不可见。 */
+    public Path environmentSnapshotStagingDir() {
+        return environmentSnapshotsDir().resolve("staging");
+    }
+
     /**
      * [中转服务端] 从上级服务端同步来的环境文件缓存目录（Phase 2）。
      * 中转端以此目录为根复用 EnvSyncServerHandlers 向客户端分发环境文件。

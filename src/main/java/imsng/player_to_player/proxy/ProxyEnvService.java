@@ -6,8 +6,7 @@ import imsng.player_to_player.config.P2PPaths;
 import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.env.EnvSyncClient;
 import imsng.player_to_player.env.EnvSyncServerHandlers;
-import imsng.player_to_player.env.EnvironmentManifest;
-import imsng.player_to_player.env.EnvironmentScanner;
+import imsng.player_to_player.env.EnvironmentSnapshotManager;
 import imsng.player_to_player.netproto.ControlClient;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
@@ -57,8 +56,8 @@ public final class ProxyEnvService {
     private final GlobalConfig config;
     private final P2PPaths paths;
 
-    /** 本地缓存目录的环境清单；null = 首次同步未完成（分发暂不可用）。 */
-    private volatile EnvironmentManifest manifest;
+    /** 下游分发使用的不可变快照管理器；首次上游同步成功前不启动。 */
+    private final EnvironmentSnapshotManager snapshots;
 
     /** 定期重同步任务；stop 时取消。 */
     private volatile ScheduledFuture<?> resyncTask;
@@ -68,6 +67,9 @@ public final class ProxyEnvService {
     public ProxyEnvService(GlobalConfig config, P2PPaths paths) {
         this.config = config;
         this.paths = paths;
+        this.snapshots = new EnvironmentSnapshotManager(
+                paths.proxyEnvDir(), paths.environmentSnapshotsDir(), List.of(),
+                config.envSnapshotRetentionMinutes);
     }
 
     /**
@@ -83,9 +85,10 @@ public final class ProxyEnvService {
             return false;
         }
         running = true;
-        // 对外分发面：服务根 = 中转缓存目录，清单 = volatile 发布的本地扫描结果
+        // 对外分发面始终读取不可变快照；首次上游同步完成前 current=null，
+        // EnvSyncServerHandlers 会明确返回 env_not_ready。
         relay.setExtraHandlers((ControlServer control) -> EnvSyncServerHandlers.register(
-                control, paths.proxyEnvDir(), () -> manifest, config));
+                control, snapshots, config));
 
         // 上游同步循环（io 线程）：首轮立即，失败退避重试；成功后转定期校验
         ThreadPools.io().execute(() -> initialSyncLoop(parent));
@@ -136,6 +139,8 @@ public final class ProxyEnvService {
             }
         }
         ControlClient cc = new ControlClient(host, port);
+        boolean sourceUpdateBegun = false;
+        boolean publishUpdate = false;
         try {
             ControlConnection conn = cc.connect();
             // HELLO：过上级服务端的未鉴权白名单门（version + clientId 即可被接受）
@@ -156,17 +161,24 @@ public final class ProxyEnvService {
                 return false;
             }
             // 全量视图同步（target=null：不过滤，中转端持有整仓）
+            snapshots.beginSourceUpdate();
+            sourceUpdateBegun = true;
             new EnvSyncClient(conn, config).syncTo(paths.proxyEnvDir(), null).join();
-            // 本地扫描 → 发布清单（客户端的分发请求以本地真实状态为准）
-            EnvironmentManifest scanned = EnvironmentScanner.scan(paths.proxyEnvDir(), List.of());
-            manifest = scanned;
-            LOGGER.info("中转端环境同步完成: {} 个文件, 全局哈希 {}",
-                    scanned.files().size(), scanned.globalHash());
+            // 首轮成功后才启动管理器，避免把空缓存发布成“就绪环境”；后续调用幂等。
+            snapshots.start();
+            publishUpdate = true;
+            LOGGER.info("中转端上游环境同步完成，已触发不可变快照发布");
             return true;
         } catch (Exception e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             LOGGER.warn("中转端环境同步失败（{} 秒后重试）: {}", RETRY_SECONDS, e.toString());
             return false;
         } finally {
+            if (sourceUpdateBegun) {
+                snapshots.endSourceUpdate(publishUpdate);
+            }
             cc.close();
         }
     }
@@ -179,5 +191,6 @@ public final class ProxyEnvService {
         if (task != null) {
             task.cancel(false);
         }
+        snapshots.stop();
     }
 }

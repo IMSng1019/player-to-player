@@ -4,7 +4,8 @@ import com.google.gson.JsonObject;
 import imsng.player_to_player.compute.ComputeScore;
 import imsng.player_to_player.compute.ComputeTable;
 import imsng.player_to_player.config.GlobalConfig;
-import imsng.player_to_player.env.EnvironmentManifest;
+import imsng.player_to_player.env.EnvironmentSnapshot;
+import imsng.player_to_player.env.EnvironmentSnapshotManager;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.MessageHandler;
@@ -20,7 +21,6 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Supplier;
 
 /**
  * HELLO 握手处理器（服务端）。
@@ -58,16 +58,16 @@ public final class HelloHandler implements MessageHandler {
 
     private final GlobalConfig config;
     private final ComputeTable computeTable;
-    /** 环境清单提供者：启动时由 IO 线程异步扫描填充，未完成时 get() 返回 null。 */
-    private final Supplier<EnvironmentManifest> manifest;
+    /** 不可变环境快照管理器：首轮快照未发布时 current() 返回 null。 */
+    private final EnvironmentSnapshotManager snapshots;
     /** 服务端世界名（HELLO_ACK 下发，客户端据此确定 <IP>+<世界名> 世界文件夹）。 */
     private final String worldName;
 
     public HelloHandler(GlobalConfig config, ComputeTable computeTable,
-                        Supplier<EnvironmentManifest> manifest, String worldName) {
+                        EnvironmentSnapshotManager snapshots, String worldName) {
         this.config = config;
         this.computeTable = computeTable;
-        this.manifest = manifest;
+        this.snapshots = snapshots;
         this.worldName = worldName;
     }
 
@@ -114,11 +114,11 @@ public final class HelloHandler implements MessageHandler {
         NAT_TABLE.put(clientId, nat);
 
         // 4. 应答 HELLO_ACK（reply 复制 _rid，使客户端 request() 的 future 完成）
-        EnvironmentManifest current = manifest.get();
+        EnvironmentSnapshot current = snapshots.current();
         JsonObject ack = new JsonObject();
         ack.addProperty("accepted", true);
         // 环境扫描未完成时 envHash 为空串 + envReady=false：客户端应等待后重发 ENV_MANIFEST_REQUEST
-        ack.addProperty("envHash", current != null ? current.globalHash() : "");
+        ack.addProperty("envHash", current != null ? current.snapshotId() : "");
         ack.addProperty("envReady", current != null);
         ack.addProperty("worldName", worldName);
         appendRelayInfo(config, ack);

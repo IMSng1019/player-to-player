@@ -10,7 +10,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -33,39 +32,6 @@ import java.util.stream.Stream;
 public final class EnvironmentScanner {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("player_to_player/env");
-
-    /**
-     * 内置排除项（相对路径前缀，正斜杠、小写比较）。
-     * 除规范列出的目录外追加：
-     * <ul>
-     *   <li>player-to-player（本模组自身数据，含日志收集与注册表，
-     *       不属于要分发给客户端的服务器环境）与 session.lock（MC 运行期锁文件，
-     *       每次启动都变且被持锁进程占用，读了也没意义）；</li>
-     *   <li>含敏感信息/服务器专属的文件：server.properties（含 rcon.password 等凭据，
-     *       绝不能分发给所有客户端）、ops.json、whitelist.json、banned-ips.json、
-     *       banned-players.json、usercache.json（玩家隐私）、eula.txt —— 这些文件
-     *       只对物理服务端有意义，客户端环境用不到。</li>
-     * </ul>
-     * 注 1：规范原文写 "./world/DIM"，实际 MC 目录为 DIM1（末地）/DIM-1（下界），按实际目录排除。
-     * 注 2："world/" 前缀是 level-name=world 时的兜底；level-name 非默认值时由
-     * P2PServerService 根据实际存档目录动态追加对应排除项（见 worldDataExclusions）。
-     */
-    private static final List<String> BUILTIN_EXCLUSIONS = List.of(
-            "logs",
-            "player-to-player",
-            "world/region",
-            "world/poi",
-            "world/entities",
-            "world/DIM-1",
-            "world/DIM1",
-            "session.lock",
-            "server.properties",
-            "ops.json",
-            "whitelist.json",
-            "banned-ips.json",
-            "banned-players.json",
-            "usercache.json",
-            "eula.txt");
 
     /**
      * 哈希任务的最大并发数：min(4, CPU 核数)。
@@ -94,19 +60,7 @@ public final class EnvironmentScanner {
             // 客户端第一次同步时本地环境目录尚不存在，按空清单处理（=全量下载）
             return new EnvironmentManifest(Map.of());
         }
-        // 合并内置排除与服务端自定义排除；排除项统一规范化 + 小写
-        // （Windows 文件系统大小写不敏感，配置写 Logs 也应命中 logs）
-        List<String> exclusions = new ArrayList<>();
-        for (String builtin : BUILTIN_EXCLUSIONS) {
-            exclusions.add(normalize(builtin).toLowerCase(Locale.ROOT));
-        }
-        if (extraExclusions != null) {
-            for (String extra : extraExclusions) {
-                if (extra != null && !extra.isBlank()) {
-                    exclusions.add(normalize(extra).toLowerCase(Locale.ROOT));
-                }
-            }
-        }
+        EnvironmentPathPolicy pathPolicy = EnvironmentPathPolicy.create(extraExclusions);
 
         Path absoluteRoot = root.toAbsolutePath().normalize();
         // 并行哈希的结果容器：并发安全 + 天然有序（EnvironmentManifest 反正还会再排一次）
@@ -120,8 +74,8 @@ public final class EnvironmentScanner {
                 if (!Files.isRegularFile(path)) {
                     return; // 只收文件；目录本身不进清单（空目录不参与环境一致性）
                 }
-                String relative = normalize(absoluteRoot.relativize(path).toString());
-                if (isExcluded(relative, exclusions)) {
+                String relative = pathPolicy.normalize(absoluteRoot.relativize(path).toString());
+                if (!pathPolicy.includes(relative)) {
                     return;
                 }
                 // 在遍历线程上先取许可再提交：io() 是 cached 无界池，每个排队任务都会
@@ -162,40 +116,4 @@ public final class EnvironmentScanner {
         return manifest;
     }
 
-    /**
-     * 排除判断：相对路径本身等于排除项，或位于排除项目录之下（前缀 + "/"）。
-     * 另外按规范补充：{@code *.tmp} 临时文件一律排除
-     * （本模组自身的原子写中间文件与其他程序的临时文件都不属于稳定环境）。
-     */
-    private static boolean isExcluded(String relative, List<String> exclusions) {
-        if (relative.toLowerCase(Locale.ROOT).endsWith(".tmp")) {
-            return true;
-        }
-        String lower = relative.toLowerCase(Locale.ROOT);
-        for (String exclusion : exclusions) {
-            if (lower.equals(exclusion) || lower.startsWith(exclusion + "/")) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * 路径规范化：反斜杠 → 正斜杠（Windows）、去掉开头的 "./" 与 "/"、
-     * 去掉尾部斜杠（"logs/" 与 "logs" 等价）。<b>保留大小写</b> ——
-     * 清单键要按原始大小写传给客户端落盘；排除比较时另行转小写。
-     */
-    private static String normalize(String path) {
-        String p = path.replace('\\', '/');
-        while (p.startsWith("./")) {
-            p = p.substring(2);
-        }
-        while (p.startsWith("/")) {
-            p = p.substring(1);
-        }
-        while (p.endsWith("/")) {
-            p = p.substring(0, p.length() - 1);
-        }
-        return p;
-    }
 }

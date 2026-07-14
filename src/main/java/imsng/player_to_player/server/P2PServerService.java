@@ -6,8 +6,7 @@ import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.config.P2PPaths;
 import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.env.EnvSyncServerHandlers;
-import imsng.player_to_player.env.EnvironmentManifest;
-import imsng.player_to_player.env.EnvironmentScanner;
+import imsng.player_to_player.env.EnvironmentSnapshotManager;
 import imsng.player_to_player.netproto.ControlServer;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.proxy.RelayCore;
@@ -19,7 +18,6 @@ import imsng.player_to_player.registry.PlayerTable;
 import imsng.player_to_player.registry.RegionFileProbe;
 import imsng.player_to_player.registry.RegistryHandlers;
 import imsng.player_to_player.registry.RegistryStore;
-import imsng.player_to_player.util.ThreadPools;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.storage.LevelResource;
@@ -58,8 +56,8 @@ public final class P2PServerService {
     /** 服务是否已启动（volatile：stop 与 start 可能来自不同线程）。 */
     private static volatile boolean running;
 
-    /** 环境清单：IO 线程扫描完成后发布；null = 扫描中（HELLO_ACK envReady=false）。 */
-    private static volatile EnvironmentManifest environmentManifest;
+    /** 实时环境快照管理器；首轮不可变快照发布前 HELLO 返回 envReady=false。 */
+    private static volatile EnvironmentSnapshotManager environmentSnapshots;
 
     private static volatile ControlServer controlServer;
     private static volatile ChunkRegistry chunkRegistry;
@@ -94,27 +92,18 @@ public final class P2PServerService {
         Path serverRoot = FabricLoader.getInstance().getGameDir();
         Path worldRoot = server.getWorldPath(LevelResource.ROOT);
 
-        // b. 环境清单异步扫描：全量 SHA-256 属重 IO，规范要求启动时计算，
-        //    但不能卡 MC 启动 —— 扫完通过 volatile 发布，之前 envReady=false。
-        //    排除表 = 服务端自定义 + 实际存档目录的维度数据（见 worldDataExclusions）
+        // b. 版本化不可变环境快照：排除表 = 管理员配置 + 实际存档的维度数据。
+        //    管理器后台构建首版，随后 WatchService 变化监听 + 60 秒校验实时更新；
+        //    清单与文件内容均绑定同一 snapshotId，运行中的 level.dat 不再造成失配。
         List<String> scanExclusions = new ArrayList<>();
         if (config.nonEnvironmentPaths != null) {
             scanExclusions.addAll(config.nonEnvironmentPaths); // GSON 反序列化可能为 null，防御
         }
         scanExclusions.addAll(worldDataExclusions(serverRoot, worldRoot));
-        environmentManifest = null;
-        ThreadPools.io().execute(() -> {
-            try {
-                EnvironmentManifest scanned =
-                        EnvironmentScanner.scan(serverRoot, scanExclusions);
-                environmentManifest = scanned;
-                LOGGER.info("环境清单扫描完成: {} 个文件, 全局哈希 {}",
-                        scanned.files().size(), scanned.globalHash());
-            } catch (Exception e) {
-                // 扫描失败不致命：环境同步不可用（envReady 恒 false），其余功能照常
-                LOGGER.error("环境清单扫描失败，环境同步将不可用", e);
-            }
-        });
+        EnvironmentSnapshotManager snapshots = new EnvironmentSnapshotManager(
+                serverRoot, paths.environmentSnapshotsDir(), scanExclusions,
+                config.envSnapshotRetentionMinutes);
+        snapshots.start();
 
         // c. 区块注册表：后端选择（Phase 4：MySQL 可选，连接失败回退 JSON —— 注册表
         //    可用性优先于后端偏好）+ 世界 region 文件探测器（hasServerData 判定用）
@@ -143,8 +132,8 @@ public final class P2PServerService {
         // c/d. 控制服务器 + 全部消息处理器
         ControlServer control = new ControlServer(config.controlPort);
         control.on(MessageType.HELLO,
-                new HelloHandler(config, computes, () -> environmentManifest, worldName));
-        EnvSyncServerHandlers.register(control, serverRoot, () -> environmentManifest, config);
+                new HelloHandler(config, computes, snapshots, worldName));
+        EnvSyncServerHandlers.register(control, snapshots, config);
         // 区块数据面（Phase 2）：CHUNK_DATA_REQUEST 下发 / CHUNK_DATA_UPLOAD 实时上行；
         // 返回的写回接口交给 RegistryHandlers 处理 CHUNK_RELEASE 携带的最终数据
         ChunkWriteback writeback = ChunkDataHandlers.register(control, server, registry);
@@ -212,6 +201,7 @@ public final class P2PServerService {
         computeTable = computes;
         groupTable = groups;
         mergeCoordinator = merges;
+        environmentSnapshots = snapshots;
         controlServer = control;
         relayCore = relay;
         running = true;
@@ -270,6 +260,12 @@ public final class P2PServerService {
             control.stop();
         }
 
+        EnvironmentSnapshotManager snapshots = environmentSnapshots;
+        environmentSnapshots = null;
+        if (snapshots != null) {
+            snapshots.stop();
+        }
+
         ChunkRegistry registry = chunkRegistry;
         chunkRegistry = null;
         if (registry != null) {
@@ -294,7 +290,6 @@ public final class P2PServerService {
         if (groups != null) {
             groups.clear();
         }
-        environmentManifest = null;
         HelloHandler.clearAll(); // 清静态在线/NAT 映射，保证下次 start 干净
 
         LOGGER.info("P2P 服务端主服务已停止");

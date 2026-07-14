@@ -109,6 +109,13 @@ public final class GlobalConfig {
      */
     public int proxyEnvResyncMinutes = 10;
 
+    /**
+     * 非当前环境快照从最后访问起的保留时间（分钟）。保留窗口让慢速客户端能够继续
+     * 下载旧 snapshotId；内容寻址 Blob 会跨版本复用，因此默认 120 分钟通常只增加
+     * 少量实际变化文件的磁盘占用。
+     */
+    public int envSnapshotRetentionMinutes = 120;
+
     /** 分块大小下限（64 KB）：再小传输轮次过多，纯浪费往返。 */
     private static final int MIN_ENV_FILE_CHUNK_BYTES = 64 * 1024;
 
@@ -179,6 +186,11 @@ public final class GlobalConfig {
             LOGGER.warn("envFileChunkBytes={} 超出合法区间 [{}, {}]，已校正为 {}",
                     envFileChunkBytes, MIN_ENV_FILE_CHUNK_BYTES, MAX_ENV_FILE_CHUNK_BYTES, clamped);
             envFileChunkBytes = clamped;
+        }
+        if (envSnapshotRetentionMinutes < 10) {
+            LOGGER.warn("envSnapshotRetentionMinutes={} 过小，已校正为 10 分钟",
+                    envSnapshotRetentionMinutes);
+            envSnapshotRetentionMinutes = 10;
         }
     }
 

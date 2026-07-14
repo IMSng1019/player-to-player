@@ -9,7 +9,7 @@ package imsng.player_to_player.netproto;
 public final class Protocol {
 
     /** 协议版本：HELLO 握手时双方校验，不一致直接拒绝（避免新旧节点混连产生隐性错误）。 */
-    public static final int VERSION = 1;
+    public static final int VERSION = 2;
 
     /** 单帧最大长度（16 MB）：超限视为恶意/损坏连接，立即断开。环境文件按块传输不会超过它。 */
     public static final int MAX_FRAME_BYTES = 16 * 1024 * 1024;

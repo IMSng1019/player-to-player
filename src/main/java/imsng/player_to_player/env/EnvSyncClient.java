@@ -55,6 +55,9 @@ public final class EnvSyncClient {
     /** 单文件哈希校验失败后的重试次数（重试仍失败则整次同步失败）。 */
     private static final int HASH_RETRY = 1;
 
+    /** 下载期间快照被回收时，重新拉取清单的最大次数。 */
+    private static final int SNAPSHOT_RESTARTS = 2;
+
     /** 等待单次请求应答的兜底超时：略大于协议层请求超时，理论不会先于它触发。 */
     private static final long AWAIT_MILLIS = 20_000;
 
@@ -86,6 +89,24 @@ public final class EnvSyncClient {
     private String doSync(Path targetEnvDir, ModPrefixResolver.Target target) {
         // 日志标签：null 目标显示为 FULL（全量视图）
         String label = target != null ? target.name() : "FULL";
+        SnapshotNotFoundException lastExpired = null;
+        for (int attempt = 0; attempt <= SNAPSHOT_RESTARTS; attempt++) {
+            try {
+                return doSyncAttempt(targetEnvDir, target, label);
+            } catch (SnapshotNotFoundException e) {
+                lastExpired = e;
+                LOGGER.info("[{}] 环境快照已过期，重新拉取清单（第 {}/{} 次）",
+                        label, attempt + 1, SNAPSHOT_RESTARTS + 1);
+            } catch (IOException e) {
+                throw new IllegalStateException("环境同步失败: " + e.getMessage(), e);
+            }
+        }
+        throw new IllegalStateException("环境同步失败: 快照连续过期", lastExpired);
+    }
+
+    /** 使用单一 snapshotId 完成一轮清单 diff 与文件下载。 */
+    private String doSyncAttempt(Path targetEnvDir, ModPrefixResolver.Target target,
+                                 String label) throws IOException {
         try {
             // ---- 1. 拉取服务端清单（按 target 过滤后的视图；无 target 字段 = 全量）----
             JsonObject req = new JsonObject();
@@ -95,6 +116,10 @@ public final class EnvSyncClient {
             ControlMessage manifestReply =
                     await(conn.request(ControlMessage.of(MessageType.ENV_MANIFEST_REQUEST, req)));
             requireType(manifestReply, MessageType.ENV_MANIFEST);
+            String snapshotId = JsonUtil.getString(manifestReply.json(), "snapshotId", "");
+            if (snapshotId.isBlank()) {
+                throw new IOException("服务端清单缺少 snapshotId");
+            }
             String filteredHash = JsonUtil.getString(manifestReply.json(), "filteredHash", "");
             JsonObject manifestJson = manifestReply.json().has("manifest")
                     && manifestReply.json().get("manifest").isJsonObject()
@@ -115,7 +140,7 @@ public final class EnvSyncClient {
             long doneBytes = 0;
             for (String path : toDownload) {
                 EnvironmentManifest.Entry entry = remote.files().get(path);
-                downloadWithRetry(normalizedDir, path, entry);
+                downloadWithRetry(normalizedDir, snapshotId, path, entry);
                 done++;
                 doneBytes += entry.size();
                 LOGGER.info("[{}] 环境同步进度: {}/{} 文件, {}/{} 字节 — {}",
@@ -125,20 +150,21 @@ public final class EnvSyncClient {
             LOGGER.info("[{}] 环境同步完成: {} 个文件, {} 字节, filteredHash={}",
                     label, done, doneBytes, filteredHash);
             return filteredHash;
-        } catch (IOException e) {
-            // 统一转非受检异常让 future 异常完成（CompletableFuture 不吃受检异常）
-            throw new IllegalStateException("环境同步失败: " + e.getMessage(), e);
+        } catch (SnapshotNotFoundException e) {
+            throw e;
         }
     }
 
     /** 下载单文件（哈希不匹配重试 {@value #HASH_RETRY} 次，仍失败抛异常终止整次同步）。 */
-    private void downloadWithRetry(Path envDir, String path, EnvironmentManifest.Entry entry)
-            throws IOException {
+    private void downloadWithRetry(Path envDir, String snapshotId, String path,
+                                   EnvironmentManifest.Entry entry) throws IOException {
         IOException lastFailure = null;
         for (int attempt = 0; attempt <= HASH_RETRY; attempt++) {
             try {
-                downloadOne(envDir, path, entry);
+                downloadOne(envDir, snapshotId, path, entry);
                 return;
+            } catch (SnapshotNotFoundException e) {
+                throw e; // 快照级失败必须重拉清单，不能在旧 ID 上重复文件请求
             } catch (IOException e) {
                 lastFailure = e;
                 LOGGER.warn("环境文件下载失败 (第 {} 次): {} — {}",
@@ -153,8 +179,8 @@ public final class EnvSyncClient {
      * 临时文件带 .tmp 后缀 —— EnvironmentScanner 内置排除 *.tmp，中途残留的
      * 半截文件不会污染下次本地扫描的清单。
      */
-    private void downloadOne(Path envDir, String path, EnvironmentManifest.Entry entry)
-            throws IOException {
+    private void downloadOne(Path envDir, String snapshotId, String path,
+                             EnvironmentManifest.Entry entry) throws IOException {
         // 清单来自网络（服务端数据也按不可信处理）：防目录穿越，落点必须在环境目录内
         Path dest = envDir.resolve(path).normalize();
         if (!dest.startsWith(envDir)) {
@@ -171,19 +197,32 @@ public final class EnvSyncClient {
                 boolean last = false;
                 while (!last) {
                     JsonObject req = new JsonObject();
+                    req.addProperty("snapshotId", snapshotId);
                     req.addProperty("path", path);
                     req.addProperty("offset", offset);
                     ControlMessage reply = await(
                             conn.request(ControlMessage.of(MessageType.ENV_FILE_REQUEST, req)));
+                    if (reply.type() == MessageType.ERROR
+                            && "snapshot_not_found".equals(
+                            JsonUtil.getString(reply.json(), "code", ""))) {
+                        throw new SnapshotNotFoundException(
+                                JsonUtil.getString(reply.json(), "message", "快照已过期"));
+                    }
                     requireType(reply, MessageType.ENV_FILE_DATA);
 
                     // 防御性核对应答归属：无状态分块协议下服务端按请求回显 path/offset，
                     // 不一致说明服务端实现异常或数据被篡改
+                    String replySnapshotId = JsonUtil.getString(
+                            reply.json(), "snapshotId", "");
                     String replyPath = JsonUtil.getString(reply.json(), "path", "");
                     long replyOffset = JsonUtil.getLong(reply.json(), "offset", -1L);
-                    if (!path.equals(replyPath) || replyOffset != offset) {
+                    long replyTotal = JsonUtil.getLong(reply.json(), "total", -1L);
+                    if (!snapshotId.equals(replySnapshotId)
+                            || !path.equals(replyPath) || replyOffset != offset
+                            || replyTotal != entry.size()) {
                         throw new IOException("ENV_FILE_DATA 应答与请求不匹配: "
-                                + replyPath + "@" + replyOffset + " 期望 " + path + "@" + offset);
+                                + replySnapshotId + ":" + replyPath + "@" + replyOffset
+                                + " 期望 " + snapshotId + ":" + path + "@" + offset);
                     }
                     byte[] chunk = reply.binary();
                     last = JsonUtil.getBoolean(reply.json(), "last", false);
@@ -197,6 +236,10 @@ public final class EnvSyncClient {
                         // 实际字节数超过清单声称大小：数据异常，及早失败省流量
                         throw new IOException("下载字节数超过清单大小: " + path);
                     }
+                }
+                if (offset != entry.size()) {
+                    throw new IOException("下载字节数与清单大小不一致: " + path
+                            + " 实际=" + offset + " 期望=" + entry.size());
                 }
             }
 
@@ -247,5 +290,12 @@ public final class EnvSyncClient {
                     + JsonUtil.getString(reply.json(), "message", ""));
         }
         throw new IOException("意外的应答类型: " + reply.type() + " 期望 " + expected);
+    }
+
+    /** 表示服务端已回收本轮绑定的旧快照，调用方必须从清单阶段重新开始。 */
+    private static final class SnapshotNotFoundException extends IOException {
+        private SnapshotNotFoundException(String message) {
+            super(message);
+        }
     }
 }
