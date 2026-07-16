@@ -1,5 +1,6 @@
 package imsng.player_to_player.client.boot;
 
+import imsng.player_to_player.client.group.GroupHost;
 import imsng.player_to_player.client.session.WorldSession;
 import imsng.player_to_player.compute.ComputeScore;
 import imsng.player_to_player.compute.ComputeScoreProvider;
@@ -9,6 +10,7 @@ import imsng.player_to_player.group.GroupRuntime;
 import imsng.player_to_player.p2p.NatDetector;
 import imsng.player_to_player.p2p.NatInfo;
 import imsng.player_to_player.util.ThreadPools;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -108,6 +110,11 @@ public final class ClientBootstrap {
         // ---------------------------------------------------------------
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> WorldSession.onJoin(client));
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> WorldSession.onLeave(client));
+
+        // 集成服务端 SERVER_STARTED 早于本地玩家登录完成，不能在服务器回调中直接
+        // publishServer。每个客户端 tick 末尾仅做常量时间状态检查；门控满足后只消费一次，
+        // 不使用固定延时，也不会因机器性能差异提前发布。
+        ClientTickEvents.END_CLIENT_TICK.register(GroupHost::onClientTick);
 
         // ---------------------------------------------------------------
         // d. Phase 2：主客户端退出本地组世界时，DISCONNECT 事件先于集成服务端

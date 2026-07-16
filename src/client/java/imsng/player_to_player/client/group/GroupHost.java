@@ -1,7 +1,9 @@
 package imsng.player_to_player.client.group;
 
 import com.google.gson.JsonObject;
+import imsng.player_to_player.group.GroupPublicationGate;
 import imsng.player_to_player.group.GroupRuntime;
+import imsng.player_to_player.group.ReplaceableRegistration;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.MessageType;
@@ -41,6 +43,31 @@ public final class GroupHost {
     /** 等待对端发来会话头的超时（毫秒）：超时视为死会话，关闭通道。 */
     private static final long HEADER_TIMEOUT_MILLIS = 15_000;
 
+    /**
+     * 跨服务器线程与客户端主线程的一次性发布门控。服务器启动回调只负责 arm，
+     * 真正的 LAN 发布由客户端 tick 在本地玩家完成登录后消费。
+     */
+    private static final GroupPublicationGate<IntegratedServer> PUBLICATION_GATE =
+            new GroupPublicationGate<>();
+
+    /**
+     * 固定的宿主入站会话监听器。使用固定引用后，主→副→主的角色切换可以显式注销
+     * 旧监听器，避免同一条 P2P 传输被多个匿名监听器并发读取。
+     */
+    private static final P2PSessions.SessionListener HOST_SESSION_LISTENER =
+            (sessionId, peerClientId, transport, initiator) -> {
+                if (initiator) {
+                    return;
+                }
+                ThreadPools.io().execute(() ->
+                        accept(sessionId, String.valueOf(peerClientId), transport));
+            };
+
+    /** 宿主监听器的成对注册槽；reset 会可靠地从 P2PSessions 摘除当前实例。 */
+    private static final ReplaceableRegistration<P2PSessions.SessionListener>
+            HOST_LISTENER_REGISTRATION = new ReplaceableRegistration<>(
+                    P2PSessions::addListener, P2PSessions::removeListener);
+
     /** LAN 端口（volatile：发布在主线程，隧道桥接在 io 线程读）。 */
     private static volatile int lanPort;
 
@@ -68,38 +95,116 @@ public final class GroupHost {
             LOGGER.error("组宿主只能运行在集成服务端上（当前: {}）", server.getClass().getName());
             return;
         }
-        Minecraft minecraft = Minecraft.getInstance();
-        // publishServer 是客户端侧动作（原版从 ShareToLanScreen 调）：转客户端主线程
-        minecraft.execute(() -> {
-            int port = HttpUtil.getAvailablePort();
-            // 游戏模式沿用世界默认；不开放作弊（组世界的权威演算不该被 /指令 干预）
-            if (integrated.publishServer(server.getDefaultGameType(), false, port)) {
-                lanPort = port;
-                LOGGER.info("集成服务端已发布 LAN 端口 {}，等待副客户端经隧道加入", port);
-                // Phase 4 组分离：向服务端通告"组世界就绪"——它据此冲刷分离时
-                // 暂存的副客户端重定向（早于此刻推送 ROLE_ASSIGN 隧道必然扑空）。
-                // 无暂存项时服务端按空操作处理，普通开组也发无妨
-                ControlConnection conn = GroupRuntime.conn();
-                UUID groupId = GroupRuntime.activeGroupId();
-                if (conn != null && conn.isOpen() && groupId != null) {
-                    JsonObject ready = new JsonObject();
-                    ready.addProperty("groupId", groupId.toString());
-                    conn.send(ControlMessage.of(MessageType.GROUP_WORLD_READY, ready));
-                }
-            } else {
-                LOGGER.error("集成服务端 LAN 发布失败（端口 {}），副客户端将无法加入", port);
-            }
-        });
 
-        // 接待副客户端：入站会话就绪 → 读会话头 → 按 op 分派。
-        // 只认非发起方会话：本端主动发起的（合并预同步）由 MergeClient 认领
-        P2PSessions.addListener((sessionId, peerClientId, transport, initiator) -> {
-            if (initiator) {
-                return;
+        // SERVER_STARTED 发生时，客户端玩家通常还没有完成本地登录。原版
+        // publishServer 会先打开 TCP 监听，再访问 Minecraft.player 更新权限；此时
+        // 直接调用会在端口已打开后抛 NPE，形成“显示局域网但模组不知道端口”的半发布状态。
+        // 因此这里只登记实例，等待 onClientTick 观察到真实就绪条件后再发布。
+        reset();
+        // 必须先挂接入站监听器再开放发布门控。否则客户端 tick 可能抢先发布并发送
+        // GROUP_WORLD_READY，服务端立即下发的副客户端会话会落在监听器尚未就绪的窗口内。
+        HOST_LISTENER_REGISTRATION.replace(HOST_SESSION_LISTENER);
+        PUBLICATION_GATE.arm(integrated);
+        LOGGER.info("组宿主接待监听器已挂接，等待本地玩家与客户端连接就绪后发布 LAN");
+    }
+
+    /**
+     * 客户端 tick 末尾的轻量就绪检查。
+     *
+     * <p>四个条件必须来自同一次 tick 快照：当前集成服务端仍是待发布实例、玩家对象
+     * 已创建、客户端游戏连接已创建，并且 {@link GroupRuntime} 仍接管该服务器。
+     * 门控消费后不会再次返回同一实例，因此本方法可每 tick 调用而不会重复发布。</p>
+     */
+    public static void onClientTick(Minecraft client) {
+        IntegratedServer ready = PUBLICATION_GATE.takeIfReady(
+                client.getSingleplayerServer(),
+                client.player != null,
+                client.getConnection() != null,
+                GroupRuntime::isManagedServer);
+        if (ready == null) {
+            return;
+        }
+        publish(ready);
+    }
+
+    /**
+     * 在客户端主线程发布集成服务端，并记录隧道实际使用的端口。
+     *
+     * <p>原版在 {@code publishServer} 内先写 {@code publishedPort}，后更新本地玩家权限。
+     * 因而其他调用路径或旧异常路径可能留下“端口已监听但调用未正常返回”的状态。
+     * 此时必须采用 {@link IntegratedServer#getPort()}，绝不能再开第二个监听器。</p>
+     */
+    private static void publish(IntegratedServer server) {
+        if (!GroupRuntime.isManagedServer(server)) {
+            LOGGER.info("集成服务端在 LAN 发布前已解除接管，本次发布取消");
+            return;
+        }
+
+        int port;
+        if (server.isPublished()) {
+            port = server.getPort();
+            LOGGER.warn("集成服务端已处于 LAN 发布状态，采用现有端口 {}，不重复监听", port);
+        } else {
+            int requestedPort = HttpUtil.getAvailablePort();
+            try {
+                // 游戏模式沿用世界默认；不开放作弊，组世界的权威演算不应被本地作弊指令干预。
+                if (!server.publishServer(server.getDefaultGameType(), false, requestedPort)) {
+                    LOGGER.error("集成服务端 LAN 发布失败（请求端口 {}），副客户端将无法加入",
+                            requestedPort);
+                    return;
+                }
+            } catch (RuntimeException e) {
+                // publishServer 不是原子操作：异常可能发生在 TCP 已监听且 publishedPort
+                // 已写入之后。若原版状态确认已发布，端口仍然可用，应继续完成模组侧登记。
+                if (!server.isPublished()) {
+                    LOGGER.error("集成服务端 LAN 发布异常，且未形成可用监听", e);
+                    return;
+                }
+                LOGGER.warn("集成服务端 LAN 发布调用中途异常，但监听已建立；继续采用现有端口",
+                        e);
             }
-            ThreadPools.io().execute(() -> accept(sessionId, String.valueOf(peerClientId), transport));
-        });
-        LOGGER.info("组宿主已就绪（会话监听器已挂接）");
+            port = server.getPort();
+        }
+
+        if (port <= 0) {
+            LOGGER.error("集成服务端报告已发布但端口无效（{}），拒绝通告组世界就绪", port);
+            return;
+        }
+        if (!GroupRuntime.isManagedServer(server)) {
+            LOGGER.info("集成服务端在 LAN 发布完成时已解除接管，不再通告组世界就绪");
+            return;
+        }
+
+        lanPort = port;
+        LOGGER.info("集成服务端已发布 LAN 端口 {}，等待副客户端经隧道加入", port);
+        notifyGroupWorldReady();
+    }
+
+    /**
+     * 向物理服务端通告本组 LAN 接待面已经可用。
+     * 普通开组没有暂存重定向时，服务端把该消息作为空操作处理。
+     */
+    private static void notifyGroupWorldReady() {
+        ControlConnection conn = GroupRuntime.conn();
+        UUID groupId = GroupRuntime.activeGroupId();
+        if (conn == null || !conn.isOpen() || groupId == null) {
+            LOGGER.warn("LAN 已发布，但控制连接或组标识不可用，无法通告组世界就绪");
+            return;
+        }
+        JsonObject ready = new JsonObject();
+        ready.addProperty("groupId", groupId.toString());
+        conn.send(ControlMessage.of(MessageType.GROUP_WORLD_READY, ready));
+    }
+
+    /**
+     * 清除待发布实例和隧道端口登记；世界会话拆除及新宿主启动前均可幂等调用。
+     * 实际 TCP 监听仍由集成服务端自身在停服时关闭。
+     */
+    public static void reset() {
+        PUBLICATION_GATE.reset();
+        // 先关闭端口可见性，再摘监听器；已提交到 IO 线程的旧回调也会读到 0 并拒绝桥接。
+        lanPort = 0;
+        HOST_LISTENER_REGISTRATION.clear();
     }
 
     /** 接待一条新入站 P2P 会话（io 线程，可阻塞）。 */

@@ -226,6 +226,10 @@ public final class MergeClient {
             // ---- 4. 让出：关停集成服务端并以副客户端身份经隧道重连 B ----
             UUID peer = merge.peerPrimary;
             minecraft.execute(() -> {
+                // suppressNextStopTeardown 会保留整个世界会话，故不能依赖 teardown
+                // 清除主客户端接待面。先撤掉宿主监听器和 LAN 端口，防止本端已降级为
+                // 副客户端后仍抢占新的入站 P2P 会话；已有传输和控制连接不受影响。
+                GroupHost.reset();
                 // 编排性断开本地组世界（切换旗标保住控制连接），随后走副客户端
                 // 加入路径 —— 与 Phase 2 的 secondary 指派完全同一条管线
                 if (minecraft.level != null) {

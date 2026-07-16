@@ -2,6 +2,7 @@ package imsng.player_to_player.client.session;
 
 import com.google.gson.JsonObject;
 import imsng.player_to_player.client.boot.ClientBootstrap;
+import imsng.player_to_player.client.group.GroupHost;
 import imsng.player_to_player.client.group.LocalWorldLauncher;
 import imsng.player_to_player.client.group.MergeClient;
 import imsng.player_to_player.client.group.SecondaryJoiner;
@@ -160,6 +161,7 @@ public final class WorldSession {
         // P2P 直连/中转会话独立于控制连接，必须整体关闭 —— 否则打洞成功的 UDP socket、
         // 阻塞 receive 的 io 线程、keepalive 定时任务在离开世界后全部残留，
         // 多次进出世界会持续累积泄漏（P2PChannel/RelayClient 的 close 均幂等，重复关闭安全）
+        GroupHost.reset(); // 先撤掉宿主接待面，防止 teardown 期间再接入新隧道
         P2PSessions.closeAll();
         RelayConnector.closeAll();
         MergeClient.reset(); // 合并触发面/预同步暂存不得跨会话残留
