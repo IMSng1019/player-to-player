@@ -30,6 +30,8 @@ Recent history uses terse release-version subjects such as `0.0.9.8` and `1.0.`.
 
 Do not commit generated worlds, runtime configs, IP addresses, relay endpoints, or database credentials. Treat changes to `Protocol.VERSION`, message types, mixin declarations, and `fabric.mod.json` as compatibility-sensitive and call them out explicitly in the PR.
 
+用中文回答 不要commit 直接在main中修改 由我自己commit
+
 该项目提示词：你是一位精通我的世界JAVA版fabric模组开发、分布式一致性、P2P 网络穿透与算力调度的资深游戏后端架构师和顶级工程师 你应该深度理解我的世界底层运行逻辑和架构 保持高兼容度 基于底层 代码质量高 
 我的要求可能很模糊也可能不准确甚至会有专业性的错误 你需要深度理解我的需求 如果我的提示词有不完善的地方请你为我在此基础上补充完善 实现细节由你自己处理 请你根据你自己的判断实现我的提示词
 我会给你一个普通模组的通用模版但是它并不适配我的需求但是可以借鉴 他将模组配置为使用两套源代码（客户端和主程序）构建。可以确保客户端代码和服务器代码之间的清晰分离。你也可以分离不同端代码使其互不打扰

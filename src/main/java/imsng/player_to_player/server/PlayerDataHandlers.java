@@ -1,6 +1,7 @@
 package imsng.player_to_player.server;
 
 import com.google.gson.JsonObject;
+import imsng.player_to_player.group.PlayerStateNbt;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.HandlerRegistry;
@@ -11,12 +12,12 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.storage.LevelResource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -37,7 +38,8 @@ import java.util.UUID;
  * <b>授权口径</b>：上传/请求方必须是该玩家本人，或该玩家当前所在组的主客户端
  * （组表查询）——防任意客户端覆盖/窥探他人存档。
  * <p>
- * 线程模型：handler 在 Netty 事件循环，解压/磁盘 IO 一律转 {@link ThreadPools#io()}；
+ * 线程模型：handler 在 Netty 事件循环；在线玩家快照必须在服务器主线程调用
+ * {@link ServerPlayer#saveWithoutId}，离线磁盘读取与上传写盘转 {@link ThreadPools#io()}；
  * 写盘用"临时文件 + 原子移动"，防半写损坏玩家存档。
  */
 public final class PlayerDataHandlers {
@@ -118,27 +120,55 @@ public final class PlayerDataHandlers {
             conn.send(error(msg, "not_authorized", "只能请求本人或本组成员的玩家数据"));
             return;
         }
-        ThreadPools.io().execute(() -> {
-            try {
-                Path file = server.getWorldPath(LevelResource.PLAYER_DATA_DIR)
-                        .resolve(playerId + ".dat");
+        // 玩家此刻仍连接物理服时，磁盘文件可能落后于实时位置/背包；必须在
+        // 服务器主线程直接序列化在线实体。只有离线时才读取原版 playerdata 文件。
+        server.execute(() -> {
+            ServerPlayer online = server.getPlayerList().getPlayer(playerId);
+            if (online != null) {
+                try {
+                    byte[] gzip = PlayerStateNbt.encode(
+                            online.saveWithoutId(new CompoundTag()));
+                    sendPlayerData(conn, msg, playerId, gzip, "在线快照");
+                } catch (Exception e) {
+                    sendReadError(conn, msg, playerId, e);
+                }
+                return;
+            }
+            ThreadPools.io().execute(() -> sendDiskPlayerData(conn, msg, playerId));
+        });
+    }
+
+    private void sendDiskPlayerData(ControlConnection conn, ControlMessage request,
+                                    UUID playerId) {
+        try {
+            Path file = server.getWorldPath(LevelResource.PLAYER_DATA_DIR)
+                    .resolve(playerId + ".dat");
+            if (!Files.isRegularFile(file)) {
                 JsonObject out = new JsonObject();
                 out.addProperty("playerUuid", playerId.toString());
-                if (!Files.isRegularFile(file)) {
-                    out.addProperty("exists", false);
-                    conn.send(msg.reply(MessageType.PLAYER_DATA, out, null));
-                    return;
-                }
-                // 重新压缩发送（文件本就是 gzip NBT，直接透传字节即可）
-                ByteArrayOutputStream bos = new ByteArrayOutputStream(16 * 1024);
-                bos.writeBytes(Files.readAllBytes(file));
-                out.addProperty("exists", true);
-                conn.send(msg.reply(MessageType.PLAYER_DATA, out, bos.toByteArray()));
-            } catch (Exception e) {
-                LOGGER.warn("玩家数据下发失败: {}", playerId, e);
-                conn.send(error(msg, "read_failed", e.toString()));
+                out.addProperty("exists", false);
+                conn.send(request.reply(MessageType.PLAYER_DATA, out, null));
+                return;
             }
-        });
+            sendPlayerData(conn, request, playerId, Files.readAllBytes(file), "磁盘兜底");
+        } catch (Exception e) {
+            sendReadError(conn, request, playerId, e);
+        }
+    }
+
+    private void sendPlayerData(ControlConnection conn, ControlMessage request,
+                                UUID playerId, byte[] gzip, String source) {
+        JsonObject out = new JsonObject();
+        out.addProperty("playerUuid", playerId.toString());
+        out.addProperty("exists", true);
+        conn.send(request.reply(MessageType.PLAYER_DATA, out, gzip));
+        LOGGER.info("玩家数据已下发: {}（{}，{} 字节压缩）", playerId, source, gzip.length);
+    }
+
+    private void sendReadError(ControlConnection conn, ControlMessage request,
+                               UUID playerId, Exception e) {
+        LOGGER.warn("玩家数据下发失败: {}", playerId, e);
+        conn.send(error(request, "read_failed", e.toString()));
     }
 
     // ------------------------------------------------------------ 工具

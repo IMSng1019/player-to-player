@@ -17,6 +17,7 @@ import imsng.player_to_player.env.ModPrefixResolver;
 import imsng.player_to_player.group.ChatRelay;
 import imsng.player_to_player.group.CommandRelayClient;
 import imsng.player_to_player.group.GroupRuntime;
+import imsng.player_to_player.group.PlayerDataClient;
 import imsng.player_to_player.group.PearlHandoff;
 import imsng.player_to_player.group.PortalPreloader;
 import imsng.player_to_player.netproto.ControlClient;
@@ -31,12 +32,12 @@ import imsng.player_to_player.util.JsonUtil;
 import imsng.player_to_player.util.ThreadPools;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ServerData;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.network.chat.Component;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -442,47 +443,30 @@ public final class WorldSession {
         } catch (IllegalArgumentException e) {
             return;
         }
-        LOGGER.info("收到分离晋升指派: 本端成为组 {} 的主客户端，切换到本地组世界", groupId);
-        ctx.setGroupId(groupId);
-        ctx.setClientRole(ClientRole.PRIMARY);
         ThreadPools.io().execute(() -> {
-            // 晋升前先取回本人最新玩家数据（分离时原主已 PLAYER_DATA_UPLOAD 上传），
-            // 写进本地主存档 —— 否则本地集成服务端会用加入时同步的旧骨架 playerdata
-            // 把玩家放回过时位置。失败只告警（旧数据能玩，位置回退可接受）。
-            pullOwnPlayerData(conn, worldFolder, worldName);
-            LocalWorldLauncher.launch(Minecraft.getInstance(), conn, worldFolder, worldName, groupId);
+            try {
+                LocalWorldLauncher.PreparedWorld prepared = prepareAuthoritativeWorld(
+                        conn, worldFolder, worldName);
+                ctx.setGroupId(groupId);
+                ctx.setClientRole(ClientRole.PRIMARY);
+                LOGGER.info("收到分离晋升指派: 本端成为组 {} 的主客户端，切换到本地组世界",
+                        groupId);
+                LocalWorldLauncher.launchPrepared(
+                        Minecraft.getInstance(), conn, prepared, groupId);
+            } catch (Exception e) {
+                LOGGER.error("分离晋升前准备权威玩家状态失败，保留当前世界连接", e);
+                showPrimarySwitchCancelled();
+            }
         });
     }
 
-    /** 拉取本人玩家数据写入本地主存档（io 线程；尽力而为，失败不阻断晋升）。 */
-    private static void pullOwnPlayerData(ControlConnection conn, Path worldFolder,
-                                          String worldName) {
+    /** 取得物理服实时玩家状态，并把本地主缓存准备到可直接启动的状态。 */
+    private static LocalWorldLauncher.PreparedWorld prepareAuthoritativeWorld(
+            ControlConnection conn, Path worldFolder, String worldName) throws Exception {
         NodeContext ctx = NodeContext.get();
-        try {
-            JsonObject req = new JsonObject();
-            req.addProperty("playerUuid", ctx.clientId().toString());
-            ControlMessage resp = conn.request(
-                            ControlMessage.of(MessageType.PLAYER_DATA_REQUEST, req))
-                    .get(Protocol.REQUEST_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
-            if (resp.type() != MessageType.PLAYER_DATA
-                    || !JsonUtil.getBoolean(resp.json(), "exists", false)
-                    || resp.binary().length == 0) {
-                LOGGER.warn("服务端无本人玩家数据（分离上传未达？），本地存档沿用既有数据");
-                return;
-            }
-            // 本地主存档 playerdata：data/primary/<存档名>/playerdata/<uuid>.dat
-            //（下发内容本就是 gzip NBT，原样落盘；临时文件 + 原子替换防半写）
-            Path playerData = ctx.paths().dataDir(worldFolder, ClientRole.PRIMARY)
-                    .resolve(P2PPaths.sanitize(worldName)).resolve("playerdata");
-            Files.createDirectories(playerData);
-            Path tmp = playerData.resolve(ctx.clientId() + ".dat.p2p-tmp");
-            Files.write(tmp, resp.binary());
-            Files.move(tmp, playerData.resolve(ctx.clientId() + ".dat"),
-                    StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-            LOGGER.info("已取回最新玩家数据写入本地存档（{} 字节压缩）", resp.binary().length);
-        } catch (Exception e) {
-            LOGGER.warn("取回玩家数据失败，本地存档沿用既有数据: {}", e.toString());
-        }
+        CompoundTag playerState = PlayerDataClient.requestAuthoritative(conn, ctx.clientId());
+        return LocalWorldLauncher.prepare(
+                worldFolder, worldName, ctx.clientId(), playerState);
     }
 
     /**
@@ -499,6 +483,21 @@ public final class WorldSession {
     private static void requestRoleAndSwitch(ControlConnection conn, Path worldFolder,
                                              String worldName, long myGeneration) {
         NodeContext ctx = NodeContext.get();
+        LocalWorldLauncher.PreparedWorld prepared;
+        try {
+            // 必须在 ROLE_REQUEST 前完成：失败时服务端尚未创建组，玩家仍留在物理服。
+            prepared = prepareAuthoritativeWorld(conn, worldFolder, worldName);
+        } catch (Exception e) {
+            ctx.setGroupId(null);
+            ctx.setClientRole(ClientRole.UNASSIGNED);
+            LOGGER.error("主客户端切换前无法取得或准备物理服务器权威玩家状态", e);
+            showPrimarySwitchCancelled();
+            return;
+        }
+        if (myGeneration != generation) {
+            return;
+        }
+
         try {
             ControlMessage assign = conn.request(ControlMessage.of(MessageType.ROLE_REQUEST,
                             new JsonObject()))
@@ -514,15 +513,16 @@ public final class WorldSession {
             if (myGeneration != generation) {
                 return; // 玩家已离开世界，指派作废（服务端断连清理会收回组登记）
             }
-            ctx.setGroupId(groupId);
             Minecraft minecraft = Minecraft.getInstance();
             switch (role) {
                 case "primary" -> {
+                    ctx.setGroupId(groupId);
                     ctx.setClientRole(ClientRole.PRIMARY);
                     LOGGER.info("角色指派: 主客户端（组 {}），启动本地组世界", groupId);
-                    LocalWorldLauncher.launch(minecraft, conn, worldFolder, worldName, groupId);
+                    LocalWorldLauncher.launchPrepared(minecraft, conn, prepared, groupId);
                 }
                 case "secondary" -> {
+                    ctx.setGroupId(groupId);
                     ctx.setClientRole(ClientRole.SECONDARY);
                     LOGGER.info("角色指派: 副客户端（组 {}，主客户端 {}），发起 P2P 加入",
                             groupId, primaryId);
@@ -533,6 +533,18 @@ public final class WorldSession {
         } catch (Exception e) {
             LOGGER.error("角色申请失败（玩家留在物理服务端世界，重进可重试）", e);
         }
+    }
+
+    /** 在客户端主线程提示失败；玩家已离开世界时 player 为 null，静默跳过即可。 */
+    private static void showPrimarySwitchCancelled() {
+        Minecraft minecraft = Minecraft.getInstance();
+        minecraft.execute(() -> {
+            if (minecraft.player != null) {
+                minecraft.player.displayClientMessage(Component.literal(
+                        "无法取得或准备物理服务器玩家状态，已取消主客户端切换，请稍后重新进入服务器"),
+                        false);
+            }
+        });
     }
 
     // ------------------------------------------------------------------ 工具
