@@ -44,6 +44,9 @@ test {
 }
 
 processResources {
+	// Gradle 进程使用系统原生编码时，资源模板仍固定按 UTF-8 读取，避免中文内容损坏。
+	filteringCharset = "UTF-8"
+
 	def version = project.version
 	inputs.property "version", version
 
@@ -53,6 +56,8 @@ processResources {
 }
 
 tasks.withType(JavaCompile).configureEach {
+	// 源码统一为 UTF-8；不能继承用于兼容 Windows worker 参数文件的系统原生编码。
+	it.options.encoding = "UTF-8"
 	it.options.release = 17
 }
 
