@@ -54,6 +54,11 @@ public final class WorldSwitcher {
         return SWITCHING.getAndSet(false);
     }
 
+    /** 只读查询当前断开是否属于主副切换；退出拦截器不能消费该一次性旗标。 */
+    public static boolean isSwitching() {
+        return SWITCHING.get();
+    }
+
     /**
      * 置位切换旗标（Phase 3 合并让出方：A 关停本地组世界降级为副客户端时，
      * 这次 DISCONNECT 同样是编排性断开，不得拆除与物理服务端的控制连接）。

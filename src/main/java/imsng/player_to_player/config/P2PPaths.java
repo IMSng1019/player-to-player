@@ -59,6 +59,11 @@ public final class P2PPaths {
         return root.resolve("logs");
     }
 
+    /** [服务端] pending/committed 主客户端退出事务元数据目录。 */
+    public Path exitTransactionsDir() {
+        return root.resolve("exit-transactions");
+    }
+
     /** [服务端/中转端] 版本化不可变环境快照仓库。 */
     public Path environmentSnapshotsDir() {
         return root.resolve("environment-snapshots");

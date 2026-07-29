@@ -9,19 +9,16 @@ import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.util.JsonUtil;
 import imsng.player_to_player.util.ThreadPools;
 import net.minecraft.nbt.CompoundTag;
-import net.minecraft.nbt.NbtAccounter;
-import net.minecraft.nbt.NbtIo;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.storage.LevelResource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.ByteArrayInputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.UUID;
+import java.util.function.Predicate;
 
 /**
  * 玩家数据面处理器（服务端，Phase 3；Phase 2 已知边界"玩家背包……不回传物理
@@ -46,20 +43,22 @@ public final class PlayerDataHandlers {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("player_to_player/player-data");
 
-    /** 玩家 NBT 解压上限（正常玩家数据 KB 级；防解压炸弹）。 */
-    private static final long MAX_PLAYER_NBT_BYTES = 16L * 1024 * 1024;
-
     private final MinecraftServer server;
     private final GroupTable groups;
+    private final Predicate<UUID> writeBlocked;
 
-    private PlayerDataHandlers(MinecraftServer server, GroupTable groups) {
+    private PlayerDataHandlers(MinecraftServer server, GroupTable groups,
+                               Predicate<UUID> writeBlocked) {
         this.server = server;
         this.groups = groups;
+        this.writeBlocked = writeBlocked;
     }
 
     /** 注册玩家数据面处理器。 */
-    public static void register(HandlerRegistry reg, MinecraftServer server, GroupTable groups) {
-        PlayerDataHandlers handlers = new PlayerDataHandlers(server, groups);
+    public static void register(HandlerRegistry reg, MinecraftServer server, GroupTable groups,
+                                Predicate<UUID> writeBlocked) {
+        PlayerDataHandlers handlers = new PlayerDataHandlers(
+                server, groups, writeBlocked != null ? writeBlocked : ignored -> false);
         reg.on(MessageType.PLAYER_DATA_UPLOAD, handlers::handleUpload);
         reg.on(MessageType.PLAYER_DATA_REQUEST, handlers::handleRequest);
     }
@@ -84,17 +83,13 @@ public final class PlayerDataHandlers {
                     conn.send(error(msg, "invalid_data", "玩家数据为空"));
                     return;
                 }
-                // 解析校验（带上限）：确认是合法 NBT 才落盘，坏数据不碰存档
-                CompoundTag tag = NbtIo.readCompressed(new ByteArrayInputStream(gzipNbt),
-                        NbtAccounter.create(MAX_PLAYER_NBT_BYTES));
                 Path dataDir = server.getWorldPath(LevelResource.PLAYER_DATA_DIR);
-                Files.createDirectories(dataDir);
-                // 原版同款格式（gzip NBT）：先写临时文件再原子移动，防半写损坏
-                Path tmp = dataDir.resolve(playerId + ".dat.p2p-tmp");
-                NbtIo.writeCompressed(tag, tmp);
-                Files.move(tmp, dataDir.resolve(playerId + ".dat"),
-                        StandardCopyOption.REPLACE_EXISTING,
-                        StandardCopyOption.ATOMIC_MOVE);
+                if (!PlayerDataFileStore.writeIfAllowed(
+                        dataDir, playerId, gzipNbt, () -> !writeBlocked.test(peer))) {
+                    conn.send(error(msg, "invalid_data",
+                            "玩家数据校验、写回失败或退出已冻结"));
+                    return;
+                }
                 JsonObject out = new JsonObject();
                 out.addProperty("written", true);
                 conn.send(msg.reply(MessageType.PLAYER_DATA, out, null));

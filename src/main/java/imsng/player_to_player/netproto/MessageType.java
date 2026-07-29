@@ -18,6 +18,7 @@ import java.util.Map;
  *   70-79  指令与聊天路由（Phase 4）
  *   80-89  合并与分离（Phase 3）
  *   90-99  特殊加载：末影珍珠/传送门（Phase 4）
+ *   100-109 主客户端耐久退出事务
  * </pre>
  * 新增类型只增不改号，保证协议向后兼容。
  */
@@ -221,7 +222,31 @@ public enum MessageType {
      * 小型的 tp 指令"——抛出者的主客户端把玩家传送到落点（含跨维度 + 原版 5 点
      * 摔落伤害），随后的合并/分离由加载门控与分离监视自然接管。
      */
-    PEARL_LANDED(91);
+    PEARL_LANDED(91),
+
+    // ---------------------------------------------------- 主客户端耐久退出 100-109
+    /**
+     * C→S 退出保护意图（json: shutdownId/clientId/groupId/players[]/chunks[]）。
+     * 服务端先持久化 pending 元数据再应答；pending 期间主客户端断线不得释放组占用。
+     * 同类型应答 json: accepted, committed。
+     */
+    EXIT_BEGIN(100),
+    /**
+     * C→S 最终玩家 NBT 分片（json: shutdownId, playerUuid, fragmentIndex,
+     * fragmentCount, totalBytes, sha256；binary: gzip NBT 片段）。服务端完整重组、
+     * 校验并耐久替换 playerdata 后，以同类型应答 json: accepted, written。
+     */
+    EXIT_PLAYER_DATA(101),
+    /**
+     * C→S 最终区块 NBT 分片（除区块键与 preserveExisting 外，字段同玩家分片；
+     * preserveExisting=true 时不带分片）。同类型应答 json: accepted, written。
+     */
+    EXIT_CHUNK_DATA(102),
+    /**
+     * C→S 提交退出事务（json: shutdownId）。服务端确认本轮数据齐全、刷新存储、
+     * 持久化 committed 并清理组占用后，以同类型应答 json: committed。
+     */
+    EXIT_COMMIT(103);
 
     private final int id;
 

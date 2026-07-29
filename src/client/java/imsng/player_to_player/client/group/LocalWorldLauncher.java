@@ -27,7 +27,7 @@ import java.util.stream.Stream;
  *   <li><b>切换前准备</b>：环境同步已把服务端的世界骨架（level.dat、playerdata、
  *       data/ 等 —— 服务端扫描时只排除了 region/poi/entities/DIM* 维度数据）带到
  *       {@code environment/primary/<世界名>/}；首次启动复制世界骨架，随后每次都用
- *       物理服务器权威玩家 NBT 覆盖本地 UUID 玩家文件，并清除 level.dat 内嵌玩家；</li>
+ *       物理服务器权威玩家 NBT 同时覆盖 UUID 玩家文件与 level.dat 内嵌玩家；</li>
  *   <li><b>预置组运行时</b>（{@link GroupRuntime#arm}）：集成服务端一启动即被接管
  *       （申请门控、上行捕获、出生点跳过全部就位 —— arm 必须先于世界打开）；</li>
  *   <li><b>主线程切换</b>：编排性断开物理服务端 → 原版管线打开本地存档；</li>

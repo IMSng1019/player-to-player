@@ -69,6 +69,8 @@ public final class GroupServerHooks {
             GroupRuntime.detach(server);
         });
 
+        ServerLifecycleEvents.SERVER_STOPPING.register(GroupRuntime::captureExitStopping);
+
         ServerChunkEvents.CHUNK_UNLOAD.register((level, chunk) -> {
             if (!GroupRuntime.isManagedLevel(level)) {
                 return;
@@ -86,6 +88,10 @@ public final class GroupServerHooks {
             // NBT 一经生成即为不可变快照，压缩 + 发送转 io 池
             try {
                 CompoundTag tag = ChunkSerializer.write(level, chunk);
+                if (GroupRuntime.isExitDraining()) {
+                    GroupRuntime.recordExitChunk(key, tag);
+                    return;
+                }
                 ThreadPools.io().execute(() ->
                         claims.releaseWithData(key, ChunkUploadService.compress(tag)));
             } catch (Exception e) {
@@ -115,6 +121,11 @@ public final class GroupServerHooks {
             return;
         }
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            PlayerStateUploadService playerUploads = GroupRuntime.playerUploads();
+            if (playerUploads != null && !GroupRuntime.isExitDraining()) {
+                playerUploads.offer(player.getUUID(),
+                        player.saveWithoutId(new CompoundTag()));
+            }
             JsonObject json = new JsonObject();
             json.addProperty("uuid", player.getUUID().toString());
             json.addProperty("dimension",

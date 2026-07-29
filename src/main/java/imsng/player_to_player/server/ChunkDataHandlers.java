@@ -74,10 +74,12 @@ public final class ChunkDataHandlers {
 
     private final MinecraftServer server;
     private final ChunkRegistry registry;
+    private final Object[] writeLocks = new Object[256];
 
     private ChunkDataHandlers(MinecraftServer server, ChunkRegistry registry) {
         this.server = server;
         this.registry = registry;
+        java.util.Arrays.setAll(writeLocks, ignored -> new Object());
     }
 
     /**
@@ -85,12 +87,12 @@ public final class ChunkDataHandlers {
      *
      * @return 供 CHUNK_RELEASE 处理链使用的最终数据写回接口
      */
-    public static ChunkWriteback register(HandlerRegistry reg, MinecraftServer server,
-                                          ChunkRegistry registry) {
+    public static ChunkDataHandlers register(HandlerRegistry reg, MinecraftServer server,
+                                             ChunkRegistry registry) {
         ChunkDataHandlers handlers = new ChunkDataHandlers(server, registry);
         reg.on(MessageType.CHUNK_DATA_REQUEST, handlers::handleDataRequest);
         reg.on(MessageType.CHUNK_DATA_UPLOAD, handlers::handleUpload);
-        return handlers::writeFinalAndFlush;
+        return handlers;
     }
 
     // ------------------------------------------------------------ 数据下发
@@ -149,7 +151,7 @@ public final class ChunkDataHandlers {
 
     // ------------------------------------------------------------ 数据上行
 
-    /** CHUNK_DATA_UPLOAD：实时上行（fire-and-forget，失败仅记日志 + 回 ERROR 供诊断）。 */
+    /** CHUNK_DATA_UPLOAD：实时上行；完成校验并提交 IOWorker 后返回 written 确认。 */
     private void handleUpload(ControlConnection conn, ControlMessage msg) {
         ChunkKey key = parseKey(msg.json());
         UUID peer = conn.peerId();
@@ -160,9 +162,14 @@ public final class ChunkDataHandlers {
         byte[] gzipNbt = msg.binary();
         // 解压/校验/写盘全部转 io 池
         ThreadPools.io().execute(() -> {
-            if (!validateAndWrite(key, peer, gzipNbt, false)) {
+            boolean written = validateAndWrite(key, peer, gzipNbt, false, false);
+            if (!written) {
                 conn.send(error(msg, "upload_rejected", "区块上行被拒: " + key.asString()));
+                return;
             }
+            JsonObject out = new JsonObject();
+            out.addProperty("written", true);
+            conn.send(msg.reply(MessageType.CHUNK_DATA_UPLOAD, out, null));
         });
     }
 
@@ -172,8 +179,40 @@ public final class ChunkDataHandlers {
      * hasServerData 的 region 文件探测必须能看到刚写入的数据。
      * 调用方（RegistryHandlers）已在 io 池上，阻塞安全。
      */
-    private boolean writeFinalAndFlush(ChunkKey key, UUID uploader, byte[] gzipNbt) {
-        return validateAndWrite(key, uploader, gzipNbt, true);
+    boolean writeFinalAndFlush(ChunkKey key, UUID uploader, byte[] gzipNbt) {
+        return validateAndWrite(key, uploader, gzipNbt, true, false);
+    }
+
+    /** RegistryHandlers 使用的最终释放写回接口。 */
+    ChunkWriteback releaseWriteback() {
+        return this::writeFinalAndFlush;
+    }
+
+    /**
+     * 退出事务区块写入。preserveExisting 表示客户端确认本地没有更新快照，服务端保留
+     * 最近一次实时上行；无论是否携带数据，都必须仍由该 pending 事务的组占用。
+     */
+    boolean writeExit(UUID groupId, ChunkKey key, byte[] gzipNbt,
+                      boolean preserveExisting) {
+        synchronized (writeLock(key)) {
+            UUID owner = registry.ownerOf(key);
+            if (owner == null || !owner.equals(groupId)) {
+                LOGGER.warn("拒绝退出区块写入（所有权不符）: {} 事务组={} 占用组={}",
+                        key.asString(), groupId, owner);
+                return false;
+            }
+            if (preserveExisting) {
+                return existingChunkIsReadable(key);
+            }
+            return validateAndWriteLocked(key, groupId, gzipNbt, false, true);
+        }
+    }
+
+    /** 刷新全部维度的 I/O worker；退出提交确认前调用。 */
+    void flushAll() {
+        for (ServerLevel level : server.getAllLevels()) {
+            level.getChunkSource().chunkMap.flushWorker();
+        }
     }
 
     /**
@@ -181,7 +220,16 @@ public final class ChunkDataHandlers {
      *
      * @param flush 是否阻塞至 IOWorker 落盘（释放路径 true，实时上行 false）
      */
-    private boolean validateAndWrite(ChunkKey key, UUID uploader, byte[] gzipNbt, boolean flush) {
+    private boolean validateAndWrite(ChunkKey key, UUID uploader, byte[] gzipNbt,
+                                     boolean flush, boolean allowExitFrozen) {
+        synchronized (writeLock(key)) {
+            return validateAndWriteLocked(
+                    key, uploader, gzipNbt, flush, allowExitFrozen);
+        }
+    }
+
+    private boolean validateAndWriteLocked(ChunkKey key, UUID uploader, byte[] gzipNbt,
+                                           boolean flush, boolean allowExitFrozen) {
         try {
             // ---- 权威校验：上传方必须是注册表登记的占用组 ----
             // （Phase 1/2 约定 groupId == 主客户端 clientId，故直接与 peerId 比对）
@@ -189,6 +237,11 @@ public final class ChunkDataHandlers {
             if (owner == null || !owner.equals(uploader)) {
                 LOGGER.warn("拒绝区块上行（非占用组）: {} 上传方={} 占用组={}",
                         key.asString(), uploader, owner);
+                return false;
+            }
+            if (!allowExitFrozen && registry.isExitFrozen(uploader)) {
+                LOGGER.info("拒绝退出冻结后的迟到区块上行: {} 组={}",
+                        key.asString(), uploader);
                 return false;
             }
             if (gzipNbt == null || gzipNbt.length == 0 || gzipNbt.length > MAX_COMPRESSED_BYTES) {
@@ -236,6 +289,30 @@ public final class ChunkDataHandlers {
             LOGGER.error("区块写回异常: {}", key.asString(), e);
             return false;
         }
+    }
+
+    /** preserveExisting 只有在 IOWorker 能实际读到该区块时才算收到。 */
+    private boolean existingChunkIsReadable(ChunkKey key) {
+        try {
+            ServerLevel level = resolveLevel(key.dimension());
+            if (level == null) {
+                return false;
+            }
+            boolean exists = level.getChunkSource().chunkMap
+                    .read(new ChunkPos(key.x(), key.z())).join().isPresent();
+            if (!exists) {
+                LOGGER.warn("退出事务要求保留服务端区块，但实际不存在: {}",
+                        key.asString());
+            }
+            return exists;
+        } catch (Exception e) {
+            LOGGER.warn("验证退出保留区块失败: {}", key.asString(), e);
+            return false;
+        }
+    }
+
+    private Object writeLock(ChunkKey key) {
+        return writeLocks[(key.hashCode() & Integer.MAX_VALUE) % writeLocks.length];
     }
 
     // ------------------------------------------------------------ 工具

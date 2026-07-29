@@ -2,7 +2,11 @@
 	"required": true,
 	"package": "imsng.player_to_player.client.mixin",
 	"compatibilityLevel": "JAVA_17",
-	"client": [],
+	"client": [
+		"MinecraftExitMixin",
+		"PauseScreenAccessor",
+		"PauseScreenExitMixin"
+	],
 	"injectors": {
 		"defaultRequire": 1
 	},

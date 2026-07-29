@@ -107,6 +107,7 @@ public final class JsonRegistryStore implements RegistryStore {
             }
         } catch (IOException e) {
             LOGGER.error("区块注册表落盘失败: {}", persistDir, e);
+            throw new IllegalStateException("区块注册表落盘失败: " + persistDir, e);
         }
     }
 

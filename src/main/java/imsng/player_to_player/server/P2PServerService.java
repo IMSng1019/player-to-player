@@ -11,7 +11,6 @@ import imsng.player_to_player.netproto.ControlServer;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.proxy.RelayCore;
 import imsng.player_to_player.registry.ChunkRegistry;
-import imsng.player_to_player.registry.ChunkWriteback;
 import imsng.player_to_player.registry.JsonRegistryStore;
 import imsng.player_to_player.registry.MysqlRegistryStore;
 import imsng.player_to_player.registry.PlayerTable;
@@ -26,7 +25,9 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -136,19 +137,98 @@ public final class P2PServerService {
         EnvSyncServerHandlers.register(control, snapshots, config);
         // 区块数据面（Phase 2）：CHUNK_DATA_REQUEST 下发 / CHUNK_DATA_UPLOAD 实时上行；
         // 返回的写回接口交给 RegistryHandlers 处理 CHUNK_RELEASE 携带的最终数据
-        ChunkWriteback writeback = ChunkDataHandlers.register(control, server, registry);
-        RegistryHandlers.register(control, registry, players, writeback);
+        ChunkDataHandlers chunkData = ChunkDataHandlers.register(control, server, registry);
+        RegistryHandlers.register(control, registry, players, chunkData.releaseWriteback());
         ComputeHandlers.register(control, computes);
         LogCollector.register(control, paths.logsDir());
         P2PBrokerHandlers.register(control, config);
-        // 角色指派（Phase 2）：环境同步完成的客户端按存档位置分主/副
-        control.on(MessageType.ROLE_REQUEST,
-                new RoleAssignHandler(server, config, registry, groups, computes));
         // 合并/分离协调器（Phase 3）：MERGE_REQUEST/PROGRESS + SPLIT_REQUEST
         MergeCoordinator merges = MergeCoordinator.register(
                 control, config, registry, groups, computes, players);
-        // 玩家数据面（Phase 3）：分离/合并前的玩家 NBT 上行与下发
-        PlayerDataHandlers.register(control, server, groups);
+        // 主客户端耐久退出：pending 元数据先落盘保护组占用，最终数据齐全并刷盘后
+        // committed；客户端断线/服务端重启均可用同一 shutdownId 幂等恢复。
+        ExitTransactionLedger exitLedger = new ExitTransactionLedger(
+                new ExitTransactionStore(paths.exitTransactionsDir()));
+        ExitTransactionHandlers exits = new ExitTransactionHandlers(
+                exitLedger,
+                (peerId, requested) -> {
+                    if (peerId == null || !peerId.equals(requested.clientId())
+                            || !peerId.equals(requested.groupId())) {
+                        return null;
+                    }
+                    UUID currentPrimary = groups.primaryOf(requested.groupId());
+                    boolean recoverOrphan = currentPrimary == null
+                            && !groups.exists(requested.groupId());
+                    if (!recoverOrphan && !peerId.equals(currentPrimary)) {
+                        return null;
+                    }
+                    Set<UUID> currentMembers;
+                    if (recoverOrphan) {
+                        // 物理服重启后组表不可恢复。只允许主客户端自己的玩家文件，
+                        // 防恶意清单借恢复路径覆盖任意其他玩家；副客户端沿用实时确认态。
+                        currentMembers = Set.of(peerId);
+                    } else {
+                        currentMembers = groups.membersOf(requested.groupId());
+                        if (currentMembers.isEmpty()
+                                || !currentMembers.containsAll(requested.playerIds())) {
+                            return null;
+                        }
+                    }
+                    // 退出冻结与合并/分离不能并行；先中止涉及该组的预同步会话。
+                    merges.abortInvolving(requested.groupId());
+                    Set<imsng.player_to_player.registry.ChunkKey> currentClaims =
+                            new HashSet<>(registry.freezeOrRecoverForExit(
+                                    requested.groupId(), requested.chunks(), recoverOrphan));
+                    return new imsng.player_to_player.group.ExitManifest(
+                            requested.shutdownId(), requested.clientId(),
+                            requested.groupId(), currentMembers, currentClaims);
+                },
+                new ExitTransactionHandlers.PendingProtection() {
+                    @Override
+                    public void protect(imsng.player_to_player.group.ExitManifest manifest) {
+                        registry.restoreExitProtection(
+                                manifest.groupId(), manifest.chunks());
+                    }
+
+                    @Override
+                    public void cancelUnpersisted(
+                            imsng.player_to_player.group.ExitManifest manifest) {
+                        registry.cancelExitProtection(manifest.groupId());
+                    }
+                },
+                (playerId, gzipNbt) -> PlayerDataFileStore.write(
+                        server.getWorldPath(LevelResource.PLAYER_DATA_DIR),
+                        playerId, gzipNbt),
+                new ExitTransactionHandlers.ChunkSink() {
+                    @Override
+                    public boolean write(UUID groupId,
+                                         imsng.player_to_player.registry.ChunkKey key,
+                                         byte[] gzipNbt, boolean preserveExisting) {
+                        return chunkData.writeExit(
+                                groupId, key, gzipNbt, preserveExisting);
+                    }
+
+                    @Override
+                    public void flush() {
+                        chunkData.flushAll();
+                    }
+                },
+                manifest -> {
+                    registry.completeExitDurably(
+                            manifest.groupId(), manifest.chunks());
+                    groups.removeClient(manifest.clientId());
+                },
+                imsng.player_to_player.util.ThreadPools.io());
+        exits.register(control);
+        // 玩家实时上行在 EXIT_BEGIN 后必须被拒绝，防旧 IO 任务覆盖最终玩家文件。
+        PlayerDataHandlers.register(
+                control, server, groups, exits::isProtectedAfterBegins);
+        // 角色指派（Phase 2）：正常重进前先结束强杀遗留的 pending，保留实时数据。
+        control.on(MessageType.ROLE_REQUEST,
+                new RoleAssignHandler(server, config, registry, groups, computes,
+                        exits::abandonPendingForRejoin));
+        // 启动网络入口前恢复 pending 冻结，并只补做尚未标记完成的 committed 清理。
+        exits.recoverDurableState();
         // 指令/聊天逐级路由（Phase 4）：COMMAND_RELAY 特例处理 + 泛化下放，CHAT_RELAY 全网分发
         CommandChatHandlers.register(control, server, groups, players);
         // 末影珍珠交接路由（Phase 4）：PEARL_HANDOFF 转发目标组 / PEARL_LANDED 回程抛出者组
@@ -176,6 +256,13 @@ public final class P2PServerService {
             }
             players.remove(peerId);
             computes.remove(peerId);
+            if (exits.isProtectedAfterBegins(peerId)) {
+                // EXIT_BEGIN 已耐久确认：断线只是退出传输中断，不得释放唯一写入所有权。
+                merges.abortInvolving(peerId);
+                LOGGER.info("主客户端 {} 处于耐久退出事务中，断线后保留组与区块占用",
+                        peerId);
+                return;
+            }
             registry.releaseAll(peerId);
             // 合并会话清理（Phase 3）：当事方掉线 → 中止其卷入的合并（A 继续运行）
             merges.abortInvolving(peerId);

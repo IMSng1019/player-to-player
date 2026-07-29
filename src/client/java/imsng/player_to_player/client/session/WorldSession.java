@@ -18,6 +18,7 @@ import imsng.player_to_player.env.ModPrefixResolver;
 import imsng.player_to_player.group.ChatRelay;
 import imsng.player_to_player.group.CommandRelayClient;
 import imsng.player_to_player.group.GroupRuntime;
+import imsng.player_to_player.group.ExitTransactionClient;
 import imsng.player_to_player.group.PlayerDataClient;
 import imsng.player_to_player.group.PearlHandoff;
 import imsng.player_to_player.group.PortalPreloader;
@@ -83,6 +84,11 @@ public final class WorldSession {
     /** 当前活跃会话的控制客户端；null = 无会话。读写均在 {@link #SESSION_LOCK} 内。 */
     private static ControlClient controlClient;
 
+    /** 退出事务断线重连所需的物理服会话身份；均在 SESSION_LOCK 内读写。 */
+    private static String sessionHost;
+    private static UUID sessionPlayerId;
+    private static String sessionPlayerName;
+
     /**
      * 会话代数：快速离开再加入时，旧的后台建连/重试流程据此发现自己已过期。
      * 写入在 {@link #SESSION_LOCK} 内；保留 volatile 供重试循环无锁读取
@@ -133,6 +139,10 @@ public final class WorldSession {
             LOGGER.info("世界切换中的编排性断开，P2P 会话保持");
             return;
         }
+        if (ClientExitCoordinator.isActive()) {
+            LOGGER.info("主客户端耐久退出进行中，P2P 会话等待最终提交确认");
+            return;
+        }
         // 主客户端退出本地组世界：DISCONNECT 事件先于集成服务端完全停止，
         // 而停服 saveAll 的区块上行还要走控制连接 —— 延迟到 SERVER_STOPPED
         // 后由 GroupRuntime 的停止回调（ClientBootstrap 挂接）执行拆除
@@ -153,6 +163,9 @@ public final class WorldSession {
             generation++; // 使仍在后台跑的建连/重试流程过期
             cc = controlClient;
             controlClient = null;
+            sessionHost = null;
+            sessionPlayerId = null;
+            sessionPlayerName = null;
         }
         if (cc != null) {
             cc.close();
@@ -213,6 +226,9 @@ public final class WorldSession {
                 expired = myGeneration != generation;
                 if (!expired) {
                     controlClient = cc;
+                    sessionHost = host;
+                    sessionPlayerId = playerId;
+                    sessionPlayerName = playerName;
                 }
             }
             if (expired) {
@@ -563,6 +579,102 @@ public final class WorldSession {
             }
         }
         cc.close();
+    }
+
+    /**
+     * 创建耐久退出发送器。连接工厂优先复用当前控制连接；断线时用保存的物理服端点
+     * 重新 TCP 建连并完成 HELLO。重试次数没有上限，等待器只提供封顶退避。
+     */
+    public static ExitTransactionClient createExitTransactionClient() {
+        return new ExitTransactionClient(new ExitTransactionClient.ConnectionFactory() {
+            @Override
+            public ControlConnection connect() throws Exception {
+                return ensureExitConnection();
+            }
+
+            @Override
+            public void invalidate(ControlConnection connection) {
+                invalidateExitConnection();
+            }
+        }, WorldSession::waitBeforeExitRetry);
+    }
+
+    private static ControlConnection ensureExitConnection() throws Exception {
+        ControlClient existing;
+        String host;
+        UUID playerId;
+        String playerName;
+        synchronized (SESSION_LOCK) {
+            existing = controlClient;
+            host = sessionHost;
+            playerId = sessionPlayerId;
+            playerName = sessionPlayerName;
+        }
+        if (existing != null) {
+            ControlConnection open = existing.connection();
+            if (open != null && open.isOpen()) {
+                return open;
+            }
+        }
+        if (host == null || host.isBlank() || playerId == null || playerName == null) {
+            throw new IllegalStateException("退出重连缺少物理服会话身份");
+        }
+
+        NodeContext ctx = NodeContext.get();
+        ControlClient replacement = new ControlClient(host, ctx.config().controlPort);
+        try {
+            ControlConnection connection = replacement.connect();
+            ControlMessage ack = connection.request(ControlMessage.of(
+                            MessageType.HELLO, buildHello(playerId, playerName, ctx)))
+                    .get(Protocol.REQUEST_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+            if (ack.type() != MessageType.HELLO_ACK
+                    || !JsonUtil.getBoolean(ack.json(), "accepted", false)) {
+                throw new IllegalStateException("退出重连 HELLO 被物理服务端拒绝");
+            }
+            ControlClient previous;
+            synchronized (SESSION_LOCK) {
+                previous = controlClient;
+                controlClient = replacement;
+            }
+            if (previous != null && previous != replacement) {
+                previous.close();
+            }
+            LOGGER.info("耐久退出控制连接已恢复: {}:{}", host,
+                    ctx.config().controlPort);
+            return connection;
+        } catch (Exception e) {
+            replacement.close();
+            throw e;
+        }
+    }
+
+    private static void invalidateExitConnection() {
+        ControlClient failed;
+        synchronized (SESSION_LOCK) {
+            failed = controlClient;
+            controlClient = null;
+        }
+        if (failed != null) {
+            failed.close();
+        }
+    }
+
+    /** 1 秒起、最高 30 秒；忽略中断，因为用户已要求退出提交不可取消。 */
+    private static void waitBeforeExitRetry(int attempt) {
+        long delayMillis = Math.min(30_000L,
+                1_000L << Math.min(5, Math.max(0, attempt - 1)));
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delayMillis);
+        while (true) {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                return;
+            }
+            try {
+                TimeUnit.NANOSECONDS.sleep(remaining);
+            } catch (InterruptedException ignored) {
+                // 清除中断并继续等满退避时间；退出事务只有服务端 committed 才结束。
+            }
+        }
     }
 
     /** 退避等待一个重试周期；线程被中断时恢复中断标志并返回 false（调用方随即退出）。 */

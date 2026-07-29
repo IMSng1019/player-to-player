@@ -2,6 +2,7 @@ package imsng.player_to_player.client.boot;
 
 import imsng.player_to_player.client.group.GroupHost;
 import imsng.player_to_player.client.session.WorldSession;
+import imsng.player_to_player.client.session.ClientExitCoordinator;
 import imsng.player_to_player.compute.ComputeScore;
 import imsng.player_to_player.compute.ComputeScoreProvider;
 import imsng.player_to_player.config.GlobalConfig;
@@ -124,6 +125,7 @@ public final class ClientBootstrap {
         // ---------------------------------------------------------------
         GroupRuntime.setStopListener(() ->
                 ThreadPools.io().execute(WorldSession::teardownSession));
+        GroupRuntime.setExitBundleListener(ClientExitCoordinator::onExitBundle);
 
         LOGGER.info("客户端引导完成：算力/NAT 探测已在后台进行，世界加入钩子已注册");
     }

@@ -104,27 +104,36 @@ public final class MysqlRegistryStore implements RegistryStore {
     public void save(Map<ChunkKey, UUID> snapshot) {
         try (Connection conn = open()) {
             conn.setAutoCommit(false); // 清空 + 重写必须原子，中途崩溃不能留半份快照
-            try (Statement clear = conn.createStatement()) {
-                clear.executeUpdate("DELETE FROM p2p_chunk_claims");
-            }
-            try (PreparedStatement insert = conn.prepareStatement(
-                    "INSERT INTO p2p_chunk_claims (dimension, x, z, group_id, claimed_at)"
-                            + " VALUES (?, ?, ?, ?, ?)")) {
-                long now = System.currentTimeMillis();
-                for (Map.Entry<ChunkKey, UUID> e : snapshot.entrySet()) {
-                    insert.setString(1, e.getKey().dimension());
-                    insert.setInt(2, e.getKey().x());
-                    insert.setInt(3, e.getKey().z());
-                    insert.setString(4, e.getValue().toString());
-                    insert.setLong(5, now);
-                    insert.addBatch();
+            try {
+                try (Statement clear = conn.createStatement()) {
+                    clear.executeUpdate("DELETE FROM p2p_chunk_claims");
                 }
-                insert.executeBatch();
+                try (PreparedStatement insert = conn.prepareStatement(
+                        "INSERT INTO p2p_chunk_claims (dimension, x, z, group_id, claimed_at)"
+                                + " VALUES (?, ?, ?, ?, ?)")) {
+                    long now = System.currentTimeMillis();
+                    for (Map.Entry<ChunkKey, UUID> e : snapshot.entrySet()) {
+                        insert.setString(1, e.getKey().dimension());
+                        insert.setInt(2, e.getKey().x());
+                        insert.setInt(3, e.getKey().z());
+                        insert.setString(4, e.getValue().toString());
+                        insert.setLong(5, now);
+                        insert.addBatch();
+                    }
+                    insert.executeBatch();
+                }
+                conn.commit();
+            } catch (SQLException e) {
+                try {
+                    conn.rollback();
+                } catch (SQLException rollbackFailure) {
+                    e.addSuppressed(rollbackFailure);
+                }
+                throw e;
             }
-            conn.commit();
         } catch (SQLException e) {
-            // 落盘失败不致命：内存表仍是权威，下个周期重试；崩溃最多丢一个周期
             LOGGER.error("MySQL 注册表落盘失败（下个周期重试）", e);
+            throw new IllegalStateException("MySQL 注册表落盘失败", e);
         }
     }
 

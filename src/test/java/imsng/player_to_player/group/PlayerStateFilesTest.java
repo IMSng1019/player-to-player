@@ -14,7 +14,6 @@ import java.nio.file.Path;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class PlayerStateFilesTest {
@@ -26,7 +25,7 @@ class PlayerStateFilesTest {
     Path tempDir;
 
     @Test
-    void authoritativeStateReplacesPoisonedPlayerFileAndRemovesEmbeddedPlayer()
+    void authoritativeStateReplacesPlayerFileAndBothEmbeddedOwnerStates()
             throws Exception {
         Path save = tempDir.resolve("world");
         Path playerDir = save.resolve("playerdata");
@@ -43,8 +42,10 @@ class PlayerStateFilesTest {
         assertEquals(-107.0, installed.getList("Pos", 6).getDouble(0), 0.0);
         CompoundTag level = read(save.resolve("level.dat"));
         CompoundTag levelOld = read(save.resolve("level.dat_old"));
-        assertFalse(level.getCompound("Data").contains("Player"));
-        assertFalse(levelOld.getCompound("Data").contains("Player"));
+        assertEquals(-107.0, level.getCompound("Data").getCompound("Player")
+                .getList("Pos", 6).getDouble(0), 0.0);
+        assertEquals(-107.0, levelOld.getCompound("Data").getCompound("Player")
+                .getList("Pos", 6).getDouble(0), 0.0);
         assertEquals(1234L, level.getCompound("Data").getLong("DayTime"));
     }
 
@@ -60,6 +61,23 @@ class PlayerStateFilesTest {
                 save, PLAYER_ID, playerAt(-107.0, 116.0, 10.0)));
 
         assertEquals(5.0, read(playerFile).getList("Pos", 6).getDouble(0), 0.0);
+    }
+
+    @Test
+    void stoppedServerPlayerFileOverridesEarlierInMemorySnapshot() throws Exception {
+        Path playerDir = tempDir.resolve("playerdata");
+        Files.createDirectories(playerDir);
+        Path playerFile = playerDir.resolve(PLAYER_ID + ".dat");
+        NbtIo.writeCompressed(playerAt(-107.0, 116.0, 10.0), playerFile);
+        byte[] earlier = imsng.player_to_player.group.PlayerStateNbt.encode(
+                playerAt(0.0, 64.0, 0.0));
+
+        byte[] selected = PlayerStateFiles.readFinalPlayerData(
+                playerDir, PLAYER_ID, earlier);
+
+        CompoundTag state = imsng.player_to_player.group.PlayerStateNbt
+                .decodeValidated(selected);
+        assertEquals(-107.0, state.getList("Pos", 6).getDouble(0), 0.0);
     }
 
     private static CompoundTag playerAt(double x, double y, double z) {

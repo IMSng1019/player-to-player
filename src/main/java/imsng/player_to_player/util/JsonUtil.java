@@ -7,10 +7,13 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 import java.io.IOException;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 
 /**
  * JSON 工具：统一持有 GSON 实例（MC 自带 GSON，不引入新依赖），
@@ -53,11 +56,20 @@ public final class JsonUtil {
         Files.createDirectories(path.toAbsolutePath().getParent());
         Path tmp = path.resolveSibling(path.getFileName() + ".tmp");
         Files.writeString(tmp, PRETTY.toJson(value), StandardCharsets.UTF_8);
+        forceFile(tmp);
         try {
             Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException e) {
+        } catch (AtomicMoveNotSupportedException e) {
             // 部分文件系统不支持原子移动，降级为普通替换
             Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING);
+        }
+        // 临时文件内容已 force；替换后再 force 目标，确保成功返回可作为落盘确认。
+        forceFile(path);
+    }
+
+    private static void forceFile(Path path) throws IOException {
+        try (FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE)) {
+            channel.force(true);
         }
     }
 

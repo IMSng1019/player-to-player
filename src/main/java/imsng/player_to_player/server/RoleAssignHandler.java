@@ -25,6 +25,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.UUID;
+import java.util.function.ToIntFunction;
 
 /**
  * 角色指派处理器（服务端，Phase 2；对应规范"玩家加入世界"事件的角色决策段）。
@@ -65,14 +66,17 @@ public final class RoleAssignHandler implements MessageHandler {
     private final ChunkRegistry registry;
     private final GroupTable groups;
     private final ComputeTable computeTable;
+    private final ToIntFunction<UUID> abandonPendingExit;
 
     public RoleAssignHandler(MinecraftServer server, GlobalConfig config, ChunkRegistry registry,
-                             GroupTable groups, ComputeTable computeTable) {
+                             GroupTable groups, ComputeTable computeTable,
+                             ToIntFunction<UUID> abandonPendingExit) {
         this.server = server;
         this.config = config;
         this.registry = registry;
         this.groups = groups;
         this.computeTable = computeTable;
+        this.abandonPendingExit = abandonPendingExit;
     }
 
     @Override
@@ -95,6 +99,12 @@ public final class RoleAssignHandler implements MessageHandler {
 
     /** 角色决策主流程（io 线程）。 */
     private void assignRole(ControlConnection conn, ControlMessage msg, UUID peer) {
+        int abandoned = abandonPendingExit != null
+                ? abandonPendingExit.applyAsInt(peer) : 0;
+        if (abandoned > 0) {
+            LOGGER.warn("客户端 {} 正常重进，已按强杀回退结束 {} 个旧退出事务，"
+                    + "保留最后一次实时确认数据", peer, abandoned);
+        }
         // ---- 1. 目标区块：玩家存档位置，无存档用主世界出生点 ----
         ChunkKey target = locatePlayerChunk(peer);
 

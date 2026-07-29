@@ -9,10 +9,12 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 区块注册表（服务端，DESIGN.md 第 5 节；规范"区块注册表：区块列表 / MySQL"）。
@@ -64,17 +66,26 @@ public final class ChunkRegistry {
     /** 区块 → 占用信息（读无锁；写经 claimLock 串行化）。 */
     private final Map<ChunkKey, ClaimInfo> claims = new ConcurrentHashMap<>();
 
+    /** 已取得 EXIT_BEGIN 保护确认、等待最终提交的组。 */
+    private final java.util.Set<UUID> exitFrozenGroups = ConcurrentHashMap.newKeySet();
+
     /** 写路径互斥锁：五格检查 + 登记必须是不可分割的整体。 */
     private final Object claimLock = new Object();
+
+    /** 后端全量快照保存互斥；防旧快照后完成并覆盖更新的退出事务状态。 */
+    private final Object persistLock = new Object();
+
+    /** 每次内存占用变更递增；用于判断是否仍有未保存的新状态。 */
+    private final AtomicLong changeVersion = new AtomicLong();
+
+    /** 已成功保存到后端的最高内存版本；与 changeVersion 不同即仍需落盘。 */
+    private final AtomicLong persistedVersion = new AtomicLong();
 
     /** 持久化后端（本地 JSON / MySQL，Phase 4 可插拔）。 */
     private final RegistryStore store;
 
     /** region 文件探测器（hasServerData 判定）。 */
     private final RegionFileProbe probe;
-
-    /** 自上次落盘后是否有变更（无变更跳过写盘，减少磁盘噪声）。 */
-    private volatile boolean dirty;
 
     /** 自动落盘任务句柄；shutdown 时取消。 */
     private volatile ScheduledFuture<?> autoPersistTask;
@@ -92,13 +103,16 @@ public final class ChunkRegistry {
      */
     public ClaimResult tryClaim(ChunkKey key, UUID groupId) {
         synchronized (claimLock) {
+            if (exitFrozenGroups.contains(groupId)) {
+                return ClaimResult.rejected(key, groupId);
+            }
             ClaimResult blocked = checkBlockedLocked(key, groupId);
             if (blocked != null) {
                 return blocked;
             }
             // 授予：登记目标区块（重复申请刷新占用时间，幂等）
             claims.put(key, new ClaimInfo(groupId, System.currentTimeMillis()));
-            dirty = true;
+            markDirtyLocked();
         }
         // hasServerData 是磁盘探测，放锁外做（不占 claimLock，避免拖慢并发申请）
         return ClaimResult.grantedResult(probe != null && probe.hasServerData(key));
@@ -140,12 +154,15 @@ public final class ChunkRegistry {
      */
     public boolean release(ChunkKey key, UUID groupId) {
         synchronized (claimLock) {
+            if (exitFrozenGroups.contains(groupId)) {
+                return false;
+            }
             ClaimInfo existing = claims.get(key);
             if (existing == null || !existing.groupId().equals(groupId)) {
                 return false;
             }
             claims.remove(key);
-            dirty = true;
+            markDirtyLocked();
             return true;
         }
     }
@@ -157,6 +174,9 @@ public final class ChunkRegistry {
         }
         int released = 0;
         synchronized (claimLock) {
+            if (exitFrozenGroups.contains(groupId)) {
+                return 0;
+            }
             var it = claims.entrySet().iterator();
             while (it.hasNext()) {
                 if (groupId.equals(it.next().getValue().groupId())) {
@@ -165,13 +185,136 @@ public final class ChunkRegistry {
                 }
             }
             if (released > 0) {
-                dirty = true;
+                markDirtyLocked();
             }
         }
         if (released > 0) {
             LOGGER.info("已释放组 {} 的 {} 个区块占用", groupId, released);
         }
         return released;
+    }
+
+    /**
+     * 原子冻结某组并返回权威占用清单。冻结后普通申请/释放/releaseAll 都不能改变
+     * 该组，只有 {@link #completeExitDurably} 可以耐久解除并释放事务清单内区块。
+     */
+    public java.util.Set<ChunkKey> freezeForExit(UUID groupId) {
+        if (groupId == null) {
+            return Set.of();
+        }
+        synchronized (claimLock) {
+            exitFrozenGroups.add(groupId);
+            return java.util.Set.copyOf(claimsOf(groupId));
+        }
+    }
+
+    /**
+     * EXIT_BEGIN 的原子冻结与清单选择。在线组使用服务端当前占用；服务端重启后
+     * 组表丢失时，可先验证客户端清单没有窃取其他组占用，再把该清单作为待恢复
+     * 清单。实际补回/删除占用在 pending 元数据落盘后的 restoreExitProtection 完成。
+     */
+    public Set<ChunkKey> freezeOrRecoverForExit(UUID groupId,
+                                                Set<ChunkKey> requestedChunks,
+                                                boolean recoverOrphan) {
+        if (groupId == null || requestedChunks == null) {
+            throw new IllegalArgumentException("冻结退出清单所需参数不完整");
+        }
+        synchronized (claimLock) {
+            if (recoverOrphan) {
+                for (ChunkKey key : requestedChunks) {
+                    ClaimInfo existing = claims.get(key);
+                    if (existing != null && !groupId.equals(existing.groupId())) {
+                        throw new IllegalStateException("孤儿组退出清单与现有占用冲突: "
+                                + key.asString());
+                    }
+                }
+                exitFrozenGroups.add(groupId);
+                return Set.copyOf(requestedChunks);
+            }
+            exitFrozenGroups.add(groupId);
+            return Set.copyOf(claimsOf(groupId));
+        }
+    }
+
+    /**
+     * 服务端重启后以已经耐久确认的 pending 清单恢复权威占用并重新冻结。
+     * 事务清单比可能落后一个周期的注册表快照更新，因此会移除该组不在清单中的
+     * 陈旧占用并补回清单中缺失的占用；若某清单区块已被另一组占用则拒绝启动，
+     * 不能静默覆盖潜在的新状态。
+     */
+    public void restoreExitProtection(UUID groupId, Set<ChunkKey> manifestChunks) {
+        if (groupId == null || manifestChunks == null) {
+            throw new IllegalArgumentException("恢复退出保护所需参数不完整");
+        }
+        synchronized (persistLock) {
+            synchronized (claimLock) {
+                for (ChunkKey key : manifestChunks) {
+                    ClaimInfo existing = claims.get(key);
+                    if (existing != null && !groupId.equals(existing.groupId())) {
+                        throw new IllegalStateException("退出事务区块已被其他组占用: "
+                                + key.asString() + " owner=" + existing.groupId());
+                    }
+                }
+                claims.entrySet().removeIf(entry -> groupId.equals(entry.getValue().groupId())
+                        && !manifestChunks.contains(entry.getKey()));
+                long now = System.currentTimeMillis();
+                for (ChunkKey key : manifestChunks) {
+                    claims.put(key, new ClaimInfo(groupId, now));
+                }
+                exitFrozenGroups.add(groupId);
+                markDirtyLocked();
+                saveCurrentClaimsLocked();
+            }
+        }
+    }
+
+    public boolean isExitFrozen(UUID groupId) {
+        return groupId != null && exitFrozenGroups.contains(groupId);
+    }
+
+    /** EXIT_BEGIN 元数据未能落盘时撤销本轮内存冻结，不修改任何占用。 */
+    public void cancelExitProtection(UUID groupId) {
+        if (groupId != null) {
+            exitFrozenGroups.remove(groupId);
+        }
+    }
+
+    /**
+     * 只清理该退出事务清单内的区块并在解除冻结前同步持久化。持久化失败时恢复
+     * 原占用并保持冻结，调用方不得返回 committed ACK。
+     */
+    public int completeExitDurably(UUID groupId, Set<ChunkKey> manifestChunks) {
+        if (groupId == null || manifestChunks == null) {
+            return 0;
+        }
+        synchronized (persistLock) {
+            synchronized (claimLock) {
+                exitFrozenGroups.add(groupId);
+                Map<ChunkKey, ClaimInfo> removed = new HashMap<>();
+                for (ChunkKey key : manifestChunks) {
+                    ClaimInfo info = claims.get(key);
+                    if (info != null && groupId.equals(info.groupId())) {
+                        removed.put(key, info);
+                        claims.remove(key);
+                    }
+                }
+                try {
+                    if (!removed.isEmpty()) {
+                        markDirtyLocked();
+                    }
+                    saveCurrentClaimsLocked();
+                    exitFrozenGroups.remove(groupId);
+                    return removed.size();
+                } catch (RuntimeException e) {
+                    claims.putAll(removed);
+                    exitFrozenGroups.add(groupId);
+                    if (!removed.isEmpty()) {
+                        markDirtyLocked();
+                    }
+                    throw e;
+                }
+            }
+        }
     }
 
     /**
@@ -188,6 +331,9 @@ public final class ChunkRegistry {
         }
         int migrated = 0;
         synchronized (claimLock) {
+            if (exitFrozenGroups.contains(from) || exitFrozenGroups.contains(to)) {
+                return 0;
+            }
             for (Map.Entry<ChunkKey, ClaimInfo> e : claims.entrySet()) {
                 if (from.equals(e.getValue().groupId())) {
                     e.setValue(new ClaimInfo(to, System.currentTimeMillis()));
@@ -195,7 +341,7 @@ public final class ChunkRegistry {
                 }
             }
             if (migrated > 0) {
-                dirty = true;
+                markDirtyLocked();
             }
         }
         if (migrated > 0) {
@@ -216,6 +362,9 @@ public final class ChunkRegistry {
         }
         int migrated = 0;
         synchronized (claimLock) {
+            if (exitFrozenGroups.contains(from) || exitFrozenGroups.contains(to)) {
+                return 0;
+            }
             for (ChunkKey key : keys) {
                 ClaimInfo info = claims.get(key);
                 if (info != null && from.equals(info.groupId())) {
@@ -224,7 +373,7 @@ public final class ChunkRegistry {
                 }
             }
             if (migrated > 0) {
-                dirty = true;
+                markDirtyLocked();
             }
         }
         if (migrated > 0) {
@@ -302,22 +451,42 @@ public final class ChunkRegistry {
 
     /** 有变更才落盘（定期任务用）。 */
     private void persistIfDirty() {
-        if (dirty) {
+        if (persistedVersion.get() != changeVersion.get()) {
             persist();
         }
     }
 
     /** 全量落盘：锁内取快照（与 claim/release 互斥），锁外交给后端做序列化与 IO。 */
     public void persist() {
-        Map<ChunkKey, UUID> snapshot;
-        synchronized (claimLock) {
-            snapshot = new HashMap<>();
-            for (Map.Entry<ChunkKey, ClaimInfo> e : claims.entrySet()) {
-                snapshot.put(e.getKey(), e.getValue().groupId());
+        synchronized (persistLock) {
+            Map<ChunkKey, UUID> snapshot;
+            long snapshotVersion;
+            synchronized (claimLock) {
+                snapshot = claimsSnapshotLocked();
+                snapshotVersion = changeVersion.get();
             }
-            dirty = false;
+            store.save(snapshot);
+            persistedVersion.accumulateAndGet(snapshotVersion, Math::max);
         }
-        store.save(snapshot);
+    }
+
+    /** persistLock 与 claimLock 均持有期间的强一致保存。 */
+    private void saveCurrentClaimsLocked() {
+        long snapshotVersion = changeVersion.get();
+        store.save(claimsSnapshotLocked());
+        persistedVersion.accumulateAndGet(snapshotVersion, Math::max);
+    }
+
+    private Map<ChunkKey, UUID> claimsSnapshotLocked() {
+        Map<ChunkKey, UUID> snapshot = new HashMap<>();
+        for (Map.Entry<ChunkKey, ClaimInfo> entry : claims.entrySet()) {
+            snapshot.put(entry.getKey(), entry.getValue().groupId());
+        }
+        return snapshot;
+    }
+
+    private void markDirtyLocked() {
+        changeVersion.incrementAndGet();
     }
 
     /** 当前占用总数（诊断/测试用）。 */

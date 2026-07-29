@@ -75,7 +75,7 @@ class EnvSyncSnapshotProtocolTest {
                     ControlMessage.of(MessageType.ENV_FILE_REQUEST, fileRequest), connection);
             ControlMessage fileResponse = connection.take();
 
-            assertEquals(2, Protocol.VERSION);
+            assertEquals(3, Protocol.VERSION);
             assertFalse(snapshotId.isBlank());
             assertEquals(snapshotId,
                     fileResponse.json().get("snapshotId").getAsString());

@@ -29,6 +29,7 @@ public interface RegistryStore {
     /**
      * 全量落盘当前占用快照（定期 + 关闭时调用）。
      * 实现必须整体覆盖旧状态 —— 已释放的占用如果残留，重启会"复活"。
+     * 写入失败必须抛出运行时异常，耐久退出路径据此拒绝返回提交确认。
      */
     void save(Map<ChunkKey, UUID> snapshot);
 

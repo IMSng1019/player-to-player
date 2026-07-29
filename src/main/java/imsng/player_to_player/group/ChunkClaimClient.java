@@ -68,6 +68,9 @@ public final class ChunkClaimClient {
 
     private volatile boolean shutdown;
 
+    /** EXIT_BEGIN 前冻结：不再新增或释放占用，服务端权威清单才能稳定。 */
+    private volatile boolean exitFrozen;
+
     public ChunkClaimClient(ControlConnection conn, UUID groupId, int retrySeconds) {
         this.conn = conn;
         this.groupId = groupId;
@@ -82,6 +85,10 @@ public final class ChunkClaimClient {
      * 消费方不得在回调里做重活/阻塞。
      */
     public CompletableFuture<ClaimOutcome> claimWithRetry(ChunkKey key) {
+        if (exitFrozen) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("主客户端正在提交退出事务"));
+        }
         return pending.computeIfAbsent(key, k -> {
             CompletableFuture<ClaimOutcome> future = new CompletableFuture<>();
             attemptClaim(k, future);
@@ -121,8 +128,9 @@ public final class ChunkClaimClient {
 
     /** 发起一次申请；被拒/失败则安排下一轮重试。 */
     private void attemptClaim(ChunkKey key, CompletableFuture<ClaimOutcome> future) {
-        if (shutdown) {
-            future.completeExceptionally(new IllegalStateException("组运行时已关停"));
+        if (shutdown || exitFrozen) {
+            future.completeExceptionally(new IllegalStateException(
+                    exitFrozen ? "主客户端正在提交退出事务" : "组运行时已关停"));
             pending.remove(key, future);
             return;
         }
@@ -133,8 +141,9 @@ public final class ChunkClaimClient {
         req.addProperty("groupId", groupId.toString());
         conn.request(ControlMessage.of(MessageType.CHUNK_CLAIM_REQUEST, req))
                 .whenComplete((resp, err) -> {
-                    if (shutdown) {
-                        future.completeExceptionally(new IllegalStateException("组运行时已关停"));
+                    if (shutdown || exitFrozen) {
+                        future.completeExceptionally(new IllegalStateException(
+                                exitFrozen ? "主客户端正在提交退出事务" : "组运行时已关停"));
                         pending.remove(key, future);
                         return;
                     }
@@ -248,6 +257,10 @@ public final class ChunkClaimClient {
      * 过滤掉，不会出现"释放后上行被服务端拒绝"的日志噪音。
      */
     public void releaseWithData(ChunkKey key, byte[] gzipNbt) {
+        if (exitFrozen) {
+            // 退出事务会整组提交并释放；普通 CHUNK_RELEASE 会破坏固定清单与保护语义。
+            return;
+        }
         claimed.remove(key);
         JsonObject req = new JsonObject();
         req.addProperty("dimension", key.dimension());
@@ -261,6 +274,20 @@ public final class ChunkClaimClient {
                         LOGGER.warn("区块释放请求失败（服务端断连清理兜底）: {}", key.asString());
                     }
                 });
+    }
+
+    /**
+     * 冻结当前占用并返回快照。所有未决申请异常结束；此后普通释放同样被抑制，
+     * 最终由 EXIT_COMMIT 在物理服整组释放。
+     */
+    public Set<ChunkKey> freezeForExit() {
+        exitFrozen = true;
+        for (Map.Entry<ChunkKey, CompletableFuture<ClaimOutcome>> entry : pending.entrySet()) {
+            entry.getValue().completeExceptionally(
+                    new IllegalStateException("主客户端正在提交退出事务"));
+        }
+        pending.clear();
+        return Set.copyOf(claimed);
     }
 
     /** 关停：未决申请全部异常完成（区块加载链随集成服务端停摆，不泄漏）。 */
