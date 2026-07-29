@@ -16,6 +16,9 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.function.BooleanSupplier;
 
 /**
  * 主客户端耐久退出协议处理器。
@@ -48,10 +51,31 @@ public final class ExitTransactionHandlers {
     }
 
     public interface ChunkSink {
+        default boolean validate(UUID groupId, ChunkKey key, byte[] gzipNbt,
+                                 boolean preserveExisting) {
+            return true;
+        }
+
         boolean write(UUID groupId, ChunkKey key, byte[] gzipNbt,
                       boolean preserveExisting);
 
         void flush();
+    }
+
+    public interface PayloadStore {
+        boolean stagePlayer(ExitManifest manifest, UUID playerId, byte[] gzipNbt);
+
+        boolean stageChunk(ExitManifest manifest, ChunkKey key, byte[] gzipNbt,
+                           boolean preserveExisting);
+
+        void apply(ExitManifest manifest);
+
+        void discard(ExitManifest manifest);
+    }
+
+    @FunctionalInterface
+    public interface SessionGuard {
+        boolean run(ControlConnection connection, BooleanSupplier action);
     }
 
     @FunctionalInterface
@@ -62,8 +86,9 @@ public final class ExitTransactionHandlers {
     private final ExitTransactionLedger ledger;
     private final BeginAuthorizer authorizer;
     private final PendingProtection pendingProtection;
-    private final PlayerSink playerSink;
-    private final ChunkSink chunkSink;
+    private final PayloadStore payloadStore;
+    private final Runnable flushRealtime;
+    private final SessionGuard sessionGuard;
     private final CommitCleanup cleanup;
     private final Executor executor;
     private final ConcurrentHashMap<UUID, CompletableFuture<Void>> beginBarriers =
@@ -77,13 +102,40 @@ public final class ExitTransactionHandlers {
                                    ChunkSink chunkSink,
                                    CommitCleanup cleanup,
                                    Executor executor) {
+        this(ledger, authorizer, pendingProtection,
+                new VolatilePayloadStore(playerSink, chunkSink),
+                chunkSink::flush, cleanup, executor,
+                (connection, action) -> action.getAsBoolean());
+    }
+
+    public ExitTransactionHandlers(ExitTransactionLedger ledger,
+                                   BeginAuthorizer authorizer,
+                                   PendingProtection pendingProtection,
+                                   PayloadStore payloadStore,
+                                   Runnable flushRealtime,
+                                   CommitCleanup cleanup,
+                                   Executor executor) {
+        this(ledger, authorizer, pendingProtection, payloadStore,
+                flushRealtime, cleanup, executor,
+                (connection, action) -> action.getAsBoolean());
+    }
+
+    public ExitTransactionHandlers(ExitTransactionLedger ledger,
+                                   BeginAuthorizer authorizer,
+                                   PendingProtection pendingProtection,
+                                   PayloadStore payloadStore,
+                                   Runnable flushRealtime,
+                                   CommitCleanup cleanup,
+                                   Executor executor,
+                                   SessionGuard sessionGuard) {
         this.ledger = ledger;
         this.authorizer = authorizer;
         this.pendingProtection = pendingProtection;
-        this.playerSink = playerSink;
-        this.chunkSink = chunkSink;
+        this.payloadStore = payloadStore;
+        this.flushRealtime = flushRealtime;
         this.cleanup = cleanup;
         this.executor = executor;
+        this.sessionGuard = sessionGuard;
     }
 
     public void register(HandlerRegistry registry) {
@@ -94,11 +146,54 @@ public final class ExitTransactionHandlers {
     }
 
     public boolean isProtectedAfterBegins(UUID clientId) {
+        awaitPendingBegins(clientId);
+        return isProtectedNow(clientId);
+    }
+
+    /**
+     * 等待当前已经发布的 BEGIN 屏障全部结束。调用方不得在 HELLO 会话锁内等待，
+     * 因为 BEGIN 任务本身需要进入同一把锁校验连接是否仍为当前会话。
+     */
+    public void awaitPendingBegins(UUID clientId) {
+        if (clientId == null) {
+            return;
+        }
+        while (true) {
+            CompletableFuture<Void> barrier = beginBarriers.get(clientId);
+            if (barrier == null) {
+                return;
+            }
+            barrier.handle((ignored, failure) -> null).join();
+            // BEGIN 任务先完成屏障再从映射摘除；等待方可协助条件删除，随后继续
+            // 检查是否有更新的屏障替换进来。
+            beginBarriers.remove(clientId, barrier);
+        }
+    }
+
+    /** 只读取当前耐久事务保护状态；不会等待 BEGIN 屏障。 */
+    public boolean isProtectedNow(UUID clientId) {
+        return ledger.isProtected(clientId);
+    }
+
+    /** 当前连接、BEGIN 屏障和 ledger 未保护检查共同包住一次实时权威写。 */
+    public boolean writeRealtimeIfAllowed(ControlConnection connection,
+                                          BooleanSupplier writer) {
+        UUID clientId = connection != null ? connection.peerId() : null;
+        if (clientId == null || writer == null) {
+            return false;
+        }
         CompletableFuture<Void> barrier = beginBarriers.get(clientId);
         if (barrier != null) {
             barrier.handle((ignored, failure) -> null).join();
         }
-        return ledger.isProtected(clientId);
+        return sessionGuard.run(connection, () -> {
+            // 生产 SessionGuard 对同一客户端串行 HELLO、BEGIN 与本动作，因此这里
+            // 只需在耗时 writer 前读取保护状态，不必占用 ledger 全局锁做磁盘 IO。
+            if (ledger.isProtected(clientId)) {
+                return false;
+            }
+            return writer.getAsBoolean();
+        });
     }
 
     /** 服务端启动时先恢复 pending 冻结，再补做 committed 但尚未完成的清理。 */
@@ -109,18 +204,26 @@ public final class ExitTransactionHandlers {
         for (ExitManifest manifest : ledger.committedManifestsNeedingCleanup()) {
             ensureCleanupComplete(manifest);
         }
+        for (ExitManifest manifest : ledger.cleanupCompleteManifests()) {
+            discardCompletedBestEffort(manifest);
+        }
     }
 
     /** 新进程正常申请角色代表旧退出进程已被强杀：保留最后实时数据并释放旧占用。 */
     public int abandonPendingForRejoin(UUID clientId) {
-        CompletableFuture<Void> barrier = beginBarriers.get(clientId);
-        if (barrier != null) {
-            barrier.handle((ignored, failure) -> null).join();
-        }
+        awaitPendingBegins(clientId);
+        return abandonPendingForRejoinNow(clientId);
+    }
+
+    /**
+     * 不等待 BEGIN 屏障的重进恢复阶段。调用方必须先在 HELLO 会话锁外调用
+     * {@link #awaitPendingBegins(UUID)}，再在当前会话锁内调用本方法。
+     */
+    public int abandonPendingForRejoinNow(UUID clientId) {
         int abandoned = 0;
         for (ExitManifest manifest : ledger.unfinishedManifestsForClient(clientId)) {
             if (!ledger.isCommitted(clientId, manifest.shutdownId())) {
-                chunkSink.flush();
+                flushRealtime.run();
                 if (!ledger.abandon(clientId, manifest.shutdownId())) {
                     throw new IllegalStateException("无法终结强杀遗留退出事务");
                 }
@@ -148,7 +251,8 @@ public final class ExitTransactionHandlers {
                 previous.handle((ignored, failure) -> null).join();
             }
             JsonObject out = new JsonObject();
-            try {
+            boolean current = sessionGuard.run(connection, () -> {
+                try {
                 UUID currentPeer = connection.peerId();
                 ExitManifest requested = ExitManifest.fromJson(message.json());
                 ExitManifest effective = ledger.manifest(
@@ -185,8 +289,14 @@ public final class ExitTransactionHandlers {
                         out.add("manifest", effective.toJson());
                     }
                 }
-            } catch (Exception e) {
-                LOGGER.warn("EXIT_BEGIN 处理失败", e);
+                } catch (Exception e) {
+                    LOGGER.warn("EXIT_BEGIN 处理失败", e);
+                    out.addProperty("accepted", false);
+                    out.addProperty("committed", false);
+                }
+                return true;
+            });
+            if (!current) {
                 out.addProperty("accepted", false);
                 out.addProperty("committed", false);
             }
@@ -212,9 +322,9 @@ public final class ExitTransactionHandlers {
 
     private void handlePlayer(ControlConnection connection, ControlMessage message) {
         executor.execute(() -> {
-            boolean accepted = false;
-            boolean written = false;
-            try {
+            boolean[] result = new boolean[2];
+            sessionGuard.run(connection, () -> {
+                try {
                 UUID peerId = connection.peerId();
                 UUID shutdownId = parseUuid(message.json(), "shutdownId");
                 UUID playerId = parseUuid(message.json(), "playerUuid");
@@ -224,29 +334,33 @@ public final class ExitTransactionHandlers {
                             new ExitPayloadAssembler.Key(
                                     shutdownId, "player", playerId.toString()),
                             message);
-                    accepted = assembled.accepted();
-                    if (assembled.complete()
-                            && playerSink.write(playerId, assembled.payload())) {
-                        written = ledger.markPlayerReceived(
-                                peerId, shutdownId, playerId);
-                        accepted = written;
+                    result[0] = assembled.accepted();
+                    if (assembled.complete()) {
+                        byte[] payload = assembled.payload();
+                        result[1] = ledger.receivePlayer(
+                                peerId, shutdownId, playerId,
+                                () -> payloadStore.stagePlayer(
+                                        manifest, playerId, payload));
+                        result[0] = result[1];
                     }
                 }
-            } catch (Exception e) {
-                LOGGER.warn("EXIT_PLAYER_DATA 处理失败", e);
-            }
+                } catch (Exception e) {
+                    LOGGER.warn("EXIT_PLAYER_DATA 处理失败", e);
+                }
+                return true;
+            });
             JsonObject out = new JsonObject();
-            out.addProperty("accepted", accepted);
-            out.addProperty("written", written);
+            out.addProperty("accepted", result[0]);
+            out.addProperty("written", result[1]);
             connection.send(message.reply(MessageType.EXIT_PLAYER_DATA, out, null));
         });
     }
 
     private void handleChunk(ControlConnection connection, ControlMessage message) {
         executor.execute(() -> {
-            boolean accepted = false;
-            boolean written = false;
-            try {
+            boolean[] result = new boolean[2];
+            sessionGuard.run(connection, () -> {
+                try {
                 UUID peerId = connection.peerId();
                 UUID shutdownId = parseUuid(message.json(), "shutdownId");
                 ChunkKey key = parseChunk(message.json());
@@ -255,72 +369,99 @@ public final class ExitTransactionHandlers {
                 ExitManifest manifest = ledger.manifest(peerId, shutdownId);
                 if (manifest != null && manifest.chunks().contains(key)) {
                     if (preserve) {
-                        written = chunkSink.write(
-                                manifest.groupId(), key, null, true)
-                                && ledger.markChunkReceived(
-                                peerId, shutdownId, key);
-                        accepted = written;
+                        result[1] = ledger.receiveChunk(
+                                peerId, shutdownId, key,
+                                () -> payloadStore.stageChunk(
+                                        manifest, key, null, true));
+                        result[0] = result[1];
                     } else {
                         ExitPayloadAssembler.Result assembled = assemble(
                                 new ExitPayloadAssembler.Key(
                                         shutdownId, "chunk", key.asString()),
                                 message);
-                        accepted = assembled.accepted();
-                        if (assembled.complete()
-                                && chunkSink.write(manifest.groupId(), key,
-                                assembled.payload(), false)) {
-                            written = ledger.markChunkReceived(
-                                    peerId, shutdownId, key);
-                            accepted = written;
+                        result[0] = assembled.accepted();
+                        if (assembled.complete()) {
+                            byte[] payload = assembled.payload();
+                            result[1] = ledger.receiveChunk(
+                                    peerId, shutdownId, key,
+                                    () -> payloadStore.stageChunk(
+                                            manifest, key, payload, false));
+                            result[0] = result[1];
                         }
                     }
                 }
-            } catch (Exception e) {
-                LOGGER.warn("EXIT_CHUNK_DATA 处理失败", e);
-            }
+                } catch (Exception e) {
+                    LOGGER.warn("EXIT_CHUNK_DATA 处理失败", e);
+                }
+                return true;
+            });
             JsonObject out = new JsonObject();
-            out.addProperty("accepted", accepted);
-            out.addProperty("written", written);
+            out.addProperty("accepted", result[0]);
+            out.addProperty("written", result[1]);
             connection.send(message.reply(MessageType.EXIT_CHUNK_DATA, out, null));
         });
     }
 
     private void handleCommit(ControlConnection connection, ControlMessage message) {
         executor.execute(() -> {
-            boolean committed = false;
-            try {
+            boolean[] committed = new boolean[1];
+            sessionGuard.run(connection, () -> {
+                try {
                 UUID peerId = connection.peerId();
                 UUID shutdownId = parseUuid(message.json(), "shutdownId");
                 ExitManifest manifest = ledger.manifest(peerId, shutdownId);
                 if (manifest != null && ledger.isCommitted(peerId, shutdownId)) {
                     ensureCleanupComplete(manifest);
-                    committed = true;
+                    committed[0] = true;
                 } else if (manifest != null
                         && ledger.isReadyToCommit(peerId, shutdownId)) {
-                    // 先刷新全部已接受区块，确认数据耐久后再写 committed 标记。
-                    chunkSink.flush();
-                    committed = ledger.commit(peerId, shutdownId);
-                    if (committed) {
+                    // 暂存对象已经逐个 force；先耐久写 committed 意图，再应用正式数据。
+                    if (ledger.commit(peerId, shutdownId)) {
                         ensureCleanupComplete(manifest);
+                        // 只有正式数据和清理元数据全部耐久完成后才允许客户端关闭。
+                        committed[0] = true;
                     }
                 }
-            } catch (Exception e) {
-                LOGGER.warn("EXIT_COMMIT 处理失败", e);
-            }
+                } catch (Exception e) {
+                    LOGGER.warn("EXIT_COMMIT 处理失败", e);
+                }
+                return true;
+            });
             JsonObject out = new JsonObject();
-            out.addProperty("committed", committed);
+            out.addProperty("committed", committed[0]);
             connection.send(message.reply(MessageType.EXIT_COMMIT, out, null));
         });
     }
 
     private void ensureCleanupComplete(ExitManifest manifest) {
         if (ledger.isCleanupComplete(manifest.clientId(), manifest.shutdownId())) {
+            discardCompletedBestEffort(manifest);
             return;
+        }
+        if (ledger.isAbandoned(manifest.clientId(), manifest.shutdownId())) {
+            payloadStore.discard(manifest);
+        } else if (!ledger.isDataApplied(
+                manifest.clientId(), manifest.shutdownId())) {
+            payloadStore.apply(manifest);
+            if (!ledger.markDataApplied(
+                    manifest.clientId(), manifest.shutdownId())) {
+                throw new IllegalStateException("退出正式数据应用状态落盘失败");
+            }
         }
         cleanup.cleanup(manifest);
         if (!ledger.markCleanupComplete(
                 manifest.clientId(), manifest.shutdownId())) {
             throw new IllegalStateException("退出事务清理状态落盘失败");
+        }
+        discardCompletedBestEffort(manifest);
+    }
+
+    private void discardCompletedBestEffort(ExitManifest manifest) {
+        try {
+            payloadStore.discard(manifest);
+        } catch (RuntimeException e) {
+            LOGGER.warn("退出事务已完成，但暂存目录清理失败: {}",
+                    manifest.shutdownId(), e);
         }
     }
 
@@ -348,5 +489,72 @@ public final class ExitTransactionHandlers {
         }
         return new ChunkKey(dimension, json.get("x").getAsInt(),
                 json.get("z").getAsInt());
+    }
+
+    /** 仅供纯状态机单测使用；生产环境必须注入 {@link ExitPayloadStore}。 */
+    private static final class VolatilePayloadStore implements PayloadStore {
+        private record ChunkPayload(byte[] data, boolean preserve) {
+        }
+
+        private final PlayerSink players;
+        private final ChunkSink chunks;
+        private final Map<UUID, Map<UUID, byte[]>> stagedPlayers = new HashMap<>();
+        private final Map<UUID, Map<ChunkKey, ChunkPayload>> stagedChunks = new HashMap<>();
+
+        private VolatilePayloadStore(PlayerSink players, ChunkSink chunks) {
+            this.players = players;
+            this.chunks = chunks;
+        }
+
+        @Override
+        public synchronized boolean stagePlayer(ExitManifest manifest, UUID playerId,
+                                                byte[] gzipNbt) {
+            stagedPlayers.computeIfAbsent(manifest.shutdownId(), ignored -> new HashMap<>())
+                    .put(playerId, gzipNbt.clone());
+            return true;
+        }
+
+        @Override
+        public synchronized boolean stageChunk(ExitManifest manifest, ChunkKey key,
+                                               byte[] gzipNbt,
+                                               boolean preserveExisting) {
+            if (!chunks.validate(manifest.groupId(), key, gzipNbt,
+                    preserveExisting)) {
+                return false;
+            }
+            stagedChunks.computeIfAbsent(manifest.shutdownId(), ignored -> new HashMap<>())
+                    .put(key, new ChunkPayload(
+                            gzipNbt != null ? gzipNbt.clone() : null,
+                            preserveExisting));
+            return true;
+        }
+
+        @Override
+        public synchronized void apply(ExitManifest manifest) {
+            Map<UUID, byte[]> playerData = stagedPlayers.getOrDefault(
+                    manifest.shutdownId(), Map.of());
+            for (UUID playerId : manifest.playerIds()) {
+                byte[] data = playerData.get(playerId);
+                if (data == null || !players.write(playerId, data)) {
+                    throw new IllegalStateException("测试暂存玩家数据缺失或写入失败");
+                }
+            }
+            Map<ChunkKey, ChunkPayload> chunkData = stagedChunks.getOrDefault(
+                    manifest.shutdownId(), Map.of());
+            for (ChunkKey key : manifest.chunks()) {
+                ChunkPayload payload = chunkData.get(key);
+                if (payload == null || !chunks.write(
+                        manifest.groupId(), key, payload.data(), payload.preserve())) {
+                    throw new IllegalStateException("测试暂存区块数据缺失或写入失败");
+                }
+            }
+            chunks.flush();
+        }
+
+        @Override
+        public synchronized void discard(ExitManifest manifest) {
+            stagedPlayers.remove(manifest.shutdownId());
+            stagedChunks.remove(manifest.shutdownId());
+        }
     }
 }

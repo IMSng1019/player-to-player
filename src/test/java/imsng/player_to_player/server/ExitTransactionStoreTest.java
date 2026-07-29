@@ -1,10 +1,15 @@
 package imsng.player_to_player.server;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import imsng.player_to_player.group.ExitManifest;
 import imsng.player_to_player.registry.ChunkKey;
+import imsng.player_to_player.util.JsonUtil;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Set;
@@ -48,5 +53,31 @@ class ExitTransactionStoreTest {
         assertTrue(committed.committed());
         assertEquals(Set.of(OVERWORLD, NETHER), committed.manifest().chunks());
     }
-}
 
+    @Test
+    void legacyCommittedRecordWithoutDataAppliedIsAlreadyApplied()
+            throws Exception {
+        JsonObject legacy = new JsonObject();
+        legacy.addProperty("shutdownId", SHUTDOWN_ID.toString());
+        legacy.addProperty("clientId", CLIENT_ID.toString());
+        legacy.addProperty("groupId", CLIENT_ID.toString());
+        legacy.addProperty("committed", true);
+        legacy.addProperty("cleanupComplete", false);
+        legacy.addProperty("abandoned", false);
+        JsonArray players = new JsonArray();
+        players.add(CLIENT_ID.toString());
+        legacy.add("players", players);
+        JsonArray chunks = new JsonArray();
+        chunks.add(OVERWORLD.asString());
+        legacy.add("chunks", chunks);
+        Files.writeString(tempDir.resolve(SHUTDOWN_ID + ".json"),
+                JsonUtil.GSON.toJson(legacy), StandardCharsets.UTF_8);
+
+        ExitTransactionRecord recovered =
+                new ExitTransactionStore(tempDir).load().get(SHUTDOWN_ID);
+
+        assertTrue(recovered.committed());
+        assertTrue(recovered.dataApplied());
+        assertFalse(recovered.cleanupComplete());
+    }
+}

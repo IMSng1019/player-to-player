@@ -105,8 +105,8 @@ public final class ClientExitCoordinator {
     /** GroupRuntime 在 SERVER_STOPPED 后调用；可能位于 IO 线程。 */
     public static void onExitBundle(ExitBundle bundle) {
         CompletableFuture<ExitBundle> future = bundleFuture;
-        if (future != null) {
-            future.complete(bundle);
+        if (future == null || !future.complete(bundle)) {
+            throw new IllegalStateException("退出协调器尚未接受最终 bundle");
         }
     }
 

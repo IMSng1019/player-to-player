@@ -215,47 +215,27 @@ public final class GroupRuntime {
             return;
         }
         if (finishingExit != null) {
-            exitManifest = null;
-            exitPlayers.clear();
-            exitChunks.clear();
             Consumer<ExitBundle> listener = exitBundleListener;
             imsng.player_to_player.util.ThreadPools.io().execute(() -> {
-                try {
-                    Map<UUID, byte[]> fallbackPlayers = new HashMap<>(playerFallback);
-                    for (Map.Entry<UUID, CompoundTag> entry : finalPlayers.entrySet()) {
-                        fallbackPlayers.put(
-                                entry.getKey(), PlayerStateNbt.encode(entry.getValue()));
-                    }
-                    // 原版已在 SERVER_STOPPED 前完成玩家保存。最终文件必须优先于
-                    // EXIT_BEGIN 时的内存快照，后者只用于文件缺失/不可读的兜底。
-                    Map<UUID, byte[]> players = new HashMap<>();
-                    java.nio.file.Path playerDataDir = server.getWorldPath(
-                            LevelResource.PLAYER_DATA_DIR);
-                    for (UUID playerId : finishingExit.playerIds()) {
-                        players.put(playerId, PlayerStateFiles.readFinalPlayerData(
-                                playerDataDir, playerId, fallbackPlayers.get(playerId)));
-                    }
-                    Map<imsng.player_to_player.registry.ChunkKey, byte[]> chunks =
-                            new HashMap<>();
-                    for (Map.Entry<imsng.player_to_player.registry.ChunkKey, CompoundTag> entry
-                            : finalChunks.entrySet()) {
-                        byte[] encoded = ChunkUploadService.compress(entry.getValue());
-                        if (encoded != null) {
-                            chunks.put(entry.getKey(), encoded);
-                        }
-                    }
-                    Set<imsng.player_to_player.registry.ChunkKey> preserve =
-                            new HashSet<>(finishingExit.chunks());
-                    preserve.removeAll(chunks.keySet());
-                    ExitBundle bundle = new ExitBundle(
-                            finishingExit, players, chunks, preserve);
-                    if (listener != null) {
-                        listener.accept(bundle);
-                    }
-                } catch (Exception e) {
-                    // 不回退普通关闭：bundle 构建失败时客户端保持退出屏障，便于保留现场。
-                    LOGGER.error("构建主客户端最终退出数据包失败，关闭继续被阻止", e);
-                }
+                ExitBundlePublication.publishUntilAccepted(
+                        () -> buildExitBundle(server, finishingExit,
+                                playerFallback, finalPlayers, finalChunks),
+                        bundle -> {
+                            if (listener == null) {
+                                throw new IllegalStateException("退出 bundle listener 未安装");
+                            }
+                            listener.accept(bundle);
+                        },
+                        e -> LOGGER.error(
+                                "构建或发布主客户端最终退出数据包失败，1 秒后继续重试", e),
+                        () -> sleepUninterruptibly(1, TimeUnit.SECONDS),
+                        () -> {
+                            synchronized (EXIT_LOCK) {
+                                exitManifest = null;
+                                exitPlayers.clear();
+                                exitChunks.clear();
+                            }
+                        });
             });
             return;
         }
@@ -459,5 +439,60 @@ public final class GroupRuntime {
     /** 本组 ID；未接管时为 null。 */
     public static UUID activeGroupId() {
         return groupId;
+    }
+
+    private static ExitBundle buildExitBundle(
+            MinecraftServer server, ExitManifest manifest,
+            Map<UUID, byte[]> playerFallback,
+            Map<UUID, CompoundTag> finalPlayers,
+            Map<imsng.player_to_player.registry.ChunkKey, CompoundTag> finalChunks) {
+        try {
+            Map<UUID, byte[]> fallbackPlayers = new HashMap<>(playerFallback);
+            for (Map.Entry<UUID, CompoundTag> entry : finalPlayers.entrySet()) {
+                fallbackPlayers.put(
+                        entry.getKey(), PlayerStateNbt.encode(entry.getValue()));
+            }
+            // 原版已在 SERVER_STOPPED 前完成玩家保存。最终文件必须优先于
+            // EXIT_BEGIN 时的内存快照，后者只用于文件缺失/不可读的兜底。
+            Map<UUID, byte[]> players = new HashMap<>();
+            java.nio.file.Path playerDataDir = server.getWorldPath(
+                    LevelResource.PLAYER_DATA_DIR);
+            for (UUID playerId : manifest.playerIds()) {
+                players.put(playerId, PlayerStateFiles.readFinalPlayerData(
+                        playerDataDir, playerId, fallbackPlayers.get(playerId)));
+            }
+            Map<imsng.player_to_player.registry.ChunkKey, byte[]> chunks =
+                    new HashMap<>();
+            for (Map.Entry<imsng.player_to_player.registry.ChunkKey, CompoundTag> entry
+                    : finalChunks.entrySet()) {
+                byte[] encoded = ChunkUploadService.compress(entry.getValue());
+                if (encoded == null) {
+                    throw new IllegalStateException("最终区块压缩失败: "
+                            + entry.getKey().asString());
+                }
+                chunks.put(entry.getKey(), encoded);
+            }
+            Set<imsng.player_to_player.registry.ChunkKey> preserve =
+                    new HashSet<>(manifest.chunks());
+            preserve.removeAll(chunks.keySet());
+            return new ExitBundle(manifest, players, chunks, preserve);
+        } catch (Exception e) {
+            throw new IllegalStateException("构建最终退出 bundle 失败", e);
+        }
+    }
+
+    private static void sleepUninterruptibly(long duration, TimeUnit unit) {
+        long deadline = System.nanoTime() + unit.toNanos(duration);
+        while (true) {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                return;
+            }
+            try {
+                TimeUnit.NANOSECONDS.sleep(remaining);
+            } catch (InterruptedException ignored) {
+                // 用户要求最终 bundle 构建不可取消。
+            }
+        }
     }
 }

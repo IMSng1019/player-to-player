@@ -69,6 +69,7 @@ public final class ExitTransactionStore implements ExitTransactionPersistence {
         root.addProperty("clientId", manifest.clientId().toString());
         root.addProperty("groupId", manifest.groupId().toString());
         root.addProperty("committed", record.committed());
+        root.addProperty("dataApplied", record.dataApplied());
         root.addProperty("cleanupComplete", record.cleanupComplete());
         root.addProperty("abandoned", record.abandoned());
         JsonArray players = new JsonArray();
@@ -97,11 +98,17 @@ public final class ExitTransactionStore implements ExitTransactionPersistence {
         }
         ExitManifest manifest = new ExitManifest(
                 shutdownId, clientId, groupId, players, chunks);
-        return new ExitTransactionRecord(
-                manifest,
-                JsonUtil.getBoolean(root, "committed", false),
-                JsonUtil.getBoolean(root, "cleanupComplete", false),
-                JsonUtil.getBoolean(root, "abandoned", false));
+        boolean committed = JsonUtil.getBoolean(root, "committed", false);
+        boolean cleanupComplete = JsonUtil.getBoolean(
+                root, "cleanupComplete", false);
+        boolean abandoned = JsonUtil.getBoolean(root, "abandoned", false);
+        boolean dataApplied = root.has("dataApplied")
+                ? JsonUtil.getBoolean(root, "dataApplied", false)
+                // 旧协议在 committed 前已经把全部最终帧直接写入正式世界；
+                // 因此旧 committed 即使 cleanup 尚未完成，也不能再寻找新暂存目录。
+                : committed && !abandoned;
+        return new ExitTransactionRecord(manifest, committed, dataApplied,
+                cleanupComplete, abandoned);
     }
 
     private static JsonArray requiredArray(JsonObject root, String name) {

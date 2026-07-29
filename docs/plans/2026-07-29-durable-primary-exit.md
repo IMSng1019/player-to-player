@@ -124,3 +124,71 @@
 4. 运行 `git diff --check` 和 `git status --short`，确认没有提交、没有无关改动。
 5. 检查兼容性敏感差异，明确报告 `Protocol.VERSION` 和消息类型变化。
 6. 实机验证：首次加入、再次加入坐标；游戏内退出；窗口关闭；退出前断网；提交中服务端重启；任务管理器强杀后的最后确认数据。
+
+### Task 9: 最终载荷耐久暂存与提交后应用
+
+**Files:**
+- Create: `src/main/java/imsng/player_to_player/server/ExitPayloadStore.java`
+- Create: `src/test/java/imsng/player_to_player/server/ExitPayloadStoreTest.java`
+- Modify: `src/main/java/imsng/player_to_player/server/ExitTransactionHandlers.java`
+- Modify: `src/main/java/imsng/player_to_player/server/ExitTransactionLedger.java`
+- Modify: `src/main/java/imsng/player_to_player/server/P2PServerService.java`
+- Modify: `src/main/java/imsng/player_to_player/config/P2PPaths.java`
+
+1. 先测试 pending 玩家/区块只进入 `shutdownId` 暂存区，正式 sink 不被调用。
+2. 测试部分暂存后 abandon 会删除暂存，正式 sink 保持最后实时数据。
+3. 测试数据齐全后先耐久 committed，再幂等应用全部暂存、flush、清理并写 cleanupComplete。
+4. 测试 committed 后服务端重启会继续应用；应用中途失败可重试且不会降级 abandon。
+5. 测试 cleanupComplete 后删除暂存目录，删除失败不影响已经完成的数据事务。
+
+### Task 10: 终态迟到载荷与跨会话写入门控
+
+**Files:**
+- Modify: `src/main/java/imsng/player_to_player/server/ExitTransactionLedger.java`
+- Modify: `src/main/java/imsng/player_to_player/server/ExitTransactionHandlers.java`
+- Modify: `src/main/java/imsng/player_to_player/server/HelloHandler.java`
+- Modify: `src/main/java/imsng/player_to_player/server/PlayerDataHandlers.java`
+- Modify: `src/main/java/imsng/player_to_player/server/ChunkDataHandlers.java`
+
+1. 测试“pending 校验 + 暂存 + received 标记”与 commit/abandon 在 ledger 锁内原子互斥。
+2. 测试 committed/abandoned 后迟到玩家或区块载荷不调用任何 sink。
+3. 测试旧连接任务在新 HELLO 发布后被拒绝；已经开始的旧写入完成前新会话不能发布。
+4. 实时正式写入在 EXIT_BEGIN 屏障后执行原子未保护检查，避免最终数据被旧任务覆盖。
+
+### Task 11: 实时区块落盘确认与异常断连释放
+
+**Files:**
+- Modify: `src/main/java/imsng/player_to_player/server/ChunkDataHandlers.java`
+- Modify: `src/main/java/imsng/player_to_player/server/P2PServerService.java`
+- Modify: `src/main/java/imsng/player_to_player/registry/ChunkRegistry.java`
+- Modify: `src/test/java/imsng/player_to_player/registry/ChunkRegistryExitFreezeTest.java`
+
+1. 测试实时上传只有底层写入和 flush 完成后才返回 `written=true`。
+2. 按客户端跟踪已接收的区块写任务；断连先冻结，再等待任务和 worker flush。
+3. 新增耐久整组释放；保存失败恢复内存占用并保持冻结，后台持续重试。
+4. 把退出区块校验的压缩载荷上限改为 `ExitPayloadProtocol.MAX_ASSEMBLED_BYTES`。
+
+### Task 12: bundle 重建与注册表变更日志
+
+**Files:**
+- Modify: `src/main/java/imsng/player_to_player/group/GroupRuntime.java`
+- Create: `src/main/java/imsng/player_to_player/registry/RegistryMutationJournal.java`
+- Create: `src/test/java/imsng/player_to_player/registry/RegistryMutationJournalTest.java`
+- Modify: `src/main/java/imsng/player_to_player/registry/ChunkRegistry.java`
+- Modify: `src/main/java/imsng/player_to_player/server/P2PServerService.java`
+
+注册表 WAL 使用长度与 SHA-256 帧，只截断明确损坏的最后一帧；checkpoint 必须先追加并
+force 完整 `replace_all` 状态，再写快照并清日志，覆盖快照已写但 WAL 未清的崩溃窗口。
+
+1. bundle 读取、压缩或发布失败时保留 manifest/快照并无限重试；压缩失败不得转 preserve。
+2. 为 claim/release/releaseAll/migrate/退出恢复写先行日志并在 ACK 前 force。
+3. 启动时加载注册表快照后重放日志；checkpoint 先 force `replace_all`，再保存快照并清日志。
+4. 孤儿 EXIT_BEGIN 只接受耐久注册表中属于请求组的精确清单，并检查四邻冲突。
+
+### Task 13: 最终验证
+
+1. 运行每个新增失败测试，确认红灯原因与目标缺失行为一致。
+2. 运行全部退出、玩家状态、区块注册表定向测试。
+3. 运行 `.\\gradlew.bat test --no-daemon`、`.\\gradlew.bat build --no-daemon`。
+4. 统计测试总数，检查 `git diff --check`、`git status --short` 和 remap JAR 条目。
+5. 不 commit；记录仍需实机执行的断网、服务端重启和任务管理器强杀场景。

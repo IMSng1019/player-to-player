@@ -7,6 +7,8 @@ import imsng.player_to_player.netproto.HandlerRegistry;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.util.JsonUtil;
 import imsng.player_to_player.util.ThreadPools;
+import imsng.player_to_player.server.ExitTransactionHandlers;
+import imsng.player_to_player.server.HelloHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,25 +52,40 @@ public final class RegistryHandlers {
      * @param writeback 最终区块数据写回（Phase 2；null = 无写回能力，只释放占用）
      */
     public static void register(HandlerRegistry reg, ChunkRegistry registry, PlayerTable players,
-                                ChunkWriteback writeback) {
-        reg.on(MessageType.CHUNK_CLAIM_REQUEST, (conn, msg) -> handleClaim(conn, msg, registry));
-        reg.on(MessageType.CHUNK_RELEASE, (conn, msg) -> handleRelease(conn, msg, registry, writeback));
+                                ChunkWriteback writeback,
+                                ExitTransactionHandlers exits) {
+        reg.on(MessageType.CHUNK_CLAIM_REQUEST,
+                (conn, msg) -> handleClaim(conn, msg, registry, exits));
+        reg.on(MessageType.CHUNK_RELEASE,
+                (conn, msg) -> handleRelease(conn, msg, registry, writeback, exits));
         reg.on(MessageType.CHUNK_PROBE_REQUEST, (conn, msg) -> handleProbe(conn, msg, registry));
         reg.on(MessageType.PLAYER_POS_UPDATE, (conn, msg) -> handlePosUpdate(conn, msg, players));
     }
 
     // ------------------------------------------------------------ 区块申请
 
-    private static void handleClaim(ControlConnection conn, ControlMessage msg, ChunkRegistry registry) {
+    private static void handleClaim(ControlConnection conn, ControlMessage msg,
+                                    ChunkRegistry registry,
+                                    ExitTransactionHandlers exits) {
         ChunkKey key = parseKey(msg.json());
         UUID groupId = parseUuid(JsonUtil.getString(msg.json(), "groupId", ""));
-        if (key == null || groupId == null) {
+        if (key == null || groupId == null || !groupId.equals(conn.peerId())) {
             conn.send(error(msg, "invalid_request", "dimension/x/z/groupId 缺失或非法"));
             return;
         }
         // tryClaim 授予路径含 region 文件探测（磁盘 IO），整体转 io() 池执行后应答
         ThreadPools.io().execute(() -> {
-            ChunkRegistry.ClaimResult result = registry.tryClaim(key, groupId);
+            java.util.concurrent.atomic.AtomicReference<ChunkRegistry.ClaimResult> resultRef =
+                    new java.util.concurrent.atomic.AtomicReference<>();
+            boolean current = exits != null && exits.writeRealtimeIfAllowed(conn, () -> {
+                resultRef.set(registry.tryClaim(key, groupId));
+                return true;
+            });
+            if (!current || resultRef.get() == null) {
+                conn.send(error(msg, "stale_session", "连接已被新会话替换或正在退出"));
+                return;
+            }
+            ChunkRegistry.ClaimResult result = resultRef.get();
             JsonObject out = new JsonObject();
             out.addProperty("granted", result.granted());
             if (result.granted()) {
@@ -86,33 +103,45 @@ public final class RegistryHandlers {
     // ------------------------------------------------------------ 区块释放
 
     private static void handleRelease(ControlConnection conn, ControlMessage msg,
-                                      ChunkRegistry registry, ChunkWriteback writeback) {
+                                      ChunkRegistry registry, ChunkWriteback writeback,
+                                      ExitTransactionHandlers exits) {
         ChunkKey key = parseKey(msg.json());
         UUID groupId = parseUuid(JsonUtil.getString(msg.json(), "groupId", ""));
-        if (key == null || groupId == null) {
+        if (key == null || groupId == null || !groupId.equals(conn.peerId())) {
             conn.send(error(msg, "invalid_request", "dimension/x/z/groupId 缺失或非法"));
             return;
         }
         byte[] finalData = msg.binary();
         // 写回（解压 + MCA 写 + 刷盘）是重活，整体转 io 池；顺序必须是先写回后释放
         ThreadPools.io().execute(() -> {
-            boolean written = false;
-            if (writeback != null && finalData != null && finalData.length > 0) {
-                // 写回内部会做占用组核验 —— 必须在 release 之前调用，否则核验必失败
-                written = writeback.writeFinalAndFlush(key, groupId, finalData);
-                if (!written) {
-                    // 写回失败不阻断释放：占用泄漏比一次数据回退更伤（区块会被永久锁死）
-                    LOGGER.warn("最终区块数据写回失败（仍继续释放占用）: {} 组={}",
-                            key.asString(), groupId);
+            java.util.concurrent.atomic.AtomicBoolean written =
+                    new java.util.concurrent.atomic.AtomicBoolean();
+            java.util.concurrent.atomic.AtomicBoolean released =
+                    new java.util.concurrent.atomic.AtomicBoolean();
+            boolean current = exits != null && exits.writeRealtimeIfAllowed(conn, () -> {
+                if (writeback != null && finalData != null && finalData.length > 0) {
+                    // 写回内部会做占用组核验 —— 必须在 release 之前调用，否则核验必失败
+                    written.set(writeback.writeFinalAndFlush(key, groupId, finalData));
+                    if (!written.get()) {
+                        LOGGER.warn("最终区块数据写回失败，保留占用并等待重试: {} 组={}",
+                                key.asString(), groupId);
+                        return false;
+                    }
                 }
+                released.set(registry.release(key, groupId));
+                return released.get();
+            });
+            if (!current) {
+                conn.send(error(msg, "release_rejected",
+                        "连接已失效、退出已冻结或最终数据未落盘"));
+                return;
             }
-            boolean released = registry.release(key, groupId);
-            if (!released) {
+            if (!released.get()) {
                 LOGGER.warn("区块释放未生效（未占用或占用者不符）: {} 组={}", key.asString(), groupId);
             }
             JsonObject out = new JsonObject();
-            out.addProperty("released", released);
-            out.addProperty("finalDataWritten", written);
+            out.addProperty("released", released.get());
+            out.addProperty("finalDataWritten", written.get());
             conn.send(msg.reply(MessageType.CHUNK_RELEASE_ACK, out, null));
         });
     }
@@ -127,7 +156,16 @@ public final class RegistryHandlers {
             conn.send(error(msg, "invalid_request", "dimension/x/z/groupId 缺失或非法"));
             return;
         }
-        ChunkRegistry.ClaimResult result = registry.probe(key, groupId);
+        java.util.concurrent.atomic.AtomicReference<ChunkRegistry.ClaimResult> resultRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        if (!HelloHandler.withCurrentSession(conn, () -> {
+            resultRef.set(registry.probe(key, groupId));
+            return true;
+        })) {
+            conn.send(error(msg, "stale_session", "连接已被新会话替换"));
+            return;
+        }
+        ChunkRegistry.ClaimResult result = resultRef.get();
         JsonObject out = new JsonObject();
         out.addProperty("blocked", !result.granted());
         if (!result.granted()) {
@@ -145,8 +183,12 @@ public final class RegistryHandlers {
             return; // 无应答消息：非法数据静默丢弃并记日志即可
         }
         String dimension = JsonUtil.getString(msg.json(), "dimension", "minecraft:overworld");
-        players.updatePosition(playerId, dimension,
-                getDouble(msg.json(), "x"), getDouble(msg.json(), "y"), getDouble(msg.json(), "z"));
+        HelloHandler.withCurrentSession(conn, () -> {
+            players.updatePosition(playerId, dimension,
+                    getDouble(msg.json(), "x"), getDouble(msg.json(), "y"),
+                    getDouble(msg.json(), "z"));
+            return true;
+        });
     }
 
     // ------------------------------------------------------------ 工具

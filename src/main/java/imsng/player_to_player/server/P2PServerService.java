@@ -16,6 +16,7 @@ import imsng.player_to_player.registry.MysqlRegistryStore;
 import imsng.player_to_player.registry.PlayerTable;
 import imsng.player_to_player.registry.RegionFileProbe;
 import imsng.player_to_player.registry.RegistryHandlers;
+import imsng.player_to_player.registry.RegistryMutationJournal;
 import imsng.player_to_player.registry.RegistryStore;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.server.MinecraftServer;
@@ -29,6 +30,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 服务端主服务（{@code mode=server}，DESIGN.md 第 8 节）。
@@ -120,7 +124,9 @@ public final class P2PServerService {
         if (store == null) {
             store = new JsonRegistryStore(paths.registryDir());
         }
-        ChunkRegistry registry = new ChunkRegistry(store, new RegionFileProbe(worldRoot));
+        ChunkRegistry registry = new ChunkRegistry(
+                store, new RegionFileProbe(worldRoot),
+                new RegistryMutationJournal(paths.registryMutationJournal()));
         registry.load();            // 恢复上次运行的占用状态（服务端重启不丢注册表）
         registry.startAutoPersist(); // 定期落盘（scheduler 驱动，崩溃最多丢一个周期）
         PlayerTable players = new PlayerTable();
@@ -138,7 +144,6 @@ public final class P2PServerService {
         // 区块数据面（Phase 2）：CHUNK_DATA_REQUEST 下发 / CHUNK_DATA_UPLOAD 实时上行；
         // 返回的写回接口交给 RegistryHandlers 处理 CHUNK_RELEASE 携带的最终数据
         ChunkDataHandlers chunkData = ChunkDataHandlers.register(control, server, registry);
-        RegistryHandlers.register(control, registry, players, chunkData.releaseWriteback());
         ComputeHandlers.register(control, computes);
         LogCollector.register(control, paths.logsDir());
         P2PBrokerHandlers.register(control, config);
@@ -149,6 +154,33 @@ public final class P2PServerService {
         // committed；客户端断线/服务端重启均可用同一 shutdownId 幂等恢复。
         ExitTransactionLedger exitLedger = new ExitTransactionLedger(
                 new ExitTransactionStore(paths.exitTransactionsDir()));
+        ExitPayloadStore exitPayloads = new ExitPayloadStore(
+                paths.exitPayloadsDir(),
+                (playerId, gzipNbt) -> PlayerDataFileStore.write(
+                        server.getWorldPath(LevelResource.PLAYER_DATA_DIR),
+                        playerId, gzipNbt),
+                new ExitPayloadStore.ChunkAccess() {
+                    @Override
+                    public boolean validate(UUID groupId,
+                                            imsng.player_to_player.registry.ChunkKey key,
+                                            byte[] gzipNbt, boolean preserveExisting) {
+                        return chunkData.validateExit(
+                                groupId, key, gzipNbt, preserveExisting);
+                    }
+
+                    @Override
+                    public boolean write(UUID groupId,
+                                         imsng.player_to_player.registry.ChunkKey key,
+                                         byte[] gzipNbt, boolean preserveExisting) {
+                        return chunkData.writeExit(
+                                groupId, key, gzipNbt, preserveExisting);
+                    }
+
+                    @Override
+                    public void flush() {
+                        chunkData.flushAll();
+                    }
+                });
         ExitTransactionHandlers exits = new ExitTransactionHandlers(
                 exitLedger,
                 (peerId, requested) -> {
@@ -196,39 +228,49 @@ public final class P2PServerService {
                         registry.cancelExitProtection(manifest.groupId());
                     }
                 },
-                (playerId, gzipNbt) -> PlayerDataFileStore.write(
-                        server.getWorldPath(LevelResource.PLAYER_DATA_DIR),
-                        playerId, gzipNbt),
-                new ExitTransactionHandlers.ChunkSink() {
-                    @Override
-                    public boolean write(UUID groupId,
-                                         imsng.player_to_player.registry.ChunkKey key,
-                                         byte[] gzipNbt, boolean preserveExisting) {
-                        return chunkData.writeExit(
-                                groupId, key, gzipNbt, preserveExisting);
-                    }
-
-                    @Override
-                    public void flush() {
-                        chunkData.flushAll();
-                    }
-                },
+                exitPayloads,
+                chunkData::flushAll,
                 manifest -> {
                     registry.completeExitDurably(
                             manifest.groupId(), manifest.chunks());
                     groups.removeClient(manifest.clientId());
                 },
-                imsng.player_to_player.util.ThreadPools.io());
+                imsng.player_to_player.util.ThreadPools.io(),
+                HelloHandler::withCurrentSession);
         exits.register(control);
+        chunkData.setExitTransactions(exits);
+        RegistryHandlers.register(
+                control, registry, players, chunkData.releaseWriteback(), exits);
         // 玩家实时上行在 EXIT_BEGIN 后必须被拒绝，防旧 IO 任务覆盖最终玩家文件。
-        PlayerDataHandlers.register(
-                control, server, groups, exits::isProtectedAfterBegins);
+        PlayerDataHandlers.register(control, server, groups, exits);
+        ConcurrentHashMap<UUID, CompletableFuture<Void>> disconnectCleanups =
+                new ConcurrentHashMap<>();
         // 角色指派（Phase 2）：正常重进前先结束强杀遗留的 pending，保留实时数据。
         control.on(MessageType.ROLE_REQUEST,
                 new RoleAssignHandler(server, config, registry, groups, computes,
-                        exits::abandonPendingForRejoin));
-        // 启动网络入口前恢复 pending 冻结，并只补做尚未标记完成的 committed 清理。
-        exits.recoverDurableState();
+                        clientId -> {
+                            CompletableFuture<Void> cleanup =
+                                    disconnectCleanups.get(clientId);
+                            if (cleanup != null) {
+                                cleanup.join();
+                            }
+                            exits.awaitPendingBegins(clientId);
+                        },
+                        exits::abandonPendingForRejoinNow));
+        // 启动网络入口前恢复 pending 冻结，并补做 committed 的暂存应用/清理。
+        // committed 是必须完成的耐久意图，磁盘暂时不可用时不能跳过后开放新会话。
+        int recoveryAttempt = 0;
+        while (true) {
+            recoveryAttempt++;
+            try {
+                exits.recoverDurableState();
+                break;
+            } catch (Exception e) {
+                LOGGER.error("恢复退出事务第 {} 次失败，1 秒后继续重试",
+                        recoveryAttempt, e);
+                sleepUninterruptibly(1, TimeUnit.SECONDS);
+            }
+        }
         // 指令/聊天逐级路由（Phase 4）：COMMAND_RELAY 特例处理 + 泛化下放，CHAT_RELAY 全网分发
         CommandChatHandlers.register(control, server, groups, players);
         // 末影珍珠交接路由（Phase 4）：PEARL_HANDOFF 转发目标组 / PEARL_LANDED 回程抛出者组
@@ -243,32 +285,71 @@ public final class P2PServerService {
             if (peerId == null) {
                 return; // 未完成 HELLO 的连接没有任何登记，无需清理
             }
-            // 竞态防护：客户端快速重连时 HelloHandler 会先登记新连接再关旧连接，
-            // 旧连接的断连回调随后才触发 —— 此刻新会话已重新上报了玩家/算力/区块状态，
-            // 若无条件按 peerId 全局清理会把新会话刚建立的状态清空（算力表被删、
-            // 组占用的区块被 releaseAll 整组释放）。故先判断该 peerId 当前登记的
-            // 连接是否仍是本连接：不是（已被新连接顶替）则只注销旧连接自身，跳过三项全局清理。
-            boolean stillCurrent = HelloHandler.connectionOf(peerId) == conn;
-            HelloHandler.unregister(peerId, conn);
-            if (!stillCurrent) {
+            if (!running) {
+                // 服务端整体停机时保留注册表快照，不能为每个被动断开的连接启动
+                // 无限释放重试；下次启动由注册表日志与退出事务统一恢复。
+                HelloHandler.unregister(peerId, conn);
+                return;
+            }
+            // 先在会话锁外等待已经排队的 EXIT_BEGIN。BEGIN 任务需要同一会话锁，
+            // 若在锁内等待会形成死锁；等待结束后再进锁重读 ledger，后来才排入的
+            // BEGIN 要么先完成耐久保护，要么在旧会话摘除后因身份失效而被拒绝。
+            exits.awaitPendingBegins(peerId);
+            CompletableFuture<Void> cleanup = new CompletableFuture<>();
+            java.util.concurrent.atomic.AtomicBoolean protectedExit =
+                    new java.util.concurrent.atomic.AtomicBoolean();
+            // 旧会话摘除、易被新 HELLO 覆盖的内存状态清理、以及断连清理 future
+            // 发布必须处于同一临界区。这样替换连接的 ROLE_REQUEST 必然能观察并等待
+            // 旧组完成 flush + 耐久释放，不会在发布空窗中创建随后被旧清理删除的新组。
+            if (!HelloHandler.unregisterIfCurrent(peerId, conn, () -> {
+                boolean protectedNow = exits.isProtectedNow(peerId);
+                protectedExit.set(protectedNow);
+                if (!protectedNow) {
+                    // 区块冻结必须先于替换 HELLO 可见，否则新连接可在 cleanup
+                    // future 已发布但冻结尚未执行的空窗中抢到随后会被旧清理释放的 claim。
+                    registry.freezeForExit(peerId);
+                    disconnectCleanups.put(peerId, cleanup);
+                }
+                players.remove(peerId);
+                computes.remove(peerId);
+            })) {
                 LOGGER.info("客户端 {} 的旧连接断开，新连接已接管，跳过全局状态清理", peerId);
                 return;
             }
-            players.remove(peerId);
-            computes.remove(peerId);
-            if (exits.isProtectedAfterBegins(peerId)) {
+            if (protectedExit.get()) {
                 // EXIT_BEGIN 已耐久确认：断线只是退出传输中断，不得释放唯一写入所有权。
                 merges.abortInvolving(peerId);
                 LOGGER.info("主客户端 {} 处于耐久退出事务中，断线后保留组与区块占用",
                         peerId);
                 return;
             }
-            registry.releaseAll(peerId);
             // 合并会话清理（Phase 3）：当事方掉线 → 中止其卷入的合并（A 继续运行）
             merges.abortInvolving(peerId);
-            // 组表清理（Phase 2）：主客户端离线 → 整组解散；副客户端离线 → 摘成员
-            groups.removeClient(peerId);
-            LOGGER.info("客户端断开，已清理其状态: {}", peerId);
+            imsng.player_to_player.util.ThreadPools.io().execute(() -> {
+                int attempt = 0;
+                while (true) {
+                    if (!running) {
+                        cleanup.complete(null);
+                        return;
+                    }
+                    attempt++;
+                    try {
+                        chunkData.flushAll();
+                        int released = registry.releaseAllDurably(peerId);
+                        groups.removeClient(peerId);
+                        LOGGER.info("客户端断开清理完成: {}，耐久释放 {} 个区块",
+                                peerId, released);
+                        cleanup.complete(null);
+                        return;
+                    } catch (Exception e) {
+                        LOGGER.warn("客户端 {} 断连清理第 {} 次失败，保持冻结并重试: {}",
+                                peerId, attempt, e.toString());
+                        sleepUninterruptibly(1, TimeUnit.SECONDS);
+                    }
+                }
+            });
+            cleanup.whenComplete((ignored, failure) ->
+                    disconnectCleanups.remove(peerId, cleanup));
         });
         control.start();
 
@@ -329,6 +410,21 @@ public final class P2PServerService {
             exclusions.add(worldPrefix + "/" + dim);
         }
         return exclusions;
+    }
+
+    private static void sleepUninterruptibly(long duration, TimeUnit unit) {
+        long deadline = System.nanoTime() + unit.toNanos(duration);
+        while (true) {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                return;
+            }
+            try {
+                TimeUnit.NANOSECONDS.sleep(remaining);
+            } catch (InterruptedException ignored) {
+                // 异常断连清理只有完成耐久释放后才能结束。
+            }
+        }
     }
 
     // ------------------------------------------------------------------ 停止

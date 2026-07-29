@@ -64,7 +64,7 @@ class ChunkRegistryExitFreezeTest {
     }
 
     @Test
-    void orphanRecoveryAddsClaimsMissingFromStaleRegistrySnapshot() {
+    void orphanRecoveryUsesOnlyDurableServerClaims() {
         MemoryStore store = new MemoryStore();
         store.data.put(FIRST, GROUP);
         ChunkRegistry registry = new ChunkRegistry(store, null);
@@ -73,13 +73,30 @@ class ChunkRegistryExitFreezeTest {
         Set<ChunkKey> recovered = registry.freezeOrRecoverForExit(
                 GROUP, Set.of(FIRST, SECOND), true);
 
-        assertEquals(Set.of(FIRST, SECOND), recovered);
+        assertEquals(Set.of(FIRST), recovered);
         assertEquals(null, registry.ownerOf(SECOND));
 
         registry.restoreExitProtection(GROUP, recovered);
 
-        assertEquals(GROUP, registry.ownerOf(SECOND));
+        assertEquals(null, registry.ownerOf(SECOND));
         assertTrue(registry.isExitFrozen(GROUP));
+    }
+
+    @Test
+    void orphanRecoveryRejectsDurableFourNeighborConflict() {
+        ChunkKey neighbor = new ChunkKey(
+                FIRST.dimension(), FIRST.x() + 1, FIRST.z());
+        MemoryStore store = new MemoryStore();
+        store.data.put(FIRST, GROUP);
+        store.data.put(neighbor, OTHER_GROUP);
+        ChunkRegistry registry = new ChunkRegistry(store, null);
+        registry.load();
+
+        assertThrows(IllegalStateException.class, () ->
+                registry.freezeOrRecoverForExit(
+                        GROUP, Set.of(FIRST), true));
+
+        assertFalse(registry.isExitFrozen(GROUP));
     }
 
     @Test
@@ -106,6 +123,36 @@ class ChunkRegistryExitFreezeTest {
 
         assertThrows(IllegalStateException.class,
                 () -> registry.completeExitDurably(GROUP, Set.of(FIRST)));
+
+        assertTrue(registry.isExitFrozen(GROUP));
+        assertEquals(GROUP, registry.ownerOf(FIRST));
+    }
+
+    @Test
+    void abnormalDisconnectReleasesWholeFrozenGroupDurably() {
+        MemoryStore store = new MemoryStore();
+        ChunkRegistry registry = new ChunkRegistry(store, null);
+        assertTrue(registry.tryClaim(FIRST, GROUP).granted());
+        assertTrue(registry.tryClaim(SECOND, GROUP).granted());
+        registry.freezeForExit(GROUP);
+
+        assertEquals(2, registry.releaseAllDurably(GROUP));
+
+        assertFalse(registry.isExitFrozen(GROUP));
+        assertEquals(0, registry.size());
+        assertTrue(store.data.isEmpty());
+    }
+
+    @Test
+    void failedAbnormalDisconnectReleaseRestoresClaimsAndFreeze() {
+        MemoryStore store = new MemoryStore();
+        ChunkRegistry registry = new ChunkRegistry(store, null);
+        assertTrue(registry.tryClaim(FIRST, GROUP).granted());
+        registry.freezeForExit(GROUP);
+        store.failNextSave = true;
+
+        assertThrows(IllegalStateException.class,
+                () -> registry.releaseAllDurably(GROUP));
 
         assertTrue(registry.isExitFrozen(GROUP));
         assertEquals(GROUP, registry.ownerOf(FIRST));

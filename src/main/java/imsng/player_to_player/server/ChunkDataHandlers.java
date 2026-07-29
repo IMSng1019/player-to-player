@@ -6,6 +6,7 @@ import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.HandlerRegistry;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.netproto.Protocol;
+import imsng.player_to_player.group.ExitPayloadProtocol;
 import imsng.player_to_player.registry.ChunkKey;
 import imsng.player_to_player.registry.ChunkRegistry;
 import imsng.player_to_player.registry.ChunkWriteback;
@@ -75,6 +76,7 @@ public final class ChunkDataHandlers {
     private final MinecraftServer server;
     private final ChunkRegistry registry;
     private final Object[] writeLocks = new Object[256];
+    private volatile ExitTransactionHandlers exits;
 
     private ChunkDataHandlers(MinecraftServer server, ChunkRegistry registry) {
         this.server = server;
@@ -93,6 +95,10 @@ public final class ChunkDataHandlers {
         reg.on(MessageType.CHUNK_DATA_REQUEST, handlers::handleDataRequest);
         reg.on(MessageType.CHUNK_DATA_UPLOAD, handlers::handleUpload);
         return handlers;
+    }
+
+    void setExitTransactions(ExitTransactionHandlers exits) {
+        this.exits = exits;
     }
 
     // ------------------------------------------------------------ 数据下发
@@ -162,7 +168,10 @@ public final class ChunkDataHandlers {
         byte[] gzipNbt = msg.binary();
         // 解压/校验/写盘全部转 io 池
         ThreadPools.io().execute(() -> {
-            boolean written = validateAndWrite(key, peer, gzipNbt, false, false);
+            ExitTransactionHandlers currentExits = exits;
+            boolean written = currentExits != null
+                    && currentExits.writeRealtimeIfAllowed(conn,
+                    () -> validateAndWrite(key, peer, gzipNbt, true, false));
             if (!written) {
                 conn.send(error(msg, "upload_rejected", "区块上行被拒: " + key.asString()));
                 return;
@@ -204,7 +213,29 @@ public final class ChunkDataHandlers {
             if (preserveExisting) {
                 return existingChunkIsReadable(key);
             }
-            return validateAndWriteLocked(key, groupId, gzipNbt, false, true);
+            return validateAndWriteLocked(key, groupId, gzipNbt, false, true,
+                    ExitPayloadProtocol.MAX_ASSEMBLED_BYTES);
+        }
+    }
+
+    /** pending 暂存前只做所有权与 NBT 校验，不修改正式 region。 */
+    boolean validateExit(UUID groupId, ChunkKey key, byte[] gzipNbt,
+                         boolean preserveExisting) {
+        synchronized (writeLock(key)) {
+            UUID owner = registry.ownerOf(key);
+            if (owner == null || !owner.equals(groupId)) {
+                return false;
+            }
+            if (preserveExisting) {
+                return existingChunkIsReadable(key);
+            }
+            try {
+                return decodeValidatedChunk(key, gzipNbt,
+                        ExitPayloadProtocol.MAX_ASSEMBLED_BYTES) != null;
+            } catch (Exception e) {
+                LOGGER.warn("退出区块暂存校验失败: {}", key.asString(), e);
+                return false;
+            }
         }
     }
 
@@ -224,12 +255,14 @@ public final class ChunkDataHandlers {
                                      boolean flush, boolean allowExitFrozen) {
         synchronized (writeLock(key)) {
             return validateAndWriteLocked(
-                    key, uploader, gzipNbt, flush, allowExitFrozen);
+                    key, uploader, gzipNbt, flush, allowExitFrozen,
+                    MAX_COMPRESSED_BYTES);
         }
     }
 
     private boolean validateAndWriteLocked(ChunkKey key, UUID uploader, byte[] gzipNbt,
-                                           boolean flush, boolean allowExitFrozen) {
+                                           boolean flush, boolean allowExitFrozen,
+                                           int maxCompressedBytes) {
         try {
             // ---- 权威校验：上传方必须是注册表登记的占用组 ----
             // （Phase 1/2 约定 groupId == 主客户端 clientId，故直接与 peerId 比对）
@@ -244,28 +277,9 @@ public final class ChunkDataHandlers {
                         key.asString(), uploader);
                 return false;
             }
-            if (gzipNbt == null || gzipNbt.length == 0 || gzipNbt.length > MAX_COMPRESSED_BYTES) {
-                LOGGER.warn("拒绝区块上行（数据缺失或超限）: {} ({} 字节)",
-                        key.asString(), gzipNbt == null ? 0 : gzipNbt.length);
-                return false;
-            }
-            // ---- 解析（带解压上限，防解压炸弹）----
-            CompoundTag tag = NbtIo.readCompressed(new ByteArrayInputStream(gzipNbt),
-                    NbtAccounter.create(MAX_CHUNK_NBT_BYTES));
-            // ---- 一致性校验：NBT 里的坐标必须与声称的键一致（防错位覆盖）----
-            int xPos = tag.getInt("xPos");
-            int zPos = tag.getInt("zPos");
-            if (xPos != key.x() || zPos != key.z()) {
-                LOGGER.warn("拒绝区块上行（坐标不符）: 声称 {} 实际 xPos={} zPos={}",
-                        key.asString(), xPos, zPos);
-                return false;
-            }
-            // ---- 版本校验：不接受高于本服的 DataVersion（未来版本数据会毁存档）----
-            int dataVersion = ChunkStorage.getVersion(tag);
-            int current = SharedConstants.getCurrentVersion().getDataVersion().getVersion();
-            if (dataVersion > current) {
-                LOGGER.warn("拒绝区块上行（DataVersion {} 高于本服 {}）: {}",
-                        dataVersion, current, key.asString());
+            CompoundTag tag = decodeValidatedChunk(
+                    key, gzipNbt, maxCompressedBytes);
+            if (tag == null) {
                 return false;
             }
             ServerLevel level = resolveLevel(key.dimension());
@@ -291,6 +305,34 @@ public final class ChunkDataHandlers {
         }
     }
 
+    private CompoundTag decodeValidatedChunk(ChunkKey key, byte[] gzipNbt,
+                                              int maxCompressedBytes)
+            throws IOException {
+        if (gzipNbt == null || gzipNbt.length == 0
+                || gzipNbt.length > maxCompressedBytes) {
+            LOGGER.warn("拒绝区块上行（数据缺失或超限）: {} ({} 字节)",
+                    key.asString(), gzipNbt == null ? 0 : gzipNbt.length);
+            return null;
+        }
+        CompoundTag tag = NbtIo.readCompressed(new ByteArrayInputStream(gzipNbt),
+                NbtAccounter.create(MAX_CHUNK_NBT_BYTES));
+        int xPos = tag.getInt("xPos");
+        int zPos = tag.getInt("zPos");
+        if (xPos != key.x() || zPos != key.z()) {
+            LOGGER.warn("拒绝区块上行（坐标不符）: 声称 {} 实际 xPos={} zPos={}",
+                    key.asString(), xPos, zPos);
+            return null;
+        }
+        int dataVersion = ChunkStorage.getVersion(tag);
+        int current = SharedConstants.getCurrentVersion().getDataVersion().getVersion();
+        if (dataVersion > current) {
+            LOGGER.warn("拒绝区块上行（DataVersion {} 高于本服 {}）: {}",
+                    dataVersion, current, key.asString());
+            return null;
+        }
+        return tag;
+    }
+
     /** preserveExisting 只有在 IOWorker 能实际读到该区块时才算收到。 */
     private boolean existingChunkIsReadable(ChunkKey key) {
         try {
@@ -298,6 +340,7 @@ public final class ChunkDataHandlers {
             if (level == null) {
                 return false;
             }
+            level.getChunkSource().chunkMap.flushWorker();
             boolean exists = level.getChunkSource().chunkMap
                     .read(new ChunkPos(key.x(), key.z())).join().isPresent();
             if (!exists) {

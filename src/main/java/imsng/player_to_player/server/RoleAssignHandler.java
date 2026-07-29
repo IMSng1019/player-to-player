@@ -25,6 +25,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.UUID;
+import java.util.function.Consumer;
 import java.util.function.ToIntFunction;
 
 /**
@@ -66,17 +67,20 @@ public final class RoleAssignHandler implements MessageHandler {
     private final ChunkRegistry registry;
     private final GroupTable groups;
     private final ComputeTable computeTable;
-    private final ToIntFunction<UUID> abandonPendingExit;
+    private final Consumer<UUID> awaitPendingExit;
+    private final ToIntFunction<UUID> abandonPendingExitNow;
 
     public RoleAssignHandler(MinecraftServer server, GlobalConfig config, ChunkRegistry registry,
                              GroupTable groups, ComputeTable computeTable,
-                             ToIntFunction<UUID> abandonPendingExit) {
+                             Consumer<UUID> awaitPendingExit,
+                             ToIntFunction<UUID> abandonPendingExitNow) {
         this.server = server;
         this.config = config;
         this.registry = registry;
         this.groups = groups;
         this.computeTable = computeTable;
-        this.abandonPendingExit = abandonPendingExit;
+        this.awaitPendingExit = awaitPendingExit;
+        this.abandonPendingExitNow = abandonPendingExitNow;
     }
 
     @Override
@@ -89,18 +93,35 @@ public final class RoleAssignHandler implements MessageHandler {
         // playerdata 读取是磁盘 IO，转 io 池后应答
         ThreadPools.io().execute(() -> {
             try {
-                assignRole(conn, msg, peer);
+                // 不能持有 HELLO 会话锁等待 BEGIN：BEGIN 任务需要进入同一把锁。
+                // 断连 cleanup 同样可能长期等待磁盘恢复，必须留在条带锁之外。
+                if (awaitPendingExit != null) {
+                    awaitPendingExit.accept(peer);
+                }
             } catch (Exception e) {
-                LOGGER.error("角色指派失败: {}", peer, e);
+                LOGGER.error("角色指派前退出恢复等待失败: {}", peer, e);
                 conn.send(error(msg, "assign_failed", e.toString()));
+                return;
+            }
+            boolean current = HelloHandler.withCurrentSession(conn, () -> {
+                try {
+                    assignRole(conn, msg, peer);
+                } catch (Exception e) {
+                    LOGGER.error("角色指派失败: {}", peer, e);
+                    conn.send(error(msg, "assign_failed", e.toString()));
+                }
+                return true;
+            });
+            if (!current) {
+                conn.send(error(msg, "stale_session", "角色申请来自已失效连接"));
             }
         });
     }
 
     /** 角色决策主流程（io 线程）。 */
     private void assignRole(ControlConnection conn, ControlMessage msg, UUID peer) {
-        int abandoned = abandonPendingExit != null
-                ? abandonPendingExit.applyAsInt(peer) : 0;
+        int abandoned = abandonPendingExitNow != null
+                ? abandonPendingExitNow.applyAsInt(peer) : 0;
         if (abandoned > 0) {
             LOGGER.warn("客户端 {} 正常重进，已按强杀回退结束 {} 个旧退出事务，"
                     + "保留最后一次实时确认数据", peer, abandoned);

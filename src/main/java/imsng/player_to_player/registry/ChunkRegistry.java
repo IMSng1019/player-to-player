@@ -87,12 +87,22 @@ public final class ChunkRegistry {
     /** region 文件探测器（hasServerData 判定）。 */
     private final RegionFileProbe probe;
 
+    /** ACK 前 force 的先行变更日志；测试可使用 disabled 实现。 */
+    private final RegistryMutationJournal journal;
+
     /** 自动落盘任务句柄；shutdown 时取消。 */
     private volatile ScheduledFuture<?> autoPersistTask;
 
     public ChunkRegistry(RegistryStore store, RegionFileProbe probe) {
+        this(store, probe, RegistryMutationJournal.disabled());
+    }
+
+    public ChunkRegistry(RegistryStore store, RegionFileProbe probe,
+                         RegistryMutationJournal journal) {
         this.store = store;
         this.probe = probe;
+        this.journal = journal != null
+                ? journal : RegistryMutationJournal.disabled();
     }
 
     // ------------------------------------------------------------ 申请与释放
@@ -111,6 +121,7 @@ public final class ChunkRegistry {
                 return blocked;
             }
             // 授予：登记目标区块（重复申请刷新占用时间，幂等）
+            journal.appendPut(key, groupId);
             claims.put(key, new ClaimInfo(groupId, System.currentTimeMillis()));
             markDirtyLocked();
         }
@@ -161,6 +172,7 @@ public final class ChunkRegistry {
             if (existing == null || !existing.groupId().equals(groupId)) {
                 return false;
             }
+            journal.appendRemove(key, groupId);
             claims.remove(key);
             markDirtyLocked();
             return true;
@@ -177,6 +189,11 @@ public final class ChunkRegistry {
             if (exitFrozenGroups.contains(groupId)) {
                 return 0;
             }
+            boolean hasClaims = claims.values().stream()
+                    .anyMatch(info -> groupId.equals(info.groupId()));
+            if (hasClaims) {
+                journal.appendRemoveGroup(groupId);
+            }
             var it = claims.entrySet().iterator();
             while (it.hasNext()) {
                 if (groupId.equals(it.next().getValue().groupId())) {
@@ -192,6 +209,46 @@ public final class ChunkRegistry {
             LOGGER.info("已释放组 {} 的 {} 个区块占用", groupId, released);
         }
         return released;
+    }
+
+    /**
+     * 异常断连使用的整组耐久释放。调用前可先冻结；保存失败会恢复全部占用并保持冻结，
+     * 调用方应继续重试，不能让其他组观察到未确认的释放。
+     */
+    public int releaseAllDurably(UUID groupId) {
+        if (groupId == null) {
+            return 0;
+        }
+        synchronized (persistLock) {
+            synchronized (claimLock) {
+                exitFrozenGroups.add(groupId);
+                journal.appendRemoveGroup(groupId);
+                Map<ChunkKey, ClaimInfo> removed = new HashMap<>();
+                var iterator = claims.entrySet().iterator();
+                while (iterator.hasNext()) {
+                    Map.Entry<ChunkKey, ClaimInfo> entry = iterator.next();
+                    if (groupId.equals(entry.getValue().groupId())) {
+                        removed.put(entry.getKey(), entry.getValue());
+                        iterator.remove();
+                    }
+                }
+                try {
+                    if (!removed.isEmpty()) {
+                        markDirtyLocked();
+                    }
+                    saveCurrentClaimsLocked();
+                    exitFrozenGroups.remove(groupId);
+                    return removed.size();
+                } catch (RuntimeException e) {
+                    claims.putAll(removed);
+                    exitFrozenGroups.add(groupId);
+                    if (!removed.isEmpty()) {
+                        markDirtyLocked();
+                    }
+                    throw e;
+                }
+            }
+        }
     }
 
     /**
@@ -221,15 +278,29 @@ public final class ChunkRegistry {
         }
         synchronized (claimLock) {
             if (recoverOrphan) {
-                for (ChunkKey key : requestedChunks) {
-                    ClaimInfo existing = claims.get(key);
-                    if (existing != null && !groupId.equals(existing.groupId())) {
-                        throw new IllegalStateException("孤儿组退出清单与现有占用冲突: "
-                                + key.asString());
+                Set<ChunkKey> durableClaims = Set.copyOf(claimsOf(groupId));
+                for (ChunkKey requested : requestedChunks) {
+                    ClaimInfo owner = claims.get(requested);
+                    if (owner != null && !groupId.equals(owner.groupId())) {
+                        throw new IllegalStateException(
+                                "孤儿组请求包含其他组占用: "
+                                        + requested.asString());
+                    }
+                }
+                for (ChunkKey key : durableClaims) {
+                    for (ChunkKey neighbor : key.neighbors4()) {
+                        ClaimInfo neighborOwner = claims.get(neighbor);
+                        if (neighborOwner != null
+                                && !groupId.equals(neighborOwner.groupId())) {
+                            throw new IllegalStateException(
+                                    "孤儿组耐久清单存在四邻冲突: "
+                                            + key.asString() + " neighbor="
+                                            + neighbor.asString());
+                        }
                     }
                 }
                 exitFrozenGroups.add(groupId);
-                return Set.copyOf(requestedChunks);
+                return durableClaims;
             }
             exitFrozenGroups.add(groupId);
             return Set.copyOf(claimsOf(groupId));
@@ -255,6 +326,7 @@ public final class ChunkRegistry {
                                 + key.asString() + " owner=" + existing.groupId());
                     }
                 }
+                journal.appendReplaceGroup(groupId, manifestChunks);
                 claims.entrySet().removeIf(entry -> groupId.equals(entry.getValue().groupId())
                         && !manifestChunks.contains(entry.getKey()));
                 long now = System.currentTimeMillis();
@@ -290,6 +362,7 @@ public final class ChunkRegistry {
         synchronized (persistLock) {
             synchronized (claimLock) {
                 exitFrozenGroups.add(groupId);
+                journal.appendRemoveKeys(groupId, manifestChunks);
                 Map<ChunkKey, ClaimInfo> removed = new HashMap<>();
                 for (ChunkKey key : manifestChunks) {
                     ClaimInfo info = claims.get(key);
@@ -334,6 +407,11 @@ public final class ChunkRegistry {
             if (exitFrozenGroups.contains(from) || exitFrozenGroups.contains(to)) {
                 return 0;
             }
+            boolean hasClaims = claims.values().stream()
+                    .anyMatch(info -> from.equals(info.groupId()));
+            if (hasClaims) {
+                journal.appendMigrateGroup(from, to);
+            }
             for (Map.Entry<ChunkKey, ClaimInfo> e : claims.entrySet()) {
                 if (from.equals(e.getValue().groupId())) {
                     e.setValue(new ClaimInfo(to, System.currentTimeMillis()));
@@ -365,9 +443,16 @@ public final class ChunkRegistry {
             if (exitFrozenGroups.contains(from) || exitFrozenGroups.contains(to)) {
                 return 0;
             }
+            Set<ChunkKey> actual = new java.util.HashSet<>();
             for (ChunkKey key : keys) {
                 ClaimInfo info = claims.get(key);
                 if (info != null && from.equals(info.groupId())) {
+                    actual.add(key);
+                }
+            }
+            if (!actual.isEmpty()) {
+                journal.appendMigrateKeys(from, to, actual);
+                for (ChunkKey key : actual) {
                     claims.put(key, new ClaimInfo(to, System.currentTimeMillis()));
                     migrated++;
                 }
@@ -414,12 +499,16 @@ public final class ChunkRegistry {
      * 坏数据由后端自行跳过（宁可丢一条记录也不能让服务端起不来）。
      */
     public void load() {
-        Map<ChunkKey, UUID> loaded = store.load();
+        boolean replayedJournal = journal.hasEntries();
+        Map<ChunkKey, UUID> loaded = journal.replay(store.load());
         long now = System.currentTimeMillis();
         synchronized (claimLock) {
             for (Map.Entry<ChunkKey, UUID> e : loaded.entrySet()) {
                 claims.put(e.getKey(), new ClaimInfo(e.getValue(), now));
             }
+        }
+        if (replayedJournal) {
+            changeVersion.incrementAndGet();
         }
         LOGGER.info("区块注册表已恢复 {} 条占用记录（后端: {}）", loaded.size(), store.describe());
     }
@@ -456,24 +545,27 @@ public final class ChunkRegistry {
         }
     }
 
-    /** 全量落盘：锁内取快照（与 claim/release 互斥），锁外交给后端做序列化与 IO。 */
+    /** 全量落盘：保存快照并清空日志期间阻止并发变更，避免删掉尚未进快照的新日志。 */
     public void persist() {
         synchronized (persistLock) {
-            Map<ChunkKey, UUID> snapshot;
-            long snapshotVersion;
             synchronized (claimLock) {
-                snapshot = claimsSnapshotLocked();
-                snapshotVersion = changeVersion.get();
+                long snapshotVersion = changeVersion.get();
+                Map<ChunkKey, UUID> snapshot = claimsSnapshotLocked();
+                journal.appendCheckpoint(snapshot);
+                store.save(snapshot);
+                journal.clear();
+                persistedVersion.accumulateAndGet(snapshotVersion, Math::max);
             }
-            store.save(snapshot);
-            persistedVersion.accumulateAndGet(snapshotVersion, Math::max);
         }
     }
 
     /** persistLock 与 claimLock 均持有期间的强一致保存。 */
     private void saveCurrentClaimsLocked() {
         long snapshotVersion = changeVersion.get();
-        store.save(claimsSnapshotLocked());
+        Map<ChunkKey, UUID> snapshot = claimsSnapshotLocked();
+        journal.appendCheckpoint(snapshot);
+        store.save(snapshot);
+        journal.clear();
         persistedVersion.accumulateAndGet(snapshotVersion, Math::max);
     }
 

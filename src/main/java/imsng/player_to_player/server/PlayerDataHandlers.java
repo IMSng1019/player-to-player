@@ -18,7 +18,6 @@ import org.slf4j.LoggerFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.UUID;
-import java.util.function.Predicate;
 
 /**
  * 玩家数据面处理器（服务端，Phase 3；Phase 2 已知边界"玩家背包……不回传物理
@@ -45,20 +44,19 @@ public final class PlayerDataHandlers {
 
     private final MinecraftServer server;
     private final GroupTable groups;
-    private final Predicate<UUID> writeBlocked;
+    private final ExitTransactionHandlers exits;
 
     private PlayerDataHandlers(MinecraftServer server, GroupTable groups,
-                               Predicate<UUID> writeBlocked) {
+                               ExitTransactionHandlers exits) {
         this.server = server;
         this.groups = groups;
-        this.writeBlocked = writeBlocked;
+        this.exits = exits;
     }
 
     /** 注册玩家数据面处理器。 */
     public static void register(HandlerRegistry reg, MinecraftServer server, GroupTable groups,
-                                Predicate<UUID> writeBlocked) {
-        PlayerDataHandlers handlers = new PlayerDataHandlers(
-                server, groups, writeBlocked != null ? writeBlocked : ignored -> false);
+                                ExitTransactionHandlers exits) {
+        PlayerDataHandlers handlers = new PlayerDataHandlers(server, groups, exits);
         reg.on(MessageType.PLAYER_DATA_UPLOAD, handlers::handleUpload);
         reg.on(MessageType.PLAYER_DATA_REQUEST, handlers::handleRequest);
     }
@@ -84,8 +82,9 @@ public final class PlayerDataHandlers {
                     return;
                 }
                 Path dataDir = server.getWorldPath(LevelResource.PLAYER_DATA_DIR);
-                if (!PlayerDataFileStore.writeIfAllowed(
-                        dataDir, playerId, gzipNbt, () -> !writeBlocked.test(peer))) {
+                if (exits == null || !exits.writeRealtimeIfAllowed(conn,
+                        () -> PlayerDataFileStore.write(
+                                dataDir, playerId, gzipNbt))) {
                     conn.send(error(msg, "invalid_data",
                             "玩家数据校验、写回失败或退出已冻结"));
                     return;

@@ -8,6 +8,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BooleanSupplier;
 
 /**
  * 退出事务的线程安全幂等状态机。
@@ -27,12 +28,14 @@ public final class ExitTransactionLedger {
         private final Set<UUID> receivedPlayers = new HashSet<>();
         private final Set<ChunkKey> receivedChunks = new HashSet<>();
         private boolean committed;
+        private boolean dataApplied;
         private boolean cleanupComplete;
         private boolean abandoned;
 
         private RuntimeTransaction(ExitTransactionRecord record) {
             manifest = record.manifest();
             committed = record.committed();
+            dataApplied = record.dataApplied();
             cleanupComplete = record.cleanupComplete();
             abandoned = record.abandoned();
         }
@@ -81,10 +84,23 @@ public final class ExitTransactionLedger {
     }
 
     public boolean markPlayerReceived(UUID peerId, UUID shutdownId, UUID playerId) {
+        return receivePlayer(peerId, shutdownId, playerId, () -> true);
+    }
+
+    /** 在 ledger 锁内原子执行 pending 校验、耐久暂存与 received 标记。 */
+    public boolean receivePlayer(UUID peerId, UUID shutdownId, UUID playerId,
+                                 BooleanSupplier stage) {
         synchronized (lock) {
             RuntimeTransaction transaction = authorizedPending(peerId, shutdownId);
             if (transaction == null
-                    || !transaction.manifest.playerIds().contains(playerId)) {
+                    || !transaction.manifest.playerIds().contains(playerId)
+                    || stage == null) {
+                return false;
+            }
+            if (transaction.receivedPlayers.contains(playerId)) {
+                return true;
+            }
+            if (!stage.getAsBoolean()) {
                 return false;
             }
             transaction.receivedPlayers.add(playerId);
@@ -93,9 +109,22 @@ public final class ExitTransactionLedger {
     }
 
     public boolean markChunkReceived(UUID peerId, UUID shutdownId, ChunkKey chunk) {
+        return receiveChunk(peerId, shutdownId, chunk, () -> true);
+    }
+
+    /** 在 ledger 锁内原子执行 pending 校验、耐久暂存与 received 标记。 */
+    public boolean receiveChunk(UUID peerId, UUID shutdownId, ChunkKey chunk,
+                                BooleanSupplier stage) {
         synchronized (lock) {
             RuntimeTransaction transaction = authorizedPending(peerId, shutdownId);
-            if (transaction == null || !transaction.manifest.chunks().contains(chunk)) {
+            if (transaction == null || !transaction.manifest.chunks().contains(chunk)
+                    || stage == null) {
+                return false;
+            }
+            if (transaction.receivedChunks.contains(chunk)) {
+                return true;
+            }
+            if (!stage.getAsBoolean()) {
                 return false;
             }
             transaction.receivedChunks.add(chunk);
@@ -122,7 +151,7 @@ public final class ExitTransactionLedger {
             }
             ExitTransactionRecord committed =
                     new ExitTransactionRecord(transaction.manifest, true,
-                            false, false);
+                            false, false, false);
             persistThenPublish(committed, () -> transaction.committed = true);
             return true;
         }
@@ -139,7 +168,7 @@ public final class ExitTransactionLedger {
                 return transaction.abandoned;
             }
             ExitTransactionRecord abandoned = new ExitTransactionRecord(
-                    transaction.manifest, true, false, true);
+                    transaction.manifest, true, false, false, true);
             persistThenPublish(abandoned, () -> {
                 transaction.committed = true;
                 transaction.abandoned = true;
@@ -148,18 +177,39 @@ public final class ExitTransactionLedger {
         }
     }
 
+    /** 全部暂存数据已幂等应用并 flush 后耐久标记，清理重试不得再次应用。 */
+    public boolean markDataApplied(UUID peerId, UUID shutdownId) {
+        synchronized (lock) {
+            RuntimeTransaction transaction = authorized(peerId, shutdownId);
+            if (transaction == null || !transaction.committed
+                    || transaction.abandoned) {
+                return false;
+            }
+            if (transaction.dataApplied) {
+                return true;
+            }
+            ExitTransactionRecord applied = new ExitTransactionRecord(
+                    transaction.manifest, true, true, false, false);
+            persistThenPublish(applied,
+                    () -> transaction.dataApplied = true);
+            return true;
+        }
+    }
+
     /** 清理区块注册表与组表成功后再耐久标记，防旧事务在后续重启重复清理新会话。 */
     public boolean markCleanupComplete(UUID peerId, UUID shutdownId) {
         synchronized (lock) {
             RuntimeTransaction transaction = authorized(peerId, shutdownId);
-            if (transaction == null || !transaction.committed) {
+            if (transaction == null || !transaction.committed
+                    || (!transaction.abandoned && !transaction.dataApplied)) {
                 return false;
             }
             if (transaction.cleanupComplete) {
                 return true;
             }
             ExitTransactionRecord cleaned = new ExitTransactionRecord(
-                    transaction.manifest, true, true, transaction.abandoned);
+                    transaction.manifest, true, transaction.dataApplied,
+                    true, transaction.abandoned);
             persistThenPublish(cleaned,
                     () -> transaction.cleanupComplete = true);
             return true;
@@ -188,6 +238,13 @@ public final class ExitTransactionLedger {
         synchronized (lock) {
             RuntimeTransaction transaction = authorized(peerId, shutdownId);
             return transaction != null && transaction.abandoned;
+        }
+    }
+
+    public boolean isDataApplied(UUID peerId, UUID shutdownId) {
+        synchronized (lock) {
+            RuntimeTransaction transaction = authorized(peerId, shutdownId);
+            return transaction != null && transaction.dataApplied;
         }
     }
 
@@ -264,6 +321,18 @@ public final class ExitTransactionLedger {
             Set<ExitManifest> result = new HashSet<>();
             for (RuntimeTransaction transaction : transactions.values()) {
                 if (transaction.committed && !transaction.cleanupComplete) {
+                    result.add(transaction.manifest);
+                }
+            }
+            return Set.copyOf(result);
+        }
+    }
+
+    public Set<ExitManifest> cleanupCompleteManifests() {
+        synchronized (lock) {
+            Set<ExitManifest> result = new HashSet<>();
+            for (RuntimeTransaction transaction : transactions.values()) {
+                if (transaction.cleanupComplete) {
                     result.add(transaction.manifest);
                 }
             }

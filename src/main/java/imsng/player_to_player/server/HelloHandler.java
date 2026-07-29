@@ -21,6 +21,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 /**
  * HELLO 握手处理器（服务端）。
@@ -55,6 +56,13 @@ public final class HelloHandler implements MessageHandler {
 
     /** clientId → HELLO 上报的 NAT 探测信息（打洞协助时转发给对端）。 */
     private static final Map<UUID, NatInfo> NAT_TABLE = new ConcurrentHashMap<>();
+
+    /** 固定条带锁串行同一客户端的新 HELLO 发布与权威写任务。 */
+    private static final Object[] SESSION_LOCKS = new Object[256];
+
+    static {
+        java.util.Arrays.setAll(SESSION_LOCKS, ignored -> new Object());
+    }
 
     private final GlobalConfig config;
     private final ComputeTable computeTable;
@@ -94,24 +102,31 @@ public final class HelloHandler implements MessageHandler {
         String playerName = JsonUtil.getString(json, "playerName", "?");
         String mode = JsonUtil.getString(json, "mode", "client");
 
-        connection.setPeerId(clientId);
-
-        // 同一 clientId 重复握手视为"客户端重连"：登记新连接并关掉旧连接，
-        // 避免旧的半死连接占用映射导致打洞消息投递到死连接上
-        ControlConnection previous = ONLINE.put(clientId, connection);
-        if (previous != null && previous != connection && previous.isOpen()) {
-            LOGGER.warn("客户端 {} 重复握手，关闭旧连接 {}", clientId, previous.remoteAddress());
-            previous.close();
-        }
-
         // 3. 算力与 NAT：字段缺失容忍（旧版本客户端可能不带），有则登记
+        ComputeScore score = null;
         if (json.has("compute") && json.get("compute").isJsonObject()) {
-            computeTable.report(clientId, ComputeScore.fromJson(json.getAsJsonObject("compute")));
+            score = ComputeScore.fromJson(json.getAsJsonObject("compute"));
         }
         NatInfo nat = json.has("nat") && json.get("nat").isJsonObject()
                 ? NatInfo.fromJson(json.getAsJsonObject("nat"))
                 : NatInfo.UNKNOWN;
-        NAT_TABLE.put(clientId, nat);
+
+        connection.setPeerId(clientId);
+        ControlConnection previous;
+        synchronized (sessionLock(clientId)) {
+            // 新会话只有在已经开始的旧权威写完成后才发布；发布之后，旧排队任务
+            // 会在 withCurrentSession 中看到连接身份不符并被拒绝。
+            if (score != null) {
+                computeTable.report(clientId, score);
+            }
+            NAT_TABLE.put(clientId, nat);
+            previous = ONLINE.put(clientId, connection);
+        }
+        if (previous != null && previous != connection && previous.isOpen()) {
+            LOGGER.warn("客户端 {} 重复握手，关闭旧连接 {}", clientId,
+                    previous.remoteAddress());
+            previous.close();
+        }
 
         // 4. 应答 HELLO_ACK（reply 复制 _rid，使客户端 request() 的 future 完成）
         EnvironmentSnapshot current = snapshots.current();
@@ -191,14 +206,61 @@ public final class HelloHandler implements MessageHandler {
     }
 
     /**
+     * 仅当连接仍是该 UUID 当前会话时执行动作；检查与动作和新 HELLO 发布原子互斥。
+     */
+    public static boolean withCurrentSession(ControlConnection connection,
+                                             BooleanSupplier action) {
+        UUID clientId = connection != null ? connection.peerId() : null;
+        if (clientId == null || action == null) {
+            return false;
+        }
+        synchronized (sessionLock(clientId)) {
+            if (ONLINE.get(clientId) != connection) {
+                return false;
+            }
+            return action.getAsBoolean();
+        }
+    }
+
+    /**
      * 断连清理：仅当映射仍指向该连接实例时才移除 ——
      * 客户端快速重连时新连接已覆盖映射，此时旧连接的断连回调不得误删新连接。
      */
     static void unregister(UUID clientId, ControlConnection connection) {
-        ONLINE.remove(clientId, connection);
-        if (!ONLINE.containsKey(clientId)) {
-            // 该客户端已完全离线才清 NAT 信息（重连会随新 HELLO 重新上报）
-            NAT_TABLE.remove(clientId);
+        unregisterIfCurrent(clientId, connection);
+    }
+
+    /** 原子摘除当前会话；连接已被替换时返回 false 且不修改新会话状态。 */
+    static boolean unregisterIfCurrent(UUID clientId,
+                                       ControlConnection connection) {
+        return unregisterIfCurrent(clientId, connection, () -> {
+        });
+    }
+
+    /**
+     * 原子摘除当前会话，并在允许替换 HELLO 发布前完成断连状态转换。
+     * transition 必须是短小、非阻塞的内存操作；尤其不能在这里等待需要
+     * {@link #withCurrentSession(ControlConnection, BooleanSupplier)} 的任务。
+     */
+    static boolean unregisterIfCurrent(UUID clientId,
+                                       ControlConnection connection,
+                                       Runnable transition) {
+        if (clientId == null) {
+            return false;
+        }
+        synchronized (sessionLock(clientId)) {
+            if (ONLINE.get(clientId) != connection) {
+                return false;
+            }
+            ONLINE.remove(clientId);
+            if (!ONLINE.containsKey(clientId)) {
+                // 该客户端已完全离线才清 NAT 信息（重连会随新 HELLO 重新上报）
+                NAT_TABLE.remove(clientId);
+            }
+            if (transition != null) {
+                transition.run();
+            }
+            return true;
         }
     }
 
@@ -206,5 +268,10 @@ public final class HelloHandler implements MessageHandler {
     static void clearAll() {
         ONLINE.clear();
         NAT_TABLE.clear();
+    }
+
+    private static Object sessionLock(UUID clientId) {
+        return SESSION_LOCKS[(clientId.hashCode() & Integer.MAX_VALUE)
+                % SESSION_LOCKS.length];
     }
 }

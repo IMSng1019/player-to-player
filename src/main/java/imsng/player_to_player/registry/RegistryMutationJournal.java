@@ -1,0 +1,444 @@
+package imsng.player_to_player.registry;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import imsng.player_to_player.util.JsonUtil;
+import imsng.player_to_player.util.Sha256;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+
+/**
+ * 区块注册表先行变更日志。每条已确认变更先追加并 force，再修改内存；服务端启动时
+ * 在最近全量快照上顺序重放，消除 30 秒周期快照造成的已确认所有权丢失窗口。
+ */
+public final class RegistryMutationJournal {
+
+    private static final int FORMAT_VERSION = 1;
+    private static final int READ_BUFFER_BYTES = 64 * 1024;
+    private static final int DEFAULT_MAX_RECORD_BYTES = 64 * 1024 * 1024;
+
+    private static final RegistryMutationJournal DISABLED =
+            new RegistryMutationJournal(null);
+
+    private final Path file;
+    private final int maxRecordBytes;
+
+    /** 只表示写入中断造成的帧不完整；仅最后一条允许截断恢复。 */
+    private static final class RecoverableTailException
+            extends IllegalArgumentException {
+        private RecoverableTailException(String message) {
+            super(message);
+        }
+
+        private RecoverableTailException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
+    public RegistryMutationJournal(Path file) {
+        this(file, DEFAULT_MAX_RECORD_BYTES);
+    }
+
+    /** 包内测试可缩小阈值；生产构造器使用 64 MiB 硬上限。 */
+    RegistryMutationJournal(Path file, int maxRecordBytes) {
+        if (maxRecordBytes <= 0) {
+            throw new IllegalArgumentException("日志单帧上限必须为正数");
+        }
+        this.file = file;
+        this.maxRecordBytes = maxRecordBytes;
+    }
+
+    static RegistryMutationJournal disabled() {
+        return DISABLED;
+    }
+
+    public void appendPut(ChunkKey key, UUID groupId) {
+        JsonObject json = base("put", groupId);
+        json.addProperty("chunk", key.asString());
+        append(json);
+    }
+
+    public void appendRemove(ChunkKey key, UUID groupId) {
+        JsonObject json = base("remove", groupId);
+        json.addProperty("chunk", key.asString());
+        append(json);
+    }
+
+    public void appendRemoveGroup(UUID groupId) {
+        append(base("remove_group", groupId));
+    }
+
+    public void appendRemoveKeys(UUID groupId, Set<ChunkKey> keys) {
+        JsonObject json = base("remove_keys", groupId);
+        json.add("chunks", chunks(keys));
+        append(json);
+    }
+
+    public void appendReplaceGroup(UUID groupId, Set<ChunkKey> keys) {
+        JsonObject json = base("replace_group", groupId);
+        json.add("chunks", chunks(keys));
+        append(json);
+    }
+
+    public void appendMigrateGroup(UUID from, UUID to) {
+        JsonObject json = base("migrate_group", from);
+        json.addProperty("to", to.toString());
+        append(json);
+    }
+
+    public void appendMigrateKeys(UUID from, UUID to, Set<ChunkKey> keys) {
+        JsonObject json = base("migrate_keys", from);
+        json.addProperty("to", to.toString());
+        json.add("chunks", chunks(keys));
+        append(json);
+    }
+
+    /**
+     * 快照收敛屏障。必须在 store.save(snapshot) 之前 force；这样崩溃发生在
+     * 快照替换前或日志 clear 前，重放到本记录都会得到同一个绝对状态。
+     */
+    void appendCheckpoint(Map<ChunkKey, UUID> snapshot) {
+        Objects.requireNonNull(snapshot, "snapshot");
+        JsonObject json = new JsonObject();
+        json.addProperty("type", "replace_all");
+        json.add("claims", claimEntries(snapshot));
+        append(json);
+    }
+
+    public synchronized Map<ChunkKey, UUID> replay(
+            Map<ChunkKey, UUID> baseline) {
+        Map<ChunkKey, UUID> result = new HashMap<>(baseline);
+        if (file == null || !Files.isRegularFile(file)) {
+            return result;
+        }
+        try (FileChannel channel = FileChannel.open(file,
+                StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            long fileSize = channel.size();
+            long offset = 0;
+            long lineStart = 0;
+            int lineNumber = 0;
+            ByteBuffer input = ByteBuffer.allocate(READ_BUFFER_BYTES);
+            ByteArrayOutputStream line = new ByteArrayOutputStream();
+            while (offset < fileSize) {
+                int read = channel.read(input);
+                if (read < 0) {
+                    break;
+                }
+                input.flip();
+                while (input.hasRemaining()) {
+                    byte value = input.get();
+                    offset++;
+                    if (value != '\n') {
+                        if (line.size() >= maxRecordBytes) {
+                            throw new IllegalStateException(
+                                    "注册表变更日志单帧超过上限 "
+                                            + maxRecordBytes + " 字节，行 "
+                                            + (lineNumber + 1));
+                        }
+                        line.write(value);
+                        continue;
+                    }
+                    lineNumber++;
+                    byte[] bytes = line.toByteArray();
+                    int length = bytes.length;
+                    if (length > 0 && bytes[length - 1] == '\r') {
+                        length--;
+                    }
+                    String text = new String(
+                            bytes, 0, length, StandardCharsets.UTF_8);
+                    if (!text.isBlank()) {
+                        try {
+                            apply(result, decodeRecord(text));
+                        } catch (RecoverableTailException e) {
+                            if (offset == fileSize) {
+                                truncateTail(channel, lineStart);
+                                return result;
+                            }
+                            throw new IllegalStateException(
+                                    "注册表变更日志损坏，行 " + lineNumber, e);
+                        } catch (Exception e) {
+                            // 校验完整后才暴露的未知版本/操作/UUID/ChunkKey 属于
+                            // 已确认记录的语义损坏，不能借“最后一行”静默丢弃。
+                            throw new IllegalStateException(
+                                    "注册表变更日志损坏，行 " + lineNumber, e);
+                        }
+                    }
+                    line.reset();
+                    lineStart = offset;
+                }
+                input.clear();
+            }
+            if (line.size() > 0) {
+                // append 只有在完整写入换行并 force 后才会返回 ACK；无换行尾部
+                // 必然属于未确认写入，截断后才能保证下次 append 不接在残片后。
+                truncateTail(channel, lineStart);
+            }
+            return result;
+        } catch (IOException e) {
+            throw new IllegalStateException("读取注册表变更日志失败: " + file, e);
+        }
+    }
+
+    public synchronized boolean hasEntries() {
+        if (file == null || !Files.isRegularFile(file)) {
+            return false;
+        }
+        try {
+            return Files.size(file) > 0;
+        } catch (IOException e) {
+            throw new IllegalStateException("检查注册表变更日志失败: " + file, e);
+        }
+    }
+
+    /** 全量快照已落盘后原子替换为空日志；调用方必须阻止并发 append。 */
+    public synchronized void clear() {
+        if (file == null) {
+            return;
+        }
+        try {
+            Files.createDirectories(file.toAbsolutePath().getParent());
+            Path temporary = file.resolveSibling(file.getFileName() + ".tmp");
+            Files.write(temporary, new byte[0]);
+            force(temporary);
+            try {
+                Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING,
+                        StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING);
+            }
+            force(file);
+        } catch (IOException e) {
+            throw new IllegalStateException("清空注册表变更日志失败: " + file, e);
+        }
+    }
+
+    private synchronized void append(JsonObject json) {
+        if (file == null) {
+            return;
+        }
+        byte[] line = (JsonUtil.GSON.toJson(frame(json)) + "\n").getBytes(
+                StandardCharsets.UTF_8);
+        if (line.length - 1 > maxRecordBytes) {
+            throw new IllegalStateException("注册表变更日志单帧超过上限 "
+                    + maxRecordBytes + " 字节");
+        }
+        try {
+            Files.createDirectories(file.toAbsolutePath().getParent());
+            try (FileChannel channel = FileChannel.open(file,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                    StandardOpenOption.APPEND)) {
+                ByteBuffer buffer = ByteBuffer.wrap(line);
+                while (buffer.hasRemaining()) {
+                    channel.write(buffer);
+                }
+                channel.force(true);
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("追加注册表变更日志失败: " + file, e);
+        }
+    }
+
+    private static void apply(Map<ChunkKey, UUID> state, JsonObject json) {
+        String type = requiredString(json, "type");
+        if ("replace_all".equals(type)) {
+            Map<ChunkKey, UUID> replacement = parseClaimEntries(json);
+            state.clear();
+            state.putAll(replacement);
+            return;
+        }
+        UUID group = UUID.fromString(requiredString(json, "group"));
+        switch (type) {
+            case "put" -> state.put(
+                    ChunkKey.parse(requiredString(json, "chunk")), group);
+            case "remove" -> state.remove(
+                    ChunkKey.parse(requiredString(json, "chunk")), group);
+            case "remove_group" -> state.entrySet().removeIf(
+                    entry -> group.equals(entry.getValue()));
+            case "remove_keys" -> parseChunks(json).forEach(
+                    key -> state.remove(key, group));
+            case "replace_group" -> {
+                Set<ChunkKey> replacement = parseChunks(json);
+                state.entrySet().removeIf(entry -> group.equals(entry.getValue()));
+                replacement.forEach(key -> state.put(key, group));
+            }
+            case "migrate_group" -> {
+                UUID to = UUID.fromString(requiredString(json, "to"));
+                state.replaceAll((key, owner) -> group.equals(owner) ? to : owner);
+            }
+            case "migrate_keys" -> {
+                UUID to = UUID.fromString(requiredString(json, "to"));
+                for (ChunkKey key : parseChunks(json)) {
+                    state.computeIfPresent(key,
+                            (ignored, owner) -> group.equals(owner) ? to : owner);
+                }
+            }
+            default -> throw new IllegalArgumentException("未知注册表日志操作: " + type);
+        }
+    }
+
+    private static JsonObject base(String type, UUID groupId) {
+        JsonObject json = new JsonObject();
+        json.addProperty("type", type);
+        json.addProperty("group", groupId.toString());
+        return json;
+    }
+
+    /** 新日志帧：长度与哈希都针对紧凑序列化后的 operation UTF-8 字节。 */
+    private static JsonObject frame(JsonObject operation) {
+        JsonObject copied = operation.deepCopy();
+        byte[] payload = operationBytes(copied);
+        JsonObject record = new JsonObject();
+        record.addProperty("version", FORMAT_VERSION);
+        record.addProperty("payloadBytes", payload.length);
+        record.addProperty("sha256", Sha256.hex(payload));
+        record.add("operation", copied);
+        return record;
+    }
+
+    /** 校验新帧；兼容工作树早期生成的合法无校验 operation 行。 */
+    private static JsonObject decodeRecord(String line) {
+        JsonObject record;
+        try {
+            record = JsonUtil.parseObject(line);
+        } catch (RuntimeException e) {
+            throw new RecoverableTailException("注册表日志 JSON 未完整写入", e);
+        }
+        if (record.has("type") && !record.has("operation")) {
+            return record;
+        }
+        JsonElement rawVersion = record.get("version");
+        if (rawVersion == null || !rawVersion.isJsonPrimitive()) {
+            throw new RecoverableTailException("注册表日志缺少完整 version");
+        }
+        int version;
+        try {
+            version = rawVersion.getAsInt();
+        } catch (RuntimeException e) {
+            throw new RecoverableTailException("注册表日志 version 未完整写入", e);
+        }
+        if (version != FORMAT_VERSION) {
+            throw new IllegalArgumentException("未知注册表日志版本: " + version);
+        }
+        JsonElement operation = record.get("operation");
+        if (operation == null || !operation.isJsonObject()) {
+            throw new RecoverableTailException("注册表日志缺少完整 operation");
+        }
+        byte[] payload = operationBytes(operation.getAsJsonObject());
+        JsonElement rawBytes = record.get("payloadBytes");
+        if (rawBytes == null || !rawBytes.isJsonPrimitive()) {
+            throw new RecoverableTailException("注册表日志缺少完整 payloadBytes");
+        }
+        long expectedBytes;
+        try {
+            expectedBytes = rawBytes.getAsLong();
+        } catch (RuntimeException e) {
+            throw new RecoverableTailException(
+                    "注册表日志 payloadBytes 未完整写入", e);
+        }
+        if (expectedBytes != payload.length) {
+            throw new RecoverableTailException("注册表日志载荷长度校验失败");
+        }
+        String expectedHash = JsonUtil.getString(record, "sha256", "");
+        if (expectedHash.isBlank()) {
+            throw new RecoverableTailException("注册表日志缺少完整 sha256");
+        }
+        if (!expectedHash.equals(Sha256.hex(payload))) {
+            throw new RecoverableTailException("注册表日志 SHA-256 校验失败");
+        }
+        return operation.getAsJsonObject();
+    }
+
+    private static byte[] operationBytes(JsonObject operation) {
+        return JsonUtil.GSON.toJson(operation).getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static JsonArray chunks(Set<ChunkKey> keys) {
+        JsonArray array = new JsonArray();
+        keys.stream().map(ChunkKey::asString).sorted().forEach(array::add);
+        return array;
+    }
+
+    private static JsonArray claimEntries(Map<ChunkKey, UUID> snapshot) {
+        JsonArray array = new JsonArray();
+        snapshot.entrySet().stream()
+                .sorted(java.util.Comparator.comparing(
+                        entry -> entry.getKey().asString()))
+                .forEach(entry -> {
+                    JsonObject item = new JsonObject();
+                    item.addProperty("chunk", entry.getKey().asString());
+                    item.addProperty("group", entry.getValue().toString());
+                    array.add(item);
+                });
+        return array;
+    }
+
+    private static Map<ChunkKey, UUID> parseClaimEntries(JsonObject json) {
+        JsonElement element = json.get("claims");
+        if (element == null || !element.isJsonArray()) {
+            throw new IllegalArgumentException("注册表 checkpoint 缺少 claims");
+        }
+        Map<ChunkKey, UUID> result = new HashMap<>();
+        for (JsonElement raw : element.getAsJsonArray()) {
+            if (!raw.isJsonObject()) {
+                throw new IllegalArgumentException("注册表 checkpoint claim 非对象");
+            }
+            JsonObject item = raw.getAsJsonObject();
+            ChunkKey key = ChunkKey.parse(requiredString(item, "chunk"));
+            UUID group = UUID.fromString(requiredString(item, "group"));
+            if (result.putIfAbsent(key, group) != null) {
+                throw new IllegalArgumentException(
+                        "注册表 checkpoint 含重复区块: " + key.asString());
+            }
+        }
+        return result;
+    }
+
+    private static Set<ChunkKey> parseChunks(JsonObject json) {
+        JsonElement element = json.get("chunks");
+        if (element == null || !element.isJsonArray()) {
+            throw new IllegalArgumentException("注册表日志缺少 chunks");
+        }
+        java.util.HashSet<ChunkKey> result = new java.util.HashSet<>();
+        for (JsonElement item : element.getAsJsonArray()) {
+            result.add(ChunkKey.parse(item.getAsString()));
+        }
+        return result;
+    }
+
+    private static String requiredString(JsonObject json, String name) {
+        String value = JsonUtil.getString(json, name, "");
+        if (value.isBlank()) {
+            throw new IllegalArgumentException("注册表日志缺少字段: " + name);
+        }
+        return value;
+    }
+
+    /** 截断未确认尾帧并同步文件内容与长度元数据。 */
+    private static void truncateTail(FileChannel channel, long length)
+            throws IOException {
+        channel.truncate(length);
+        channel.force(true);
+    }
+
+    private static void force(Path path) throws IOException {
+        try (FileChannel channel = FileChannel.open(
+                path, StandardOpenOption.WRITE)) {
+            channel.force(true);
+        }
+    }
+}

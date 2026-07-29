@@ -54,6 +54,11 @@ public final class P2PPaths {
         return root.resolve("registry");
     }
 
+    /** [服务端] 区块所有权 ACK 前强制落盘的追加变更日志。 */
+    public Path registryMutationJournal() {
+        return registryDir().resolve("mutations.jsonl");
+    }
+
     /** [服务端] 主客户端日志收集目录。 */
     public Path logsDir() {
         return root.resolve("logs");
@@ -62,6 +67,11 @@ public final class P2PPaths {
     /** [服务端] pending/committed 主客户端退出事务元数据目录。 */
     public Path exitTransactionsDir() {
         return root.resolve("exit-transactions");
+    }
+
+    /** [服务端] pending 最终玩家/区块载荷的事务专属耐久暂存目录。 */
+    public Path exitPayloadsDir() {
+        return root.resolve("exit-payloads");
     }
 
     /** [服务端/中转端] 版本化不可变环境快照仓库。 */

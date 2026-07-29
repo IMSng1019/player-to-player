@@ -46,6 +46,8 @@ class ExitTransactionLedgerTest {
         assertTrue(ledger.isProtected(CLIENT_ID));
         assertTrue(persistence.records.get(SHUTDOWN_ID).committed());
 
+        assertTrue(ledger.markDataApplied(CLIENT_ID, SHUTDOWN_ID));
+        assertTrue(persistence.records.get(SHUTDOWN_ID).dataApplied());
         assertTrue(ledger.markCleanupComplete(CLIENT_ID, SHUTDOWN_ID));
         assertFalse(ledger.isProtected(CLIENT_ID));
         assertTrue(persistence.records.get(SHUTDOWN_ID).cleanupComplete());
@@ -105,7 +107,13 @@ class ExitTransactionLedgerTest {
         assertTrue(recoveredCommitted.isProtected(CLIENT_ID));
         assertEquals(Set.of(manifest),
                 recoveredCommitted.committedManifestsNeedingCleanup());
-        assertTrue(recoveredCommitted.markCleanupComplete(CLIENT_ID, SHUTDOWN_ID));
+        assertTrue(recoveredCommitted.markDataApplied(CLIENT_ID, SHUTDOWN_ID));
+
+        ExitTransactionLedger recoveredApplied = new ExitTransactionLedger(persistence);
+        assertTrue(recoveredApplied.isDataApplied(CLIENT_ID, SHUTDOWN_ID));
+        assertEquals(Set.of(manifest),
+                recoveredApplied.committedManifestsNeedingCleanup());
+        assertTrue(recoveredApplied.markCleanupComplete(CLIENT_ID, SHUTDOWN_ID));
 
         ExitTransactionLedger recoveredClean = new ExitTransactionLedger(persistence);
         ExitTransactionLedger.BeginResult begin =
@@ -167,19 +175,20 @@ class ExitTransactionLedgerTest {
 
     @Test
     void cleanupWriteVisibleBeforeThrowPublishesCleanupState() {
-        UncertainPersistence persistence = new UncertainPersistence(3);
+        UncertainPersistence persistence = new UncertainPersistence(4);
         ExitTransactionLedger ledger = new ExitTransactionLedger(persistence);
         ExitManifest manifest = manifest(SHUTDOWN_ID, CLIENT_ID, Set.of());
         assertTrue(ledger.begin(CLIENT_ID, manifest).accepted());
         assertTrue(ledger.markPlayerReceived(CLIENT_ID, SHUTDOWN_ID, CLIENT_ID));
         assertTrue(ledger.commit(CLIENT_ID, SHUTDOWN_ID));
+        assertTrue(ledger.markDataApplied(CLIENT_ID, SHUTDOWN_ID));
 
         assertThrows(IllegalStateException.class,
                 () -> ledger.markCleanupComplete(CLIENT_ID, SHUTDOWN_ID));
 
         assertTrue(ledger.isCleanupComplete(CLIENT_ID, SHUTDOWN_ID));
         assertFalse(ledger.isProtected(CLIENT_ID));
-        assertEquals(3, persistence.saves);
+        assertEquals(4, persistence.saves);
     }
 
     private static ExitManifest manifest(UUID shutdownId, UUID clientId,
