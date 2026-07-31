@@ -21,22 +21,22 @@ class ExitBundleTest {
             new ChunkKey("minecraft:the_nether", 3, 4);
 
     @Test
-    void requiresExactlyOneFinalDispositionForEveryManifestItem() {
+    void allowsCleanManifestChunksWithoutExplicitPayload() {
         ExitManifest manifest = new ExitManifest(UUID.randomUUID(), ID, ID,
                 Set.of(ID), Set.of(WRITTEN, PRESERVED));
 
         ExitBundle bundle = new ExitBundle(manifest,
                 Map.of(ID, new byte[]{1, 2, 3}),
-                Map.of(WRITTEN, new byte[]{4, 5}),
-                Set.of(PRESERVED));
+                Map.of(WRITTEN, new byte[]{4, 5}));
 
         assertEquals(manifest, bundle.manifest());
         assertArrayEquals(new byte[]{1, 2, 3}, bundle.playerData(ID));
         assertArrayEquals(new byte[]{4, 5}, bundle.chunkData(WRITTEN));
-        assertEquals(Set.of(PRESERVED), bundle.preserveExistingChunks());
+        assertEquals(Set.of(WRITTEN), bundle.writtenChunks());
 
         assertThrows(IllegalArgumentException.class, () -> new ExitBundle(manifest,
-                Map.of(ID, new byte[]{1}), Map.of(), Set.of(PRESERVED)));
+                Map.of(ID, new byte[]{1}),
+                Map.of(new ChunkKey("minecraft:overworld", 99, 99), new byte[]{2})));
     }
 
     @Test
@@ -46,7 +46,7 @@ class ExitBundleTest {
         ExitManifest manifest = new ExitManifest(UUID.randomUUID(), ID, ID,
                 Set.of(ID), Set.of(WRITTEN));
         ExitBundle bundle = new ExitBundle(manifest,
-                Map.of(ID, player), Map.of(WRITTEN, chunk), Set.of());
+                Map.of(ID, player), Map.of(WRITTEN, chunk));
 
         player[0] = 9;
         chunk[0] = 9;
@@ -55,6 +55,6 @@ class ExitBundleTest {
 
         assertArrayEquals(new byte[]{1, 2}, bundle.playerData(ID));
         assertArrayEquals(new byte[]{3, 4}, bundle.chunkData(WRITTEN));
+        assertEquals(4L, bundle.compressedBytes());
     }
 }
-

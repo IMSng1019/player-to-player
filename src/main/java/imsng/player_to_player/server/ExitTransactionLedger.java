@@ -23,6 +23,17 @@ public final class ExitTransactionLedger {
     public record BeginResult(boolean accepted, boolean committed) {
     }
 
+    /** committed 区块处置计划；explicit=false 表示旧格式需走 marker 恢复。 */
+    public record ChunkDisposition(Set<ChunkKey> writtenChunks, boolean explicit) {
+        public ChunkDisposition {
+            writtenChunks = Set.copyOf(writtenChunks);
+        }
+
+        public boolean legacy() {
+            return !explicit;
+        }
+    }
+
     private static final class RuntimeTransaction {
         private final ExitManifest manifest;
         private final Set<UUID> receivedPlayers = new HashSet<>();
@@ -31,6 +42,8 @@ public final class ExitTransactionLedger {
         private boolean dataApplied;
         private boolean cleanupComplete;
         private boolean abandoned;
+        private Set<ChunkKey> writtenChunks;
+        private boolean writtenChunksDeclared;
 
         private RuntimeTransaction(ExitTransactionRecord record) {
             manifest = record.manifest();
@@ -38,6 +51,8 @@ public final class ExitTransactionLedger {
             dataApplied = record.dataApplied();
             cleanupComplete = record.cleanupComplete();
             abandoned = record.abandoned();
+            writtenChunks = record.writtenChunks();
+            writtenChunksDeclared = record.writtenChunksDeclared();
         }
     }
 
@@ -136,23 +151,33 @@ public final class ExitTransactionLedger {
      * 数据齐全时把事务标为 committed 并先落盘。重复提交已经 committed 的事务
      * 同样返回 true，用于最终 ACK 丢失后的重连恢复。
      */
-    public boolean commit(UUID peerId, UUID shutdownId) {
+    public boolean commit(UUID peerId, UUID shutdownId,
+                          Set<ChunkKey> declaredWrittenChunks) {
         synchronized (lock) {
             RuntimeTransaction transaction = authorized(peerId, shutdownId);
-            if (transaction == null) {
+            Set<ChunkKey> writtenChunks = immutableWrittenSubset(
+                    transaction, declaredWrittenChunks);
+            if (transaction == null || writtenChunks == null) {
                 return false;
             }
             if (transaction.committed) {
-                return true;
+                // 新格式的重复 COMMIT 必须重放完全相同的耐久计划；旧格式没有
+                // 可比较字段，只保留历史幂等恢复能力。
+                return !transaction.writtenChunksDeclared
+                        || transaction.writtenChunks.equals(writtenChunks);
             }
             if (!transaction.receivedPlayers.containsAll(transaction.manifest.playerIds())
-                    || !transaction.receivedChunks.containsAll(transaction.manifest.chunks())) {
+                    || !transaction.receivedChunks.equals(writtenChunks)) {
                 return false;
             }
             ExitTransactionRecord committed =
                     new ExitTransactionRecord(transaction.manifest, true,
-                            false, false, false);
-            persistThenPublish(committed, () -> transaction.committed = true);
+                            writtenChunks, true, false, false, false);
+            persistThenPublish(committed, () -> {
+                transaction.committed = true;
+                transaction.writtenChunks = writtenChunks;
+                transaction.writtenChunksDeclared = true;
+            });
             return true;
         }
     }
@@ -168,7 +193,9 @@ public final class ExitTransactionLedger {
                 return transaction.abandoned;
             }
             ExitTransactionRecord abandoned = new ExitTransactionRecord(
-                    transaction.manifest, true, false, false, true);
+                    transaction.manifest, true,
+                    transaction.writtenChunks, transaction.writtenChunksDeclared,
+                    false, false, true);
             persistThenPublish(abandoned, () -> {
                 transaction.committed = true;
                 transaction.abandoned = true;
@@ -189,7 +216,9 @@ public final class ExitTransactionLedger {
                 return true;
             }
             ExitTransactionRecord applied = new ExitTransactionRecord(
-                    transaction.manifest, true, true, false, false);
+                    transaction.manifest, true,
+                    transaction.writtenChunks, transaction.writtenChunksDeclared,
+                    true, false, false);
             persistThenPublish(applied,
                     () -> transaction.dataApplied = true);
             return true;
@@ -208,22 +237,38 @@ public final class ExitTransactionLedger {
                 return true;
             }
             ExitTransactionRecord cleaned = new ExitTransactionRecord(
-                    transaction.manifest, true, transaction.dataApplied,
-                    true, transaction.abandoned);
+                    transaction.manifest, true,
+                    transaction.writtenChunks, transaction.writtenChunksDeclared,
+                    transaction.dataApplied, true, transaction.abandoned);
             persistThenPublish(cleaned,
                     () -> transaction.cleanupComplete = true);
             return true;
         }
     }
 
-    public boolean isReadyToCommit(UUID peerId, UUID shutdownId) {
+    public boolean isReadyToCommit(UUID peerId, UUID shutdownId,
+                                   Set<ChunkKey> declaredWrittenChunks) {
         synchronized (lock) {
             RuntimeTransaction transaction = authorizedPending(peerId, shutdownId);
+            Set<ChunkKey> writtenChunks = immutableWrittenSubset(
+                    transaction, declaredWrittenChunks);
             return transaction != null
+                    && writtenChunks != null
                     && transaction.receivedPlayers.containsAll(
                     transaction.manifest.playerIds())
-                    && transaction.receivedChunks.containsAll(
-                    transaction.manifest.chunks());
+                    && transaction.receivedChunks.equals(writtenChunks);
+        }
+    }
+
+    /** 返回 committed 时固定的区块写入计划，供崩溃恢复和正式 apply 使用。 */
+    public ChunkDisposition chunkDisposition(UUID peerId, UUID shutdownId) {
+        synchronized (lock) {
+            RuntimeTransaction transaction = authorized(peerId, shutdownId);
+            if (transaction == null || !transaction.committed) {
+                return null;
+            }
+            return new ChunkDisposition(
+                    transaction.writtenChunks, transaction.writtenChunksDeclared);
         }
     }
 
@@ -343,6 +388,21 @@ public final class ExitTransactionLedger {
     private RuntimeTransaction authorizedPending(UUID peerId, UUID shutdownId) {
         RuntimeTransaction transaction = authorized(peerId, shutdownId);
         return transaction != null && !transaction.committed ? transaction : null;
+    }
+
+    private static Set<ChunkKey> immutableWrittenSubset(
+            RuntimeTransaction transaction, Set<ChunkKey> declaredWrittenChunks) {
+        if (transaction == null || declaredWrittenChunks == null) {
+            return null;
+        }
+        final Set<ChunkKey> writtenChunks;
+        try {
+            writtenChunks = Set.copyOf(declaredWrittenChunks);
+        } catch (RuntimeException invalidSet) {
+            return null;
+        }
+        return transaction.manifest.chunks().containsAll(writtenChunks)
+                ? writtenChunks : null;
     }
 
     /**

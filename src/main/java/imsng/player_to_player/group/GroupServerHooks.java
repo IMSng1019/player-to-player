@@ -6,7 +6,6 @@ import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.registry.ChunkKey;
-import imsng.player_to_player.util.ThreadPools;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerChunkEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
@@ -27,11 +26,9 @@ import org.slf4j.LoggerFactory;
  *   <li><b>SERVER_STARTED</b>：客户端节点且组计划已预置 → {@link GroupRuntime#tryAttach}
  *       接管刚启动的集成服务端；</li>
  *   <li><b>SERVER_STOPPING</b>：解除接管（申请客户端/上行服务关停）；</li>
- *   <li><b>CHUNK_UNLOAD</b>：规范"玩家卸载区块，服务器将该区块占用解除，并将最后的
- *       区块数据由主客户端发给服务端"——在事件线程（服务器主线程）序列化区块，
- *       压缩与发送转 io 池，随 CHUNK_RELEASE 上行最终数据。<b>先行序列化</b>而非
- *       依赖卸载存盘的上行捕获：Fabric 事件与 save 的先后顺序是实现细节，
- *       自带数据可保证"释放帧里就是最终态"，与顺序无关；</li>
+ *   <li><b>CHUNK_UNLOAD</b>：正常路径在 ChunkMap.scheduleUnload 的 save dependency
+ *       中已经取得服务端释放 ACK，因此事件只做防御性校验；若仍持有 claim，说明屏障未
+ *       覆盖到该卸载，立即使用同一可靠状态机补交并记录错误，不再 fire-and-forget；</li>
  *   <li><b>END_SERVER_TICK</b>：每 {@value #POS_REPORT_INTERVAL_TICKS} tick 把组内
  *       全部玩家（主 + 副）的位置经 PLAYER_POS_UPDATE 上报玩家表（规范"服务端
  *       保存所有玩家的坐标信息"）。</li>
@@ -82,23 +79,26 @@ public final class GroupServerHooks {
             ChunkKey key = new ChunkKey(level.dimension().location().toString(),
                     chunk.getPos().x, chunk.getPos().z);
             if (!claims.isClaimed(key)) {
-                return; // 门控窗口期内加载的区块（理论不存在），防御
+                return; // 正常路径：预卸载屏障已收到正 ACK 并清理本地 claim
             }
-            // 序列化必须在服务器主线程（事件线程即是）：区块此刻仍完整可读；
-            // NBT 一经生成即为不可变快照，压缩 + 发送转 io 池
-            try {
-                CompoundTag tag = ChunkSerializer.write(level, chunk);
-                if (GroupRuntime.isExitDraining()) {
-                    GroupRuntime.recordExitChunk(key, tag);
-                    return;
+            if (GroupRuntime.isExitDraining()) {
+                try {
+                    GroupRuntime.recordExitChunk(key, ChunkSerializer.write(level, chunk));
+                } catch (Exception error) {
+                    LOGGER.error("退出冻结后的卸载区块快照捕获失败: {}", key.asString(), error);
                 }
-                ThreadPools.io().execute(() ->
-                        claims.releaseWithData(key, ChunkUploadService.compress(tag)));
-            } catch (Exception e) {
-                // 序列化失败：仍要释放占用（不带数据），否则区块被本组永久锁死
-                LOGGER.error("卸载区块序列化失败，改为无数据释放: {}", key.asString(), e);
-                claims.releaseWithData(key, null);
+                return;
             }
+            ChunkPreUnloadService preUnloads = GroupRuntime.preUnloads();
+            if (preUnloads == null) {
+                LOGGER.error("区块已触发本地卸载但预卸载服务不存在，保留服务端 claim: {}",
+                        key.asString());
+                return;
+            }
+            LOGGER.error("预卸载屏障未覆盖到 CHUNK_UNLOAD，启动防御性可靠提交: {}",
+                    key.asString());
+            preUnloads.begin(key, chunk.isUnsaved(),
+                    () -> GroupRuntime.captureChunkSnapshot(level, chunk));
         });
 
         ServerTickEvents.END_SERVER_TICK.register(GroupServerHooks::reportPositions);

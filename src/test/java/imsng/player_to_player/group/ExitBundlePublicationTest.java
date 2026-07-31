@@ -29,7 +29,7 @@ class ExitBundlePublicationTest {
                     }
                     return new ExitBundle(
                             manifest, java.util.Map.of(id, new byte[]{1}),
-                            java.util.Map.of(), Set.of());
+                            java.util.Map.of());
                 },
                 bundle -> {
                     if (deliveries.incrementAndGet() == 1) {

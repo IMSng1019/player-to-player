@@ -22,35 +22,58 @@ class ExitTransactionLedgerTest {
             UUID.fromString("9207ce8d-2b04-4fd8-a9f7-a437ce1211a0");
     private static final ChunkKey CHUNK =
             new ChunkKey("minecraft:overworld", -7, 0);
+    private static final ChunkKey CLEAN =
+            new ChunkKey("minecraft:overworld", -6, 0);
 
     @Test
-    void pendingTransactionRequiresEveryExpectedItemBeforeCommit() {
+    void pendingTransactionOnlyRequiresDeclaredWrittenChunksBeforeCommit() {
         InMemoryPersistence persistence = new InMemoryPersistence();
         ExitTransactionLedger ledger = new ExitTransactionLedger(persistence);
-        ExitManifest manifest = manifest(SHUTDOWN_ID, CLIENT_ID, Set.of(CHUNK));
+        ExitManifest manifest = manifest(
+                SHUTDOWN_ID, CLIENT_ID, Set.of(CHUNK, CLEAN));
 
         ExitTransactionLedger.BeginResult begin = ledger.begin(CLIENT_ID, manifest);
 
         assertTrue(begin.accepted());
         assertFalse(begin.committed());
         assertTrue(ledger.isProtected(CLIENT_ID));
-        assertFalse(ledger.commit(CLIENT_ID, SHUTDOWN_ID));
+        assertFalse(ledger.commit(CLIENT_ID, SHUTDOWN_ID, Set.of(CHUNK)));
 
         assertTrue(ledger.markPlayerReceived(CLIENT_ID, SHUTDOWN_ID, CLIENT_ID));
         assertTrue(ledger.markPlayerReceived(CLIENT_ID, SHUTDOWN_ID, CLIENT_ID));
-        assertFalse(ledger.commit(CLIENT_ID, SHUTDOWN_ID));
+        assertFalse(ledger.commit(CLIENT_ID, SHUTDOWN_ID, Set.of(CHUNK)));
 
         assertTrue(ledger.markChunkReceived(CLIENT_ID, SHUTDOWN_ID, CHUNK));
         assertTrue(ledger.markChunkReceived(CLIENT_ID, SHUTDOWN_ID, CHUNK));
-        assertTrue(ledger.commit(CLIENT_ID, SHUTDOWN_ID));
+        assertTrue(ledger.commit(CLIENT_ID, SHUTDOWN_ID, Set.of(CHUNK)));
         assertTrue(ledger.isProtected(CLIENT_ID));
         assertTrue(persistence.records.get(SHUTDOWN_ID).committed());
+        assertEquals(Set.of(CHUNK),
+                persistence.records.get(SHUTDOWN_ID).writtenChunks());
+        assertTrue(persistence.records.get(SHUTDOWN_ID).writtenChunksDeclared());
 
         assertTrue(ledger.markDataApplied(CLIENT_ID, SHUTDOWN_ID));
         assertTrue(persistence.records.get(SHUTDOWN_ID).dataApplied());
         assertTrue(ledger.markCleanupComplete(CLIENT_ID, SHUTDOWN_ID));
         assertFalse(ledger.isProtected(CLIENT_ID));
         assertTrue(persistence.records.get(SHUTDOWN_ID).cleanupComplete());
+    }
+
+    @Test
+    void commitRejectsMissingUndeclaredAndOutOfManifestChunks() {
+        ExitTransactionLedger ledger = new ExitTransactionLedger(
+                new InMemoryPersistence());
+        ExitManifest manifest = manifest(
+                SHUTDOWN_ID, CLIENT_ID, Set.of(CHUNK, CLEAN));
+        assertTrue(ledger.begin(CLIENT_ID, manifest).accepted());
+        assertTrue(ledger.markPlayerReceived(CLIENT_ID, SHUTDOWN_ID, CLIENT_ID));
+        assertTrue(ledger.markChunkReceived(CLIENT_ID, SHUTDOWN_ID, CHUNK));
+
+        assertFalse(ledger.commit(
+                CLIENT_ID, SHUTDOWN_ID, Set.of(CHUNK, CLEAN)));
+        assertFalse(ledger.commit(CLIENT_ID, SHUTDOWN_ID, Set.of()));
+        assertFalse(ledger.commit(CLIENT_ID, SHUTDOWN_ID, Set.of(
+                new ChunkKey("minecraft:the_end", 1, 1))));
     }
 
     @Test
@@ -101,7 +124,8 @@ class ExitTransactionLedgerTest {
 
         recoveredPending.markPlayerReceived(CLIENT_ID, SHUTDOWN_ID, CLIENT_ID);
         recoveredPending.markChunkReceived(CLIENT_ID, SHUTDOWN_ID, CHUNK);
-        assertTrue(recoveredPending.commit(CLIENT_ID, SHUTDOWN_ID));
+        assertTrue(recoveredPending.commit(
+                CLIENT_ID, SHUTDOWN_ID, Set.of(CHUNK)));
 
         ExitTransactionLedger recoveredCommitted = new ExitTransactionLedger(persistence);
         assertTrue(recoveredCommitted.isProtected(CLIENT_ID));
@@ -151,7 +175,7 @@ class ExitTransactionLedgerTest {
         assertTrue(ledger.markChunkReceived(CLIENT_ID, SHUTDOWN_ID, CHUNK));
 
         assertThrows(IllegalStateException.class,
-                () -> ledger.commit(CLIENT_ID, SHUTDOWN_ID));
+                () -> ledger.commit(CLIENT_ID, SHUTDOWN_ID, Set.of(CHUNK)));
 
         assertTrue(ledger.isCommitted(CLIENT_ID, SHUTDOWN_ID));
         assertTrue(ledger.begin(CLIENT_ID, manifest).committed());
@@ -180,7 +204,7 @@ class ExitTransactionLedgerTest {
         ExitManifest manifest = manifest(SHUTDOWN_ID, CLIENT_ID, Set.of());
         assertTrue(ledger.begin(CLIENT_ID, manifest).accepted());
         assertTrue(ledger.markPlayerReceived(CLIENT_ID, SHUTDOWN_ID, CLIENT_ID));
-        assertTrue(ledger.commit(CLIENT_ID, SHUTDOWN_ID));
+        assertTrue(ledger.commit(CLIENT_ID, SHUTDOWN_ID, Set.of()));
         assertTrue(ledger.markDataApplied(CLIENT_ID, SHUTDOWN_ID));
 
         assertThrows(IllegalStateException.class,

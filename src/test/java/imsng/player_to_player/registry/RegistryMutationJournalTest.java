@@ -26,6 +26,8 @@ class RegistryMutationJournalTest {
             UUID.fromString("9207ce8d-2b04-4fd8-a9f7-a437ce1211a0");
     private static final UUID OTHER =
             UUID.fromString("30c88a44-b992-4a3a-9f5b-6b64f176f501");
+    private static final UUID RELEASE_ID =
+            UUID.fromString("129c3954-0249-45da-b98f-739dc5dab118");
     private static final ChunkKey FIRST =
             new ChunkKey("minecraft:overworld", 10, 10);
     private static final ChunkKey SECOND =
@@ -54,6 +56,21 @@ class RegistryMutationJournalTest {
 
         assertEquals(null, recovered.ownerOf(FIRST));
         assertEquals(GROUP, recovered.ownerOf(SECOND));
+    }
+
+    @Test
+    void releaseSuccessReplaysOwnershipRemovalAndReceiptFromOneDurableRecord() {
+        RegistryMutationJournal journal = new RegistryMutationJournal(
+                temporary.resolve("mutations.jsonl"));
+        ChunkReleaseReceipt receipt = new ChunkReleaseReceipt(
+                RELEASE_ID, FIRST, GROUP, 3, Sha256.hex(new byte[]{1, 2, 3}), true);
+
+        journal.appendRelease(receipt);
+        RegistryMutationJournal.ReplayState replayed = journal.replayState(
+                Map.of(FIRST, GROUP), Map.of());
+
+        assertFalse(replayed.claims().containsKey(FIRST));
+        assertEquals(receipt, replayed.releaseReceipts().get(RELEASE_ID));
     }
 
     @Test

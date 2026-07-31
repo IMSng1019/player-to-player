@@ -6,6 +6,7 @@ import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.HandlerRegistry;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.util.JsonUtil;
+import imsng.player_to_player.util.Sha256;
 import imsng.player_to_player.util.ThreadPools;
 import imsng.player_to_player.server.ExitTransactionHandlers;
 import imsng.player_to_player.server.HelloHandler;
@@ -21,7 +22,7 @@ import java.util.UUID;
  *   <li>{@code CHUNK_CLAIM_REQUEST}（json: dimension, x, z, groupId）→
  *       {@code CHUNK_CLAIM_RESPONSE}（granted / 拒绝原因：blockingChunk + blockingGroup；
  *       granted 时附 hasServerData 指示走服务端数据还是种子生成）；</li>
- *   <li>{@code CHUNK_RELEASE}（json: dimension, x, z, groupId；binary 可携带最终
+ *   <li>{@code CHUNK_RELEASE}（json: dimension, x, z, groupId, releaseId；binary 可携带最终
  *       区块数据）→ {@code CHUNK_RELEASE_ACK}。规范"玩家卸载区块……将最后的区块
  *       数据由主客户端发给服务端"：binary 非空时先经 {@link ChunkWriteback} 写回
  *       MCA 并刷盘，<b>再</b>释放占用 —— 顺序保证释放一经确认，其他组随后的申请
@@ -54,10 +55,16 @@ public final class RegistryHandlers {
     public static void register(HandlerRegistry reg, ChunkRegistry registry, PlayerTable players,
                                 ChunkWriteback writeback,
                                 ExitTransactionHandlers exits) {
+        ChunkReleaseExecutionTracker releaseTracker =
+                new ChunkReleaseExecutionTracker();
         reg.on(MessageType.CHUNK_CLAIM_REQUEST,
                 (conn, msg) -> handleClaim(conn, msg, registry, exits));
         reg.on(MessageType.CHUNK_RELEASE,
-                (conn, msg) -> handleRelease(conn, msg, registry, writeback, exits));
+                (conn, msg) -> handleRelease(
+                        conn, msg, registry, writeback, exits, releaseTracker));
+        reg.on(MessageType.CHUNK_RELEASE_RECEIPT_CONFIRM,
+                (conn, msg) -> handleReleaseConfirmation(
+                        conn, msg, registry, exits, releaseTracker));
         reg.on(MessageType.CHUNK_PROBE_REQUEST, (conn, msg) -> handleProbe(conn, msg, registry));
         reg.on(MessageType.PLAYER_POS_UPDATE, (conn, msg) -> handlePosUpdate(conn, msg, players));
     }
@@ -104,45 +111,193 @@ public final class RegistryHandlers {
 
     private static void handleRelease(ControlConnection conn, ControlMessage msg,
                                       ChunkRegistry registry, ChunkWriteback writeback,
-                                      ExitTransactionHandlers exits) {
+                                      ExitTransactionHandlers exits,
+                                      ChunkReleaseExecutionTracker releaseTracker) {
         ChunkKey key = parseKey(msg.json());
         UUID groupId = parseUuid(JsonUtil.getString(msg.json(), "groupId", ""));
-        if (key == null || groupId == null || !groupId.equals(conn.peerId())) {
-            conn.send(error(msg, "invalid_request", "dimension/x/z/groupId 缺失或非法"));
+        UUID releaseId = parseUuid(JsonUtil.getString(
+                msg.json(), "releaseId", ""));
+        if (key == null || groupId == null || releaseId == null
+                || !groupId.equals(conn.peerId())) {
+            conn.send(error(msg, "invalid_request",
+                    "dimension/x/z/groupId/releaseId 缺失或非法"));
+            return;
+        }
+        // 必须在进入 cached IO 队列前登记：排队中的旧重试同样会影响 receipt 的安全回收。
+        if (!releaseTracker.begin(releaseId, groupId)) {
+            conn.send(error(msg, "release_id_conflict",
+                    "releaseId 已被另一组的在途释放请求占用"));
             return;
         }
         byte[] finalData = msg.binary();
         // 写回（解压 + MCA 写 + 刷盘）是重活，整体转 io 池；顺序必须是先写回后释放
-        ThreadPools.io().execute(() -> {
-            java.util.concurrent.atomic.AtomicBoolean written =
-                    new java.util.concurrent.atomic.AtomicBoolean();
-            java.util.concurrent.atomic.AtomicBoolean released =
-                    new java.util.concurrent.atomic.AtomicBoolean();
-            boolean current = exits != null && exits.writeRealtimeIfAllowed(conn, () -> {
-                if (writeback != null && finalData != null && finalData.length > 0) {
-                    // 写回内部会做占用组核验 —— 必须在 release 之前调用，否则核验必失败
-                    written.set(writeback.writeFinalAndFlush(key, groupId, finalData));
-                    if (!written.get()) {
-                        LOGGER.warn("最终区块数据写回失败，保留占用并等待重试: {} 组={}",
-                                key.asString(), groupId);
-                        return false;
+        Runnable releaseTask = () -> {
+            try {
+                processRelease(conn, msg, registry, writeback, exits,
+                        key, groupId, releaseId, finalData);
+            } finally {
+                // 成功、拒绝、异常都必须排空计数；若 confirmation 已到达，最后一个任务
+                // 在这里安全回收 receipt，晚到旧请求便不可能再误伤后来重新 claim 的区块。
+                releaseTracker.finish(releaseId, groupId, registry);
+            }
+        };
+        try {
+            ThreadPools.io().execute(releaseTask);
+        } catch (RuntimeException schedulingFailure) {
+            // 线程池关闭/拒绝执行时任务体不会进入 finally，必须在提交方补偿计数。
+            releaseTracker.finish(releaseId, groupId, registry);
+            LOGGER.warn("区块释放任务无法进入 IO 队列: {} 组={} releaseId={}",
+                    key.asString(), groupId, releaseId, schedulingFailure);
+            conn.send(error(msg, "release_scheduling_failed",
+                    schedulingFailure.toString()));
+        }
+    }
+
+    /** 在 IO 线程执行一次释放；在途计数的进入和离开由调用方统一包住。 */
+    private static void processRelease(
+            ControlConnection conn, ControlMessage msg,
+            ChunkRegistry registry, ChunkWriteback writeback,
+            ExitTransactionHandlers exits, ChunkKey key,
+            UUID groupId, UUID releaseId, byte[] finalData) {
+        int payloadBytes = finalData != null ? finalData.length : 0;
+        // 大区块 payload 的 SHA-256 同样属于重活，不能在 Netty 事件循环计算。
+        String payloadSha256 = Sha256.hex(
+                finalData != null ? finalData : ControlMessage.NO_BINARY);
+        java.util.concurrent.atomic.AtomicReference<ChunkWriteback.ReleaseResult>
+                resultRef = new java.util.concurrent.atomic.AtomicReference<>();
+        boolean current;
+        try {
+            current = exits != null && exits.writeRealtimeIfAllowed(conn, () -> {
+                boolean hasFinalData = payloadBytes > 0;
+                ChunkWriteback.ReleaseTransaction transaction =
+                        new ChunkWriteback.ReleaseTransaction() {
+                            @Override
+                            public ChunkWriteback.ReleaseResult replay() {
+                                ChunkReleaseReceipt receipt =
+                                        registry.findReleaseReceipt(
+                                                releaseId, key, groupId,
+                                                payloadBytes, payloadSha256);
+                                return receipt != null
+                                        ? new ChunkWriteback.ReleaseResult(
+                                        receipt.finalDataWritten(), true)
+                                        : null;
+                            }
+
+                            @Override
+                            public ChunkWriteback.ReleaseResult commit(
+                                    boolean finalDataWritten) {
+                                if (hasFinalData != finalDataWritten) {
+                                    return new ChunkWriteback.ReleaseResult(
+                                            finalDataWritten, false);
+                                }
+                                ChunkReleaseReceipt completed =
+                                        registry.completeRelease(
+                                                new ChunkReleaseReceipt(
+                                                        releaseId, key, groupId,
+                                                        payloadBytes,
+                                                        payloadSha256,
+                                                        finalDataWritten));
+                                return completed != null
+                                        ? new ChunkWriteback.ReleaseResult(
+                                        completed.finalDataWritten(), true)
+                                        : new ChunkWriteback.ReleaseResult(
+                                        finalDataWritten, false);
+                            }
+                        };
+                ChunkWriteback.ReleaseResult result;
+                if (writeback == null) {
+                    result = transaction.replay();
+                    if (result == null) {
+                        if (hasFinalData) {
+                            LOGGER.warn("收到最终区块数据但服务端没有写回能力: {} 组={}",
+                                    key.asString(), groupId);
+                            return false;
+                        }
+                        result = transaction.commit(false);
                     }
+                } else {
+                    // 写回实现持有与实时上行相同的区块锁，并在锁内先查询回执。
+                    // 首次操作按“最终写回 -> WAL 原子回执+删除 ownership”完成；
+                    // ACK 丢失后的重放直接返回回执，不再写 NBT。
+                    result = writeback.finalizeAndRelease(
+                            key, groupId, finalData, transaction);
                 }
-                released.set(registry.release(key, groupId));
-                return released.get();
+                resultRef.set(result);
+                if (hasFinalData && (result == null
+                        || !result.finalDataWritten())) {
+                    LOGGER.warn("最终区块数据写回失败，保留占用并等待重试: {} 组={}",
+                            key.asString(), groupId);
+                }
+                return result != null && result.released();
             });
-            if (!current) {
-                conn.send(error(msg, "release_rejected",
-                        "连接已失效、退出已冻结或最终数据未落盘"));
+        } catch (IllegalArgumentException conflict) {
+            LOGGER.warn("拒绝冲突的区块释放重试: {} 组={} releaseId={}",
+                    key.asString(), groupId, releaseId, conflict);
+            conn.send(error(msg, "release_id_conflict", conflict.getMessage()));
+            return;
+        } catch (RuntimeException failure) {
+            LOGGER.warn("区块释放处理异常: {} 组={} releaseId={}",
+                    key.asString(), groupId, releaseId, failure);
+            conn.send(error(msg, "release_failed", failure.toString()));
+            return;
+        }
+        if (!current) {
+            conn.send(error(msg, "release_rejected",
+                    "连接已失效、退出已冻结或最终数据未落盘"));
+            return;
+        }
+        ChunkWriteback.ReleaseResult result = resultRef.get();
+        if (result == null || !result.released()) {
+            LOGGER.warn("区块释放未生效（未占用或占用者不符）: {} 组={}",
+                    key.asString(), groupId);
+        }
+        JsonObject out = new JsonObject();
+        out.addProperty("released", result != null && result.released());
+        out.addProperty("finalDataWritten",
+                result != null && result.finalDataWritten());
+        conn.send(msg.reply(MessageType.CHUNK_RELEASE_ACK, out, null));
+    }
+
+    /**
+     * 正 ACK 已到达客户端后的回执回收。删除动作自身具备幂等性：即使本应答丢失，
+     * 客户端重发时服务端在“回执已不存在”状态仍返回 accepted=true。
+     */
+    private static void handleReleaseConfirmation(
+            ControlConnection conn, ControlMessage msg,
+            ChunkRegistry registry, ExitTransactionHandlers exits,
+            ChunkReleaseExecutionTracker releaseTracker) {
+        UUID releaseId = parseUuid(JsonUtil.getString(
+                msg.json(), "releaseId", ""));
+        UUID groupId = parseUuid(JsonUtil.getString(
+                msg.json(), "groupId", ""));
+        if (releaseId == null || groupId == null
+                || !groupId.equals(conn.peerId())) {
+            conn.send(error(msg, "invalid_request",
+                    "releaseId/groupId 缺失、非法或与连接身份不符"));
+            return;
+        }
+        ThreadPools.io().execute(() -> {
+            java.util.concurrent.atomic.AtomicBoolean accepted =
+                    new java.util.concurrent.atomic.AtomicBoolean();
+            boolean current;
+            try {
+                current = exits != null && exits.writeRealtimeIfAllowed(
+                        conn, () -> {
+                            accepted.set(releaseTracker.confirm(
+                                    releaseId, groupId, registry));
+                            return accepted.get();
+                        });
+            } catch (RuntimeException failure) {
+                LOGGER.warn("释放回执确认落盘失败: group={} releaseId={}",
+                        groupId, releaseId, failure);
+                conn.send(error(msg, "receipt_confirm_failed",
+                        failure.toString()));
                 return;
             }
-            if (!released.get()) {
-                LOGGER.warn("区块释放未生效（未占用或占用者不符）: {} 组={}", key.asString(), groupId);
-            }
             JsonObject out = new JsonObject();
-            out.addProperty("released", released.get());
-            out.addProperty("finalDataWritten", written.get());
-            conn.send(msg.reply(MessageType.CHUNK_RELEASE_ACK, out, null));
+            out.addProperty("accepted", current && accepted.get());
+            conn.send(msg.reply(
+                    MessageType.CHUNK_RELEASE_RECEIPT_CONFIRM, out, null));
         });
     }
 

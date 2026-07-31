@@ -3,7 +3,6 @@ package imsng.player_to_player.group;
 import imsng.player_to_player.registry.ChunkKey;
 
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -11,34 +10,26 @@ import java.util.UUID;
 
 /**
  * 集成服停止后用于耐久退出提交的完整不可变数据包。
- * 每个清单区块必须恰好选择“上传最终 NBT”或“保留服务端已有状态”之一。
+ * ownership manifest 保持完整，但区块 payload 只包含最后一次物理服确认之后仍未确认的版本；
+ * 未出现在 written 集合中的清单区块隐式保留服务端现状，不再逐项生成 preserve marker。
  */
 public final class ExitBundle {
 
     private final ExitManifest manifest;
     private final Map<UUID, byte[]> players;
     private final Map<ChunkKey, byte[]> chunks;
-    private final Set<ChunkKey> preserveExisting;
 
     public ExitBundle(ExitManifest manifest, Map<UUID, byte[]> players,
-                      Map<ChunkKey, byte[]> chunks,
-                      Set<ChunkKey> preserveExisting) {
+                      Map<ChunkKey, byte[]> chunks) {
         this.manifest = Objects.requireNonNull(manifest, "manifest");
         this.players = copyBytes(players);
         this.chunks = copyBytes(chunks);
-        this.preserveExisting = Set.copyOf(
-                Objects.requireNonNull(preserveExisting, "preserveExisting"));
 
         if (!this.players.keySet().equals(manifest.playerIds())) {
             throw new IllegalArgumentException("最终玩家数据与退出清单不一致");
         }
-        Set<ChunkKey> allChunks = new HashSet<>(this.chunks.keySet());
-        if (!java.util.Collections.disjoint(allChunks, this.preserveExisting)) {
-            throw new IllegalArgumentException("同一区块不能同时上传并保留旧状态");
-        }
-        allChunks.addAll(this.preserveExisting);
-        if (!allChunks.equals(manifest.chunks())) {
-            throw new IllegalArgumentException("最终区块数据与退出清单不一致");
+        if (!manifest.chunks().containsAll(this.chunks.keySet())) {
+            throw new IllegalArgumentException("written 区块必须是退出 ownership 清单的子集");
         }
     }
 
@@ -54,16 +45,24 @@ public final class ExitBundle {
         return chunks.keySet();
     }
 
-    public Set<ChunkKey> preserveExistingChunks() {
-        return preserveExisting;
-    }
-
     public byte[] playerData(UUID playerId) {
         return copy(players.get(playerId));
     }
 
     public byte[] chunkData(ChunkKey key) {
         return copy(chunks.get(key));
+    }
+
+    /** 返回当前不可变快照中所有已压缩 payload 的总字节数，不复制二进制内容。 */
+    public long compressedBytes() {
+        long total = 0;
+        for (byte[] data : players.values()) {
+            total += data.length;
+        }
+        for (byte[] data : chunks.values()) {
+            total += data.length;
+        }
+        return total;
     }
 
     private static <K> Map<K, byte[]> copyBytes(Map<K, byte[]> source) {
@@ -80,4 +79,3 @@ public final class ExitBundle {
         return value != null ? value.clone() : null;
     }
 }
-

@@ -15,12 +15,14 @@ import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 /**
  * 区块申请客户端（主客户端侧，Phase 2；规范"特殊的区块加载"）。
@@ -59,6 +61,11 @@ public final class ChunkClaimClient {
     private final ControlConnection conn;
     private final UUID groupId;
     private final int retrySeconds;
+    /** 申请/释放失败后的异步重试入口；测试通过包可见构造器注入手动调度器。 */
+    private final Consumer<Runnable> retryScheduler;
+
+    /** 线性化退出阶段与 release 注册，避免 freeze 和新释放请求之间出现竞态。 */
+    private final Object lifecycleLock = new Object();
 
     /** 未决申请：key → 共享 future（授予后移除；被拒时保留并由定时重试驱动）。 */
     private final Map<ChunkKey, CompletableFuture<ClaimOutcome>> pending = new ConcurrentHashMap<>();
@@ -66,15 +73,85 @@ public final class ChunkClaimClient {
     /** 已授予且尚未释放的区块（上行服务据此过滤"释放后仍触发的存盘上行"）。 */
     private final Set<ChunkKey> claimed = ConcurrentHashMap.newKeySet();
 
+    /**
+     * 当前 claim 对应的服务端数据基线：true 表示物理服已经有可保留的权威区块数据，
+     * false 表示本次从种子生成且尚未得到任何一次耐久写入确认。记录只与仍在本地持有的
+     * claim 同寿命；释放或迁移后立即删除，迟到的实时上传 ACK 只能 replace，不能复活状态。
+     */
+    private final ConcurrentHashMap<ChunkKey, Boolean> serverDataKnown = new ConcurrentHashMap<>();
+
+    /** 已登记但尚未得到正 CHUNK_RELEASE_ACK 的释放操作。 */
+    private final Map<ChunkKey, ReleaseOperation> releases = new ConcurrentHashMap<>();
+
+    private static final class ReleaseOperation {
+        /**
+         * 一次逻辑释放的稳定身份。网络超时只会重放该身份，服务端据此返回第一次
+         * 已耐久完成的结果，不能把一次重试误判成“owner 已不存在”的新释放。
+         */
+        private final UUID releaseId;
+        private final byte[] gzipNbt;
+        private final CompletableFuture<Void> future;
+        private final java.util.concurrent.atomic.AtomicInteger attempts =
+                new java.util.concurrent.atomic.AtomicInteger();
+        private final java.util.concurrent.atomic.AtomicInteger confirmationAttempts =
+                new java.util.concurrent.atomic.AtomicInteger();
+
+        private ReleaseOperation(UUID releaseId, byte[] gzipNbt,
+                                 CompletableFuture<Void> future) {
+            this.releaseId = releaseId;
+            this.gzipNbt = gzipNbt;
+            this.future = future;
+        }
+
+        private UUID releaseId() {
+            return releaseId;
+        }
+
+        private byte[] gzipNbt() {
+            return gzipNbt;
+        }
+
+        private CompletableFuture<Void> future() {
+            return future;
+        }
+
+        private int beginAttempt() {
+            return attempts.incrementAndGet();
+        }
+
+        private int attemptCount() {
+            return attempts.get();
+        }
+
+        private int beginConfirmationAttempt() {
+            return confirmationAttempts.incrementAndGet();
+        }
+    }
+
     private volatile boolean shutdown;
 
-    /** EXIT_BEGIN 前冻结：不再新增或释放占用，服务端权威清单才能稳定。 */
+    /** EXIT_BEGIN 前准备：拒绝新 claim，但允许已经登记的普通 release 继续完成。 */
+    private volatile boolean exitPreparing;
+
+    /** EXIT_BEGIN 后最终冻结：不再新增 claim 或启动普通 release。 */
     private volatile boolean exitFrozen;
 
     public ChunkClaimClient(ControlConnection conn, UUID groupId, int retrySeconds) {
+        this(conn, groupId, retrySeconds,
+                task -> ThreadPools.scheduler().schedule(
+                        task, Math.max(1, retrySeconds), TimeUnit.SECONDS));
+    }
+
+    /**
+     * 包可见测试构造器。生产路径仍统一使用 {@link ThreadPools#scheduler()}；注入点只替换
+     * “何时再次尝试”这一层，不改变请求线程和状态机语义。
+     */
+    ChunkClaimClient(ControlConnection conn, UUID groupId, int retrySeconds,
+                     Consumer<Runnable> retryScheduler) {
         this.conn = conn;
         this.groupId = groupId;
         this.retrySeconds = Math.max(1, retrySeconds);
+        this.retryScheduler = Objects.requireNonNull(retryScheduler, "retryScheduler");
     }
 
     // ------------------------------------------------------------ 区块申请
@@ -85,15 +162,24 @@ public final class ChunkClaimClient {
      * 消费方不得在回调里做重活/阻塞。
      */
     public CompletableFuture<ClaimOutcome> claimWithRetry(ChunkKey key) {
-        if (exitFrozen) {
-            return CompletableFuture.failedFuture(
-                    new IllegalStateException("主客户端正在提交退出事务"));
+        CompletableFuture<ClaimOutcome> future;
+        boolean start = false;
+        synchronized (lifecycleLock) {
+            if (shutdown || exitPreparing || exitFrozen) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("主客户端正在准备或提交退出事务"));
+            }
+            future = pending.get(key);
+            if (future == null) {
+                future = new CompletableFuture<>();
+                pending.put(key, future);
+                start = true;
+            }
         }
-        return pending.computeIfAbsent(key, k -> {
-            CompletableFuture<ClaimOutcome> future = new CompletableFuture<>();
-            attemptClaim(k, future);
-            return future;
-        });
+        if (start) {
+            attemptClaim(key, future);
+        }
+        return future;
     }
 
     /** 是否持有该区块的占用。 */
@@ -113,12 +199,29 @@ public final class ChunkClaimClient {
      * 过滤，不产生"上行被拒"日志噪音。
      */
     public void forgetLocal(ChunkKey key) {
-        claimed.remove(key);
+        ReleaseOperation release;
+        synchronized (lifecycleLock) {
+            claimed.remove(key);
+            serverDataKnown.remove(key);
+            release = releases.remove(key);
+        }
+        if (release != null) {
+            release.future().completeExceptionally(
+                    new IllegalStateException("区块占用已由其他组接管"));
+        }
     }
 
     /** 整体摘除全部本地占用记录（合并让出方在关停集成服务端前调用）。 */
     public void forgetAllLocal() {
-        claimed.clear();
+        Map<ChunkKey, ReleaseOperation> activeReleases;
+        synchronized (lifecycleLock) {
+            claimed.clear();
+            serverDataKnown.clear();
+            activeReleases = new java.util.HashMap<>(releases);
+            releases.clear();
+        }
+        activeReleases.values().forEach(operation -> operation.future().completeExceptionally(
+                new IllegalStateException("区块占用已由其他组接管")));
     }
 
     /** 已占用区块数（诊断用）。 */
@@ -126,11 +229,27 @@ public final class ChunkClaimClient {
         return claimed.size();
     }
 
+    /**
+     * 首次从种子生成的区块在卸载前必须至少写回一次；否则物理服没有任何可供下一组加载的
+     * 数据。已经释放或迁移的 key 没有本地基线，因而返回 false。
+     */
+    public boolean requiresInitialWrite(ChunkKey key) {
+        return Boolean.FALSE.equals(serverDataKnown.get(key));
+    }
+
+    /**
+     * 标记物理服已经耐久保存该区块。使用 replace 而不是 put，确保释放后的迟到 ACK 不会
+     * 重新创建基线，也不会让一个已经不归本组所有的区块重新进入本地状态机。
+     */
+    public void markServerDataKnown(ChunkKey key) {
+        serverDataKnown.replace(key, true);
+    }
+
     /** 发起一次申请；被拒/失败则安排下一轮重试。 */
     private void attemptClaim(ChunkKey key, CompletableFuture<ClaimOutcome> future) {
-        if (shutdown || exitFrozen) {
+        if (shutdown || exitPreparing || exitFrozen) {
             future.completeExceptionally(new IllegalStateException(
-                    exitFrozen ? "主客户端正在提交退出事务" : "组运行时已关停"));
+                    shutdown ? "组运行时已关停" : "主客户端正在准备或提交退出事务"));
             pending.remove(key, future);
             return;
         }
@@ -141,9 +260,9 @@ public final class ChunkClaimClient {
         req.addProperty("groupId", groupId.toString());
         conn.request(ControlMessage.of(MessageType.CHUNK_CLAIM_REQUEST, req))
                 .whenComplete((resp, err) -> {
-                    if (shutdown || exitFrozen) {
+                    if (shutdown || exitPreparing || exitFrozen) {
                         future.completeExceptionally(new IllegalStateException(
-                                exitFrozen ? "主客户端正在提交退出事务" : "组运行时已关停"));
+                                shutdown ? "组运行时已关停" : "主客户端正在准备或提交退出事务"));
                         pending.remove(key, future);
                         return;
                     }
@@ -155,10 +274,20 @@ public final class ChunkClaimClient {
                         return;
                     }
                     if (JsonUtil.getBoolean(resp.json(), "granted", false)) {
-                        claimed.add(key);
-                        pending.remove(key, future);
-                        future.complete(new ClaimOutcome(
-                                JsonUtil.getBoolean(resp.json(), "hasServerData", false)));
+                        boolean hasServerData = JsonUtil.getBoolean(
+                                resp.json(), "hasServerData", false);
+                        synchronized (lifecycleLock) {
+                            if (shutdown || exitPreparing || exitFrozen) {
+                                future.completeExceptionally(new IllegalStateException(
+                                        "主客户端正在准备或提交退出事务"));
+                                pending.remove(key, future);
+                                return;
+                            }
+                            serverDataKnown.put(key, hasServerData);
+                            claimed.add(key);
+                            pending.remove(key, future);
+                        }
+                        future.complete(new ClaimOutcome(hasServerData));
                         return;
                     }
                     // 被拒：区块保持未加载（规范：其他组占用中），按间隔重试。
@@ -180,8 +309,7 @@ public final class ChunkClaimClient {
 
     /** 安排下一轮申请重试。 */
     private void scheduleRetry(ChunkKey key, CompletableFuture<ClaimOutcome> future) {
-        ThreadPools.scheduler().schedule(() -> attemptClaim(key, future),
-                retrySeconds, TimeUnit.SECONDS);
+        retryScheduler.accept(() -> attemptClaim(key, future));
     }
 
     // ------------------------------------------------------------ 数据拉取
@@ -252,28 +380,224 @@ public final class ChunkClaimClient {
     // ------------------------------------------------------------ 释放
 
     /**
-     * 释放区块占用并携带最终区块数据（CHUNK_RELEASE，binary=压缩 NBT；可为 null）。
-     * 先摘 claimed 集：其后集成服务端的存盘上行会被 {@link ChunkUploadService}
-     * 过滤掉，不会出现"释放后上行被服务端拒绝"的日志噪音。
+     * 可靠释放区块占用。请求失败、应答类型错误、{@code released=false}，以及携带最终
+     * 数据时 {@code finalDataWritten=false}，都保留本地 claim 并通过异步 scheduler 无限重试。
+     * 只有物理服务端给出完整正 ACK 后，才原子清理 claim 与数据基线并完成返回 future。
      */
-    public void releaseWithData(ChunkKey key, byte[] gzipNbt) {
-        if (exitFrozen) {
-            // 退出事务会整组提交并释放；普通 CHUNK_RELEASE 会破坏固定清单与保护语义。
-            return;
+    public CompletableFuture<Void> releaseWhenConfirmed(ChunkKey key, byte[] gzipNbt) {
+        ReleaseOperation operation;
+        synchronized (lifecycleLock) {
+            if (shutdown) {
+                return CompletableFuture.failedFuture(new IllegalStateException("组运行时已关停"));
+            }
+            if (exitFrozen) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("退出清单已冻结，禁止启动新的区块释放"));
+            }
+            if (!claimed.contains(key)) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("区块不属于当前组，不能释放: " + key.asString()));
+            }
+            operation = releases.get(key);
+            if (operation == null) {
+                byte[] payload = gzipNbt == null ? null : gzipNbt.clone();
+                operation = new ReleaseOperation(
+                        UUID.randomUUID(), payload, new CompletableFuture<>());
+                releases.put(key, operation);
+            } else {
+                // 同一 key 的预卸载请求只允许一个在途事务；后续调用共享同一 future，
+                // 防止重复 CHUNK_RELEASE 造成服务端竞争和本地卸载顺序失真。
+                return operation.future();
+            }
         }
-        claimed.remove(key);
+        attemptRelease(key, operation);
+        return operation.future();
+    }
+
+    /** 旧调用点兼容层：保留返回 future，调用方可等待；实现本身不再 fire-and-forget。 */
+    public CompletableFuture<Void> releaseWithData(ChunkKey key, byte[] gzipNbt) {
+        return releaseWhenConfirmed(key, gzipNbt);
+    }
+
+    /** 发起或继续一次释放尝试；已开始的操作在 exitFrozen 后仍可继续重试。 */
+    private void attemptRelease(ChunkKey key, ReleaseOperation operation) {
+        synchronized (lifecycleLock) {
+            if (releases.get(key) != operation) {
+                return;
+            }
+            if (shutdown) {
+                failRelease(key, operation, new IllegalStateException("组运行时已关停"));
+                return;
+            }
+        }
+        operation.beginAttempt();
         JsonObject req = new JsonObject();
         req.addProperty("dimension", key.dimension());
         req.addProperty("x", key.x());
         req.addProperty("z", key.z());
         req.addProperty("groupId", groupId.toString());
-        conn.request(ControlMessage.of(MessageType.CHUNK_RELEASE, req, gzipNbt))
-                .whenComplete((resp, err) -> {
-                    if (err != null) {
-                        // 释放失败兜底：断连时服务端会 releaseAll，占用不会永久泄漏
-                        LOGGER.warn("区块释放请求失败（服务端断连清理兜底）: {}", key.asString());
-                    }
-                });
+        req.addProperty("releaseId", operation.releaseId().toString());
+        CompletableFuture<ControlMessage> responseFuture;
+        try {
+            responseFuture = conn.request(ControlMessage.of(
+                    MessageType.CHUNK_RELEASE, req, operation.gzipNbt()));
+            if (responseFuture == null) {
+                throw new IllegalStateException("控制连接返回 null future");
+            }
+        } catch (Throwable error) {
+            scheduleReleaseRetry(key, operation, error);
+            return;
+        }
+        responseFuture.whenComplete((resp, err) -> {
+            if (err == null && isPositiveReleaseAck(resp, operation.gzipNbt())) {
+                completeRelease(key, operation);
+            } else {
+                Throwable cause = err != null ? err
+                        : new IllegalStateException("区块释放未获完整正 ACK");
+                scheduleReleaseRetry(key, operation, cause);
+            }
+        });
+    }
+
+    private boolean isPositiveReleaseAck(ControlMessage response, byte[] gzipNbt) {
+        if (response == null || response.type() != MessageType.CHUNK_RELEASE_ACK
+                || !JsonUtil.getBoolean(response.json(), "released", false)) {
+            return false;
+        }
+        return gzipNbt == null || gzipNbt.length == 0
+                || JsonUtil.getBoolean(response.json(), "finalDataWritten", false);
+    }
+
+    private void scheduleReleaseRetry(ChunkKey key, ReleaseOperation operation, Throwable cause) {
+        synchronized (lifecycleLock) {
+            if (releases.get(key) != operation || shutdown) {
+                return;
+            }
+        }
+        int attempt = operation.attemptCount();
+        // 断网时每个区块都会无限轮询。只记录首次和每 30 次里程碑，既能确认重试
+        // 仍在推进，又不会让 latest.log 被每秒重复消息淹没。
+        if (attempt == 1 || attempt % 30 == 0) {
+            LOGGER.warn("区块释放第 {} 次未确认，将继续重试: {} ({})",
+                    attempt, key.asString(), cause.toString());
+        }
+        retryScheduler.accept(() -> attemptRelease(key, operation));
+    }
+
+    private void completeRelease(ChunkKey key, ReleaseOperation operation) {
+        boolean completed;
+        synchronized (lifecycleLock) {
+            completed = releases.remove(key, operation);
+            if (completed) {
+                // 先在同一临界区摘除 claim 与基线，再完成 future；任何后续上传都会看到
+                // “已释放”并被过滤，迟到的 markServerDataKnown 也只能 replace 现有项。
+                claimed.remove(key);
+                serverDataKnown.remove(key);
+            }
+        }
+        if (completed) {
+            int attempts = operation.attemptCount();
+            if (attempts > 1) {
+                LOGGER.info("区块释放在第 {} 次尝试获得确认: {}",
+                        attempts, key.asString());
+            } else {
+                LOGGER.debug("区块释放已确认: {}", key.asString());
+            }
+            // 正释放 ACK 已足以开放原版卸载；必须先完成屏障，再启动纯垃圾回收。
+            // 即使连接/调度器正好关闭，回执确认异常也绝不能把已成功的卸载重新卡住。
+            operation.future().complete(null);
+            attemptReceiptConfirmation(key, operation);
+        }
+    }
+
+    /**
+     * 后台确认服务端成功回执已送达。确认 ACK 丢失时可安全无限重放：服务端即使已经
+     * 删除回执也会返回 accepted=true；本流程不重新加入 releases，因而不阻塞卸载。
+     */
+    private void attemptReceiptConfirmation(
+            ChunkKey key, ReleaseOperation operation) {
+        if (shutdown) {
+            return;
+        }
+        int attempt = operation.beginConfirmationAttempt();
+        JsonObject req = new JsonObject();
+        req.addProperty("releaseId", operation.releaseId().toString());
+        req.addProperty("groupId", groupId.toString());
+        CompletableFuture<ControlMessage> responseFuture;
+        try {
+            responseFuture = conn.request(ControlMessage.of(
+                    MessageType.CHUNK_RELEASE_RECEIPT_CONFIRM, req));
+            if (responseFuture == null) {
+                throw new IllegalStateException("控制连接返回 null future");
+            }
+        } catch (Throwable failure) {
+            scheduleReceiptConfirmationRetry(
+                    key, operation, attempt, failure);
+            return;
+        }
+        responseFuture.whenComplete((response, failure) -> {
+            boolean accepted = failure == null
+                    && response != null
+                    && response.type()
+                    == MessageType.CHUNK_RELEASE_RECEIPT_CONFIRM
+                    && JsonUtil.getBoolean(
+                    response.json(), "accepted", false);
+            if (accepted) {
+                if (attempt > 1) {
+                    LOGGER.debug("区块释放回执在第 {} 次确认后已回收: {}",
+                            attempt, key.asString());
+                }
+                return;
+            }
+            scheduleReceiptConfirmationRetry(
+                    key, operation, attempt,
+                    failure != null ? failure
+                            : new IllegalStateException("释放回执确认未获正 ACK"));
+        });
+    }
+
+    private void scheduleReceiptConfirmationRetry(
+            ChunkKey key, ReleaseOperation operation,
+            int attempt, Throwable cause) {
+        if (shutdown) {
+            return;
+        }
+        if (attempt == 1 || attempt % 30 == 0) {
+            LOGGER.debug("区块释放回执第 {} 次确认失败，后台继续重试: {} ({})",
+                    attempt, key.asString(), cause.toString());
+        }
+        try {
+            retryScheduler.accept(() ->
+                    attemptReceiptConfirmation(key, operation));
+        } catch (RuntimeException schedulingFailure) {
+            // 回执最多暂时留到周期快照/整组清理；绝不能影响已经开放的本地卸载。
+            LOGGER.debug("区块释放回执确认调度器已停止: {} ({})",
+                    key.asString(), schedulingFailure.toString());
+        }
+    }
+
+    private void failRelease(ChunkKey key, ReleaseOperation operation, Throwable cause) {
+        if (releases.remove(key, operation)) {
+            operation.future().completeExceptionally(cause);
+        }
+    }
+
+    /**
+     * 退出准备阶段：停止新的 claim 并终止未决申请。已经登记的普通 release 不受影响，
+     * 这样预卸载屏障可以在网络恢复后继续完成；调用方应等待它们清空后再 freeze。
+     */
+    public void beginExitPreparation() {
+        Map<ChunkKey, CompletableFuture<ClaimOutcome>> pendingClaims;
+        synchronized (lifecycleLock) {
+            if (shutdown || exitPreparing) {
+                return;
+            }
+            exitPreparing = true;
+            pendingClaims = new java.util.HashMap<>(pending);
+            pending.clear();
+        }
+        pendingClaims.values().forEach(future -> future.completeExceptionally(
+                new IllegalStateException("主客户端正在准备退出事务")));
     }
 
     /**
@@ -281,22 +605,38 @@ public final class ChunkClaimClient {
      * 最终由 EXIT_COMMIT 在物理服整组释放。
      */
     public Set<ChunkKey> freezeForExit() {
-        exitFrozen = true;
-        for (Map.Entry<ChunkKey, CompletableFuture<ClaimOutcome>> entry : pending.entrySet()) {
-            entry.getValue().completeExceptionally(
-                    new IllegalStateException("主客户端正在提交退出事务"));
+        Map<ChunkKey, CompletableFuture<ClaimOutcome>> pendingClaims;
+        Set<ChunkKey> snapshot;
+        synchronized (lifecycleLock) {
+            exitPreparing = true;
+            exitFrozen = true;
+            pendingClaims = new java.util.HashMap<>(pending);
+            pending.clear();
+            snapshot = Set.copyOf(claimed);
         }
-        pending.clear();
-        return Set.copyOf(claimed);
+        pendingClaims.values().forEach(future -> future.completeExceptionally(
+                new IllegalStateException("主客户端正在提交退出事务")));
+        return snapshot;
     }
 
     /** 关停：未决申请全部异常完成（区块加载链随集成服务端停摆，不泄漏）。 */
     public void shutdown() {
-        shutdown = true;
-        for (Map.Entry<ChunkKey, CompletableFuture<ClaimOutcome>> entry : pending.entrySet()) {
-            entry.getValue().completeExceptionally(new IllegalStateException("组运行时已关停"));
+        Map<ChunkKey, CompletableFuture<ClaimOutcome>> pendingClaims;
+        Map<ChunkKey, ReleaseOperation> activeReleases;
+        synchronized (lifecycleLock) {
+            shutdown = true;
+            exitPreparing = true;
+            exitFrozen = true;
+            pendingClaims = new java.util.HashMap<>(pending);
+            pending.clear();
+            activeReleases = new java.util.HashMap<>(releases);
+            releases.clear();
+            claimed.clear();
+            serverDataKnown.clear();
         }
-        pending.clear();
-        claimed.clear();
+        pendingClaims.values().forEach(future -> future.completeExceptionally(
+                new IllegalStateException("组运行时已关停")));
+        activeReleases.values().forEach(operation -> operation.future().completeExceptionally(
+                new IllegalStateException("组运行时已关停")));
     }
 }

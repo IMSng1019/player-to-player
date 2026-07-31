@@ -8,6 +8,7 @@ import imsng.player_to_player.group.PresyncStore;
 import imsng.player_to_player.registry.ChunkKey;
 import net.minecraft.Util;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ChunkMap;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
@@ -20,6 +21,7 @@ import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.Optional;
@@ -28,7 +30,11 @@ import java.util.concurrent.CompletableFuture;
 /**
  * 区块加载门控 + 物理服务端存盘取消（Phase 2 核心 Mixin，规范"特殊的区块加载"）。
  *
- * <h2>注入点一：{@code readChunk(ChunkPos)} @RETURN —— 主客户端集成服务端的申请门控</h2>
+ * <h2>注入点一：{@code scheduleUnload(long, ChunkHolder)} @HEAD —— 预卸载 ACK 屏障</h2>
+ * 原版取得 holder.chunkToSave 前，把物理服最终写回与释放确认 future 作为 save dependency
+ * 加入 holder。ACK 前原版卸载链不会继续；ACK 后仍完全沿用原版保存与内存移除流程。
+ *
+ * <h2>注入点二：{@code readChunk(ChunkPos)} @RETURN —— 主客户端集成服务端的申请门控</h2>
  * readChunk 是原版"从磁盘读区块 NBT"的唯一入口（scheduleChunkLoad 调用；已用
  * javap 核实为 private、返回 {@code CompletableFuture<Optional<CompoundTag>>}）。
  * 世代管线的一切后续（ChunkSerializer.read、各 ChunkStatus 生成步骤）都挂在这个
@@ -48,7 +54,7 @@ import java.util.concurrent.CompletableFuture;
  * 门控条件 {@link GroupRuntime#isManagedLevel}（一次 volatile 读）：单人游戏、
  * 服务端、未接管的集成服务端一律走原版路径，零行为差异。
  *
- * <h2>注入点二：{@code save(ChunkAccess)} @HEAD —— 物理服务端存盘取消</h2>
+ * <h2>注入点三：{@code save(ChunkAccess)} @HEAD —— 物理服务端存盘取消</h2>
  * 物理服务端在玩家登录期间会加载（乃至生成）玩家周边区块，这些<b>内存副本
  * 不参与演算、注定陈旧</b>。若放任原版的卸载存盘/自动存盘，会发生：
  * 主客户端上行了新数据 → IOWorker 写入 MCA → 服务端稍后卸载陈旧内存区块 →
@@ -83,7 +89,27 @@ public abstract class ChunkMapMixin {
     @Unique
     private static volatile boolean player_to_player$saveBlockLogged = false;
 
-    // ------------------------------------------------- 注入点一：加载门控
+    // ----------------------------------------------- 注入点一：预卸载屏障
+
+    /**
+     * 原版把区块放入 pendingUnloads 前，先把物理服释放确认 future 并入 holder 的
+     * chunkToSave。这里不取消 scheduleUnload：ACK 完成后原版继续执行保存、实体卸载与
+     * 内存移除；失败时依赖保持未完成，区块自然停留在预卸载状态。
+     */
+    @Inject(method = "scheduleUnload", at = @At("HEAD"))
+    private void player_to_player$installPreUnloadBarrier(
+            long packedPos, ChunkHolder holder, CallbackInfo ci) {
+        if (!GroupRuntime.isManagedLevel(this.level)) {
+            return;
+        }
+        CompletableFuture<ChunkAccess> originalChunkToSave = holder.getChunkToSave();
+        CompletableFuture<Void> dependency = GroupRuntime.beginChunkPreUnload(
+                this.level, originalChunkToSave);
+        ((ChunkHolderSaveDependencyAccess) holder).player_to_player$addSaveDependency(
+                "player_to_player:pre_unload", dependency);
+    }
+
+    // ------------------------------------------------- 注入点二：加载门控
 
     @Inject(method = "readChunk", at = @At("RETURN"), cancellable = true)
     private void player_to_player$gateChunkLoad(
@@ -120,7 +146,7 @@ public abstract class ChunkMapMixin {
         }));
     }
 
-    // -------------------------------------------- 注入点二：物理服务端存盘取消
+    // -------------------------------------------- 注入点三：物理服务端存盘取消
 
     @Inject(method = "save", at = @At("HEAD"), cancellable = true)
     private void player_to_player$blockPhysicalServerSave(

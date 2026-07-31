@@ -152,6 +152,10 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
 - 不改动原版存档格式与网络协议语义；Mixin 全部配置门控（关掉即回退原版行为）。
 - 不引入第三方依赖：Netty/GSON 用 MC 自带，加密用 JDK，HTTP 用 `java.net.http`。
 - Mojang 官方映射；`src/main` 不得引用客户端专用类。
+- 当前控制协议版本为 **v4**：`EXIT_COMMIT` 增加 `writtenChunks[]` 并取消新事务的
+  preserveExisting 区块帧；`CHUNK_RELEASE` 增加稳定 `releaseId`，新增
+  `CHUNK_RELEASE_RECEIPT_CONFIRM(29)`。这是显式的不向后兼容变更，v3/v4 节点握手时
+  直接拒绝混连。
 
 ## 11. Phase 2：组世界（集成服务端接管 + P2P 隧道 + 区块数据面）
 
@@ -176,10 +180,10 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
 - **编排性断开**：`WorldSwitcher` 的一次性切换旗标让 `WorldSession.onLeave` 跳过会话
   拆除；副客户端连隧道口触发的 JOIN 由隧道端口登记（`isTunnelAddress`）跳过。
   与物理服务端的控制连接活到组世界全程（区块申请/上行/位置上报都走它）。
-- **退出时序**：主客户端退出本地世界时 DISCONNECT 先于集成服务端停止，而停服
-  saveAll 的最终区块上行必须赶在控制连接关闭前 —— onLeave 检测
-  `GroupRuntime.isArmedOrActive()` 延迟拆除，`SERVER_STOPPED`（detach）后经
-  stopListener 补拆。
+- **退出时序**：主客户端先停止新 claim，并等待所有普通预卸载屏障完成，再冻结剩余
+  ownership 清单。随后才允许集成服务端停止；停服 saveAll 产生的最后脏快照继续进入
+  未确认集合。`SERVER_STOPPED`（detach）构建增量 bundle 后经 stopListener 补拆，
+  控制连接只有在物理服确认完整退出事务后才关闭。
 
 ### 11.2 区块申请门控与数据面（规范"特殊的区块加载"）
 
@@ -193,9 +197,24 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
   唯一咽喉（自动存盘/卸载存盘/停服 saveAll 殊途同归），凡原版写盘必上行
   CHUNK_DATA_UPLOAD(24)——与原版 unsaved 脏标记语义对齐，天然去抖；
   `ChunkUploadService` 按区块合并 + 有界队列 + 单 io 工作线程，绝不反压主线程。
-- **卸载释放（Fabric CHUNK_UNLOAD）**：主线程序列化最终 NBT → CHUNK_RELEASE(22)
-  携带二进制 → 服务端**先写回刷盘再释放占用**（顺序保证释放后其他组的
-  hasServerData 探测立刻可见）。
+- **预卸载屏障（ChunkMap.scheduleUnload HEAD）**：通过
+  `ChunkHolder.addSaveDependency` 把可靠 CHUNK_RELEASE future 接入原版卸载链。
+  区块先进入 PRE_UNLOAD；物理服正 ACK 前原版不能移除内存区块。服务端已有基线且
+  `unsaved=false`、无未确认快照时只释放 ownership；新生成、脏或未确认区块才在主线程
+  序列化最终 NBT。异常、断线、负 ACK 均保持屏障并无限重试。Fabric CHUNK_UNLOAD 只作
+  防御性兜底，不再承担正常最终序列化。
+- **原子写回释放**：服务端对同一 ChunkKey 的实时上行、退出写入与最终释放共用分片锁；
+  CHUNK_RELEASE 在锁内严格执行“先查 `releaseId` 回执 → 最终 NBT 写回并 flush → 单条 WAL
+  同时建立成功回执并删除 ownership → 解锁”。正 ACK 丢失或服务端重启后，相同操作直接
+  重放原 ACK，不再次写 NBT，也不会因 ownership 已删除而永久卡住预卸载。迟到实时上传
+  只能先于最终写回完成，或在释放后因所有权消失而被拒绝，不能覆盖最终态。
+- **回执回收**：客户端收到正释放 ACK 后立即完成 save dependency、允许本地卸载；随后在
+  后台可靠重试 `CHUNK_RELEASE_RECEIPT_CONFIRM(29)`。确认不增加卸载 RTT；服务端在内存删除
+  回执并随周期 checkpoint 批量落盘，避免每次卸载增加第二次 fsync。服务端在释放请求进入
+  IO 队列前按 `releaseId` 计数；即使 confirmation 已到达，也必须等该 ID 的所有已接收请求
+  （包括仍在排队的旧重试）排空后才真正删除回执，防止迟到请求误释放同组重新 claim 的新区块。
+  确认删除前崩溃最多让已无害回执暂时复活，重复确认仍成功；整组退出/断连也会统一清理。
+  checkpoint 按“WAL 屏障 → ownership 快照 → 回执原子快照 → 清 WAL”落盘，覆盖双文件崩溃窗口。
 - **MCA 单区块写回（服务端 ChunkDataHandlers）**：不自实现 MCA 格式，直接走服务端
   自身存储栈 `level.getChunkSource().chunkMap.write(pos, tag)`（IOWorker 线程安全，
   region 内单区块定位写入）。校验：占用组核对、解压上限 64MB、xPos/zPos 一致、
@@ -204,6 +223,21 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
   MCA 唯一写入来源收敛为客户端上行，消灭覆盖竞态。
 - **位置上报**：集成服务端每 20 tick 把组内全部玩家位置经 PLAYER_POS_UPDATE(32)
   上报服务端玩家表。
+
+#### 11.2.1 服务端数据基线与增量退出
+
+- 每个 claim 保存 `hasServerData` 基线；任意实时 CHUNK_DATA_UPLOAD 正 ACK 后转为已知。
+  实时上行按对象版本确认，旧 ACK 不能清除同键后来产生的新快照。
+- 正常退出的 `ExitManifest.chunks` 仍是完整 ownership 清单，用于原子整组释放；
+  `ExitBundle.writtenChunks` 只包含最后一次物理服确认之后仍未确认的区块。干净清单项
+  隐式保留服务端现状，不再发送 preserveExisting 帧，也不在服务端逐项读 region。
+- `EXIT_COMMIT` 持久化排序后的 `writtenChunks[]`。服务端要求本轮 received 集合与声明
+  集合完全相等，只读取并应用这些暂存文件，全部区块完成后统一 flush 一次，再释放完整
+  manifest。事务在 committed 后崩溃时可按该计划准确恢复。
+- 旧事务 JSON 缺少 `writtenChunks` 时进入 legacy disposition，继续识别旧 data/marker
+  暂存格式；在线协议不兼容，因此 `Protocol.VERSION=4`。
+- 退出统计日志记录 `ownedChunks`、`writtenChunks` 和最终压缩字节数，便于确认耗时是否
+  随脏区块量而非 ownership 总量增长。
 
 ### 11.3 P2P 隧道传输栈
 

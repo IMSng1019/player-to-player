@@ -46,12 +46,16 @@ class ExitTransactionStoreTest {
         assertEquals(manifest, pending.get(SHUTDOWN_ID).manifest());
         assertFalse(pending.get(SHUTDOWN_ID).committed());
 
-        store.save(new ExitTransactionRecord(manifest, true));
+        store.save(new ExitTransactionRecord(
+                manifest, true, Set.of(OVERWORLD)));
 
         ExitTransactionRecord committed =
                 new ExitTransactionStore(tempDir).load().get(SHUTDOWN_ID);
         assertTrue(committed.committed());
         assertEquals(Set.of(OVERWORLD, NETHER), committed.manifest().chunks());
+        assertEquals(Set.of(OVERWORLD), committed.writtenChunks());
+        assertTrue(committed.writtenChunksDeclared());
+        assertFalse(committed.legacyDisposition());
     }
 
     @Test
@@ -79,5 +83,7 @@ class ExitTransactionStoreTest {
         assertTrue(recovered.committed());
         assertTrue(recovered.dataApplied());
         assertFalse(recovered.cleanupComplete());
+        assertTrue(recovered.legacyDisposition());
+        assertTrue(recovered.writtenChunks().isEmpty());
     }
 }

@@ -36,7 +36,20 @@ public final class RegistryMutationJournal {
             new RegistryMutationJournal(null);
 
     private final Path file;
+    /** 周期 checkpoint 后保存成功回执的原子快照；WAL 负责跨双文件写入窗口恢复。 */
+    private final Path receiptSnapshotFile;
     private final int maxRecordBytes;
+
+    /** 注册表 WAL 重放后的完整状态；回执与 ownership 必须来自同一条有序日志。 */
+    public record ReplayState(
+            Map<ChunkKey, UUID> claims,
+            Map<UUID, ChunkReleaseReceipt> releaseReceipts) {
+
+        public ReplayState {
+            claims = Map.copyOf(claims);
+            releaseReceipts = Map.copyOf(releaseReceipts);
+        }
+    }
 
     /** 只表示写入中断造成的帧不完整；仅最后一条允许截断恢复。 */
     private static final class RecoverableTailException
@@ -60,6 +73,11 @@ public final class RegistryMutationJournal {
             throw new IllegalArgumentException("日志单帧上限必须为正数");
         }
         this.file = file;
+        this.receiptSnapshotFile = file != null
+                // JsonRegistryStore 会把同目录 *.json 当作维度快照并清理；专用扩展名
+                // 防止 ownership 保存阶段误删回执，破坏双文件崩溃恢复协议。
+                ? file.resolveSibling(file.getFileName() + ".receipts")
+                : null;
         this.maxRecordBytes = maxRecordBytes;
     }
 
@@ -77,6 +95,80 @@ public final class RegistryMutationJournal {
         JsonObject json = base("remove", groupId);
         json.addProperty("chunk", key.asString());
         append(json);
+    }
+
+    /**
+     * 原子记录一次成功释放：同一 WAL 帧同时代表 ownership 删除与幂等回执建立。
+     * append 返回前帧已经 force，因而不存在“owner 已删但成功凭据尚未落盘”的窗口。
+     */
+    public void appendRelease(ChunkReleaseReceipt receipt) {
+        Objects.requireNonNull(receipt, "receipt");
+        append(releaseJson(receipt));
+    }
+
+    /** 读取上次 checkpoint 已整体落盘的成功回执。损坏时拒绝启动，不能丢失幂等证据。 */
+    public synchronized Map<UUID, ChunkReleaseReceipt> loadReleaseReceipts() {
+        if (receiptSnapshotFile == null
+                || !Files.isRegularFile(receiptSnapshotFile)) {
+            return Map.of();
+        }
+        try {
+            JsonObject root = JsonUtil.readFile(
+                    receiptSnapshotFile, JsonObject.class);
+            if (root == null || JsonUtil.getInt(root, "version", -1) != 1) {
+                throw new IllegalArgumentException("释放回执快照版本缺失或不支持");
+            }
+            JsonElement rawReceipts = root.get("receipts");
+            if (rawReceipts == null || !rawReceipts.isJsonArray()) {
+                throw new IllegalArgumentException("释放回执快照缺少 receipts 数组");
+            }
+            Map<UUID, ChunkReleaseReceipt> result = new HashMap<>();
+            for (JsonElement raw : rawReceipts.getAsJsonArray()) {
+                if (!raw.isJsonObject()) {
+                    throw new IllegalArgumentException("释放回执条目不是对象");
+                }
+                JsonObject json = raw.getAsJsonObject();
+                UUID group = UUID.fromString(requiredString(json, "group"));
+                ChunkReleaseReceipt receipt = parseReleaseReceipt(json, group);
+                ChunkReleaseReceipt duplicate = result.putIfAbsent(
+                        receipt.releaseId(), receipt);
+                if (duplicate != null) {
+                    throw new IllegalArgumentException(
+                            "释放回执快照含重复 releaseId: " + receipt.releaseId());
+                }
+            }
+            return Map.copyOf(result);
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                    "读取释放回执快照失败: " + receiptSnapshotFile, e);
+        }
+    }
+
+    /**
+     * 原子保存全部成功回执。调用顺序必须是 WAL checkpoint、ownership 快照、本方法、
+     * 最后 clear WAL；任一步崩溃都能由尚存 WAL 收敛到同一状态。
+     */
+    public synchronized void saveReleaseReceipts(
+            Map<UUID, ChunkReleaseReceipt> receipts) {
+        if (receiptSnapshotFile == null) {
+            return;
+        }
+        Objects.requireNonNull(receipts, "receipts");
+        JsonObject root = new JsonObject();
+        root.addProperty("version", 1);
+        JsonArray array = new JsonArray();
+        receipts.values().stream()
+                .sorted(java.util.Comparator.comparing(
+                        receipt -> receipt.releaseId().toString()))
+                .map(RegistryMutationJournal::releaseJson)
+                .forEach(array::add);
+        root.add("receipts", array);
+        try {
+            JsonUtil.writeFileAtomic(receiptSnapshotFile, root);
+        } catch (IOException e) {
+            throw new IllegalStateException(
+                    "保存释放回执快照失败: " + receiptSnapshotFile, e);
+        }
     }
 
     public void appendRemoveGroup(UUID groupId) {
@@ -122,9 +214,17 @@ public final class RegistryMutationJournal {
 
     public synchronized Map<ChunkKey, UUID> replay(
             Map<ChunkKey, UUID> baseline) {
+        return replayState(baseline, Map.of()).claims();
+    }
+
+    /** 在快照后端的 ownership 与回执基线上重放 WAL。 */
+    public synchronized ReplayState replayState(
+            Map<ChunkKey, UUID> baseline,
+            Map<UUID, ChunkReleaseReceipt> receiptBaseline) {
         Map<ChunkKey, UUID> result = new HashMap<>(baseline);
+        Map<UUID, ChunkReleaseReceipt> receipts = new HashMap<>(receiptBaseline);
         if (file == null || !Files.isRegularFile(file)) {
-            return result;
+            return new ReplayState(result, receipts);
         }
         try (FileChannel channel = FileChannel.open(file,
                 StandardOpenOption.READ, StandardOpenOption.WRITE)) {
@@ -163,11 +263,11 @@ public final class RegistryMutationJournal {
                             bytes, 0, length, StandardCharsets.UTF_8);
                     if (!text.isBlank()) {
                         try {
-                            apply(result, decodeRecord(text));
+                            apply(result, receipts, decodeRecord(text));
                         } catch (RecoverableTailException e) {
                             if (offset == fileSize) {
                                 truncateTail(channel, lineStart);
-                                return result;
+                                return new ReplayState(result, receipts);
                             }
                             throw new IllegalStateException(
                                     "注册表变更日志损坏，行 " + lineNumber, e);
@@ -188,7 +288,7 @@ public final class RegistryMutationJournal {
                 // 必然属于未确认写入，截断后才能保证下次 append 不接在残片后。
                 truncateTail(channel, lineStart);
             }
-            return result;
+            return new ReplayState(result, receipts);
         } catch (IOException e) {
             throw new IllegalStateException("读取注册表变更日志失败: " + file, e);
         }
@@ -253,7 +353,9 @@ public final class RegistryMutationJournal {
         }
     }
 
-    private static void apply(Map<ChunkKey, UUID> state, JsonObject json) {
+    private static void apply(Map<ChunkKey, UUID> state,
+                              Map<UUID, ChunkReleaseReceipt> receipts,
+                              JsonObject json) {
         String type = requiredString(json, "type");
         if ("replace_all".equals(type)) {
             Map<ChunkKey, UUID> replacement = parseClaimEntries(json);
@@ -267,10 +369,35 @@ public final class RegistryMutationJournal {
                     ChunkKey.parse(requiredString(json, "chunk")), group);
             case "remove" -> state.remove(
                     ChunkKey.parse(requiredString(json, "chunk")), group);
-            case "remove_group" -> state.entrySet().removeIf(
-                    entry -> group.equals(entry.getValue()));
-            case "remove_keys" -> parseChunks(json).forEach(
-                    key -> state.remove(key, group));
+            case "release" -> {
+                ChunkReleaseReceipt receipt = parseReleaseReceipt(json, group);
+                ChunkReleaseReceipt existing = receipts.get(receipt.releaseId());
+                if (existing != null) {
+                    if (!existing.equals(receipt)) {
+                        throw new IllegalArgumentException(
+                                "releaseId 对应的耐久回执内容冲突: "
+                                        + receipt.releaseId());
+                    }
+                    // 同一帧若因外部复制重复出现也必须是严格幂等的，不能删除其后
+                    // 可能由同组重新取得的新 ownership。
+                    return;
+                }
+                state.remove(receipt.key(), group);
+                receipts.put(receipt.releaseId(), receipt);
+            }
+            case "remove_group" -> {
+                state.entrySet().removeIf(
+                        entry -> group.equals(entry.getValue()));
+                receipts.values().removeIf(
+                        receipt -> group.equals(receipt.groupId()));
+            }
+            case "remove_keys" -> {
+                parseChunks(json).forEach(key -> state.remove(key, group));
+                // remove_keys 只用于整组退出清单提交；会话终结后不会再有合法的
+                // 旧释放重试，连同该组遗留回执一起收敛，避免异常退出造成泄漏。
+                receipts.values().removeIf(
+                        receipt -> group.equals(receipt.groupId()));
+            }
             case "replace_group" -> {
                 Set<ChunkKey> replacement = parseChunks(json);
                 state.entrySet().removeIf(entry -> group.equals(entry.getValue()));
@@ -295,6 +422,16 @@ public final class RegistryMutationJournal {
         JsonObject json = new JsonObject();
         json.addProperty("type", type);
         json.addProperty("group", groupId.toString());
+        return json;
+    }
+
+    private static JsonObject releaseJson(ChunkReleaseReceipt receipt) {
+        JsonObject json = base("release", receipt.groupId());
+        json.addProperty("releaseId", receipt.releaseId().toString());
+        json.addProperty("chunk", receipt.key().asString());
+        json.addProperty("payloadBytes", receipt.payloadBytes());
+        json.addProperty("payloadSha256", receipt.payloadSha256());
+        json.addProperty("finalDataWritten", receipt.finalDataWritten());
         return json;
     }
 
@@ -406,6 +543,17 @@ public final class RegistryMutationJournal {
             }
         }
         return result;
+    }
+
+    private static ChunkReleaseReceipt parseReleaseReceipt(
+            JsonObject json, UUID group) {
+        UUID releaseId = UUID.fromString(requiredString(json, "releaseId"));
+        ChunkKey key = ChunkKey.parse(requiredString(json, "chunk"));
+        int payloadBytes = json.get("payloadBytes").getAsInt();
+        String payloadSha256 = requiredString(json, "payloadSha256");
+        boolean finalDataWritten = json.get("finalDataWritten").getAsBoolean();
+        return new ChunkReleaseReceipt(releaseId, key, group, payloadBytes,
+                payloadSha256, finalDataWritten);
     }
 
     private static Set<ChunkKey> parseChunks(JsonObject json) {

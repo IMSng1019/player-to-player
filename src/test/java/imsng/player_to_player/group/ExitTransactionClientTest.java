@@ -31,6 +31,81 @@ class ExitTransactionClientTest {
             new ChunkKey("minecraft:overworld", -7, 0);
 
     @Test
+    void cleanManifestChunksDoNotSendChunkPayloadMessages() {
+        ChunkKey cleanA = new ChunkKey("minecraft:overworld", 12, -3);
+        ChunkKey cleanB = new ChunkKey("minecraft:the_nether", 4, 9);
+        ExitManifest manifest = manifest(Set.of(cleanA, cleanB));
+        ExitBundle bundle = new ExitBundle(
+                manifest, Map.of(ID, new byte[]{1}), Map.of());
+        List<MessageType> sent = new ArrayList<>();
+        List<String> committedWritten = new ArrayList<>();
+        FakeFactory factory = new FakeFactory();
+        factory.connections.add(new ScriptedConnection(message -> {
+            sent.add(message.type());
+            return switch (message.type()) {
+                case EXIT_BEGIN -> CompletableFuture.completedFuture(
+                        beginAck(manifest, false));
+                case EXIT_PLAYER_DATA -> CompletableFuture.completedFuture(
+                        booleanAck(MessageType.EXIT_PLAYER_DATA, "written", true));
+                case EXIT_CHUNK_DATA -> CompletableFuture.completedFuture(
+                        booleanAck(MessageType.EXIT_CHUNK_DATA, "written", true));
+                case EXIT_COMMIT -> {
+                    if (message.json().has("writtenChunks")) {
+                        message.json().getAsJsonArray("writtenChunks")
+                                .forEach(element -> committedWritten.add(element.getAsString()));
+                    }
+                    yield CompletableFuture.completedFuture(booleanAck(
+                            MessageType.EXIT_COMMIT, "committed", true));
+                }
+                default -> throw new AssertionError(message.type());
+            };
+        }));
+
+        new ExitTransactionClient(factory, ignored -> {
+        }).commitUntilAccepted(bundle);
+
+        assertEquals(List.of(MessageType.EXIT_BEGIN, MessageType.EXIT_PLAYER_DATA,
+                MessageType.EXIT_COMMIT), sent);
+        assertTrue(committedWritten.isEmpty());
+    }
+
+    @Test
+    void commitDeclaresExactlyWrittenChunksInStableOrder() {
+        ChunkKey later = new ChunkKey("minecraft:overworld", 8, 1);
+        ChunkKey earlier = new ChunkKey("minecraft:overworld", -4, 2);
+        ExitManifest manifest = manifest(Set.of(later, earlier));
+        ExitBundle bundle = new ExitBundle(manifest,
+                Map.of(ID, new byte[]{1}),
+                Map.of(later, new byte[]{2}, earlier, new byte[]{3}));
+        List<String> committedWritten = new ArrayList<>();
+        FakeFactory factory = new FakeFactory();
+        factory.connections.add(new ScriptedConnection(message -> {
+            return switch (message.type()) {
+                case EXIT_BEGIN -> CompletableFuture.completedFuture(
+                        beginAck(manifest, false));
+                case EXIT_PLAYER_DATA, EXIT_CHUNK_DATA -> CompletableFuture.completedFuture(
+                        booleanAck(message.type(), "written", true));
+                case EXIT_COMMIT -> {
+                    if (message.json().has("writtenChunks")) {
+                        message.json().getAsJsonArray("writtenChunks")
+                                .forEach(element -> committedWritten.add(element.getAsString()));
+                    }
+                    yield CompletableFuture.completedFuture(booleanAck(
+                            MessageType.EXIT_COMMIT, "committed", true));
+                }
+                default -> throw new AssertionError(message.type());
+            };
+        }));
+
+        new ExitTransactionClient(factory, ignored -> {
+        }).commitUntilAccepted(bundle);
+
+        assertEquals(bundle.writtenChunks().stream()
+                        .map(ChunkKey::asString).sorted().toList(),
+                committedWritten);
+    }
+
+    @Test
     void beginRetriesForeverPolicyUntilConnectionReturnsAcceptedManifest()
             throws Exception {
         ExitManifest requested = manifest(Set.of());
@@ -58,7 +133,7 @@ class ExitTransactionClientTest {
             throws Exception {
         ExitManifest manifest = manifest(Set.of(CHUNK));
         ExitBundle bundle = new ExitBundle(manifest,
-                Map.of(ID, new byte[]{1}), Map.of(CHUNK, new byte[]{2}), Set.of());
+                Map.of(ID, new byte[]{1}), Map.of(CHUNK, new byte[]{2}));
         List<MessageType> first = new ArrayList<>();
         List<MessageType> second = new ArrayList<>();
         FakeFactory factory = new FakeFactory();
@@ -102,7 +177,7 @@ class ExitTransactionClientTest {
     void committedBeginSkipsPayloadReplay() throws Exception {
         ExitManifest manifest = manifest(Set.of(CHUNK));
         ExitBundle bundle = new ExitBundle(manifest,
-                Map.of(ID, new byte[]{1}), Map.of(CHUNK, new byte[]{2}), Set.of());
+                Map.of(ID, new byte[]{1}), Map.of(CHUNK, new byte[]{2}));
         List<MessageType> sent = new ArrayList<>();
         FakeFactory factory = new FakeFactory();
         factory.connections.add(new ScriptedConnection(message -> {
@@ -123,7 +198,7 @@ class ExitTransactionClientTest {
         byte[] large = new byte[ExitPayloadProtocol.FRAGMENT_BYTES * 2 + 17];
         java.util.Arrays.fill(large, (byte) 7);
         ExitBundle bundle = new ExitBundle(
-                manifest, Map.of(ID, large), Map.of(), Set.of());
+                manifest, Map.of(ID, large), Map.of());
         List<Integer> indexes = new ArrayList<>();
         List<Integer> sizes = new ArrayList<>();
         FakeFactory factory = new FakeFactory();

@@ -1,5 +1,6 @@
 package imsng.player_to_player.server;
 
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import imsng.player_to_player.group.ExitManifest;
 import imsng.player_to_player.netproto.ControlConnection;
@@ -17,7 +18,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -68,7 +71,8 @@ public final class ExitTransactionHandlers {
         boolean stageChunk(ExitManifest manifest, ChunkKey key, byte[] gzipNbt,
                            boolean preserveExisting);
 
-        void apply(ExitManifest manifest);
+        void apply(ExitManifest manifest,
+                   ExitTransactionLedger.ChunkDisposition disposition);
 
         void discard(ExitManifest manifest);
     }
@@ -409,14 +413,11 @@ public final class ExitTransactionHandlers {
                 try {
                 UUID peerId = connection.peerId();
                 UUID shutdownId = parseUuid(message.json(), "shutdownId");
+                Set<ChunkKey> writtenChunks = parseWrittenChunks(message.json());
                 ExitManifest manifest = ledger.manifest(peerId, shutdownId);
-                if (manifest != null && ledger.isCommitted(peerId, shutdownId)) {
-                    ensureCleanupComplete(manifest);
-                    committed[0] = true;
-                } else if (manifest != null
-                        && ledger.isReadyToCommit(peerId, shutdownId)) {
+                if (manifest != null) {
                     // 暂存对象已经逐个 force；先耐久写 committed 意图，再应用正式数据。
-                    if (ledger.commit(peerId, shutdownId)) {
+                    if (ledger.commit(peerId, shutdownId, writtenChunks)) {
                         ensureCleanupComplete(manifest);
                         // 只有正式数据和清理元数据全部耐久完成后才允许客户端关闭。
                         committed[0] = true;
@@ -442,7 +443,13 @@ public final class ExitTransactionHandlers {
             payloadStore.discard(manifest);
         } else if (!ledger.isDataApplied(
                 manifest.clientId(), manifest.shutdownId())) {
-            payloadStore.apply(manifest);
+            ExitTransactionLedger.ChunkDisposition disposition =
+                    ledger.chunkDisposition(
+                            manifest.clientId(), manifest.shutdownId());
+            if (disposition == null) {
+                throw new IllegalStateException("退出事务缺少 committed 区块处置计划");
+            }
+            payloadStore.apply(manifest, disposition);
             if (!ledger.markDataApplied(
                     manifest.clientId(), manifest.shutdownId())) {
                 throw new IllegalStateException("退出正式数据应用状态落盘失败");
@@ -491,6 +498,22 @@ public final class ExitTransactionHandlers {
                 json.get("z").getAsInt());
     }
 
+    private static Set<ChunkKey> parseWrittenChunks(JsonObject json) {
+        JsonElement element = json.get("writtenChunks");
+        if (element == null || !element.isJsonArray()) {
+            throw new IllegalArgumentException("EXIT_COMMIT 缺少 writtenChunks 数组");
+        }
+        Set<ChunkKey> writtenChunks = new HashSet<>();
+        for (JsonElement value : element.getAsJsonArray()) {
+            ChunkKey key = ChunkKey.parse(value.getAsString());
+            if (!writtenChunks.add(key)) {
+                throw new IllegalArgumentException(
+                        "EXIT_COMMIT writtenChunks 含重复区块: " + key.asString());
+            }
+        }
+        return Set.copyOf(writtenChunks);
+    }
+
     /** 仅供纯状态机单测使用；生产环境必须注入 {@link ExitPayloadStore}。 */
     private static final class VolatilePayloadStore implements PayloadStore {
         private record ChunkPayload(byte[] data, boolean preserve) {
@@ -518,6 +541,9 @@ public final class ExitTransactionHandlers {
         public synchronized boolean stageChunk(ExitManifest manifest, ChunkKey key,
                                                byte[] gzipNbt,
                                                boolean preserveExisting) {
+            if (preserveExisting) {
+                return false;
+            }
             if (!chunks.validate(manifest.groupId(), key, gzipNbt,
                     preserveExisting)) {
                 return false;
@@ -530,7 +556,9 @@ public final class ExitTransactionHandlers {
         }
 
         @Override
-        public synchronized void apply(ExitManifest manifest) {
+        public synchronized void apply(
+                ExitManifest manifest,
+                ExitTransactionLedger.ChunkDisposition disposition) {
             Map<UUID, byte[]> playerData = stagedPlayers.getOrDefault(
                     manifest.shutdownId(), Map.of());
             for (UUID playerId : manifest.playerIds()) {
@@ -541,7 +569,9 @@ public final class ExitTransactionHandlers {
             }
             Map<ChunkKey, ChunkPayload> chunkData = stagedChunks.getOrDefault(
                     manifest.shutdownId(), Map.of());
-            for (ChunkKey key : manifest.chunks()) {
+            Set<ChunkKey> requiredChunks = disposition.explicit()
+                    ? disposition.writtenChunks() : manifest.chunks();
+            for (ChunkKey key : requiredChunks) {
                 ChunkPayload payload = chunkData.get(key);
                 if (payload == null || !chunks.write(
                         manifest.groupId(), key, payload.data(), payload.preserve())) {

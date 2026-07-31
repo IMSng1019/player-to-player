@@ -69,6 +69,12 @@ public final class ChunkRegistry {
     /** 已取得 EXIT_BEGIN 保护确认、等待最终提交的组。 */
     private final java.util.Set<UUID> exitFrozenGroups = ConcurrentHashMap.newKeySet();
 
+    /**
+     * 已成功提交的普通区块释放回执。其生命周期跨越 ACK 丢失和服务端重启；写入必须
+     * 与对应 ownership 删除共用一条 {@link RegistryMutationJournal} 记录。
+     */
+    private final Map<UUID, ChunkReleaseReceipt> releaseReceipts = new HashMap<>();
+
     /** 写路径互斥锁：五格检查 + 登记必须是不可分割的整体。 */
     private final Object claimLock = new Object();
 
@@ -179,6 +185,91 @@ public final class ChunkRegistry {
         }
     }
 
+    /**
+     * 查询一次释放重试的既有成功回执。相同 releaseId 若绑定到不同请求，立即拒绝，
+     * 不能把 UUID 误复用掩盖成另一份区块数据已经写入。
+     */
+    public ChunkReleaseReceipt findReleaseReceipt(
+            UUID releaseId, ChunkKey key, UUID groupId,
+            int payloadBytes, String payloadSha256) {
+        synchronized (claimLock) {
+            ChunkReleaseReceipt receipt = releaseReceipts.get(releaseId);
+            if (receipt == null) {
+                return null;
+            }
+            if (!receipt.matchesRequest(
+                    key, groupId, payloadBytes, payloadSha256)) {
+                throw new IllegalArgumentException(
+                        "releaseId 已绑定到另一释放请求: " + releaseId);
+            }
+            return receipt;
+        }
+    }
+
+    /** 在途计数器确认 confirmation 确实对应已经建立且属于该组的成功回执。 */
+    boolean hasReleaseReceiptForGroup(UUID releaseId, UUID groupId) {
+        synchronized (claimLock) {
+            ChunkReleaseReceipt receipt = releaseReceipts.get(releaseId);
+            return receipt != null && groupId.equals(receipt.groupId());
+        }
+    }
+
+    /**
+     * 在最终数据已经按区块锁写入并 flush 后，原子建立成功回执并删除 ownership。
+     * WAL append 先于两项内存变更，因此进程在任意指令间崩溃，重启重放仍会同时看到
+     * 二者；相同操作重放直接返回原回执，不再次删除后来取得的 ownership。
+     *
+     * @return 成功或既有回执；owner 不符/退出冻结时返回 null
+     */
+    public ChunkReleaseReceipt completeRelease(ChunkReleaseReceipt receipt) {
+        if (receipt == null) {
+            throw new IllegalArgumentException("释放回执不能为空");
+        }
+        synchronized (claimLock) {
+            ChunkReleaseReceipt existing = findReleaseReceipt(
+                    receipt.releaseId(), receipt.key(), receipt.groupId(),
+                    receipt.payloadBytes(), receipt.payloadSha256());
+            if (existing != null) {
+                return existing;
+            }
+            if (exitFrozenGroups.contains(receipt.groupId())) {
+                return null;
+            }
+            ClaimInfo owner = claims.get(receipt.key());
+            if (owner == null || !receipt.groupId().equals(owner.groupId())) {
+                return null;
+            }
+            journal.appendRelease(receipt);
+            claims.remove(receipt.key());
+            releaseReceipts.put(receipt.releaseId(), receipt);
+            markDirtyLocked();
+            return receipt;
+        }
+    }
+
+    /**
+     * 客户端收到正 CHUNK_RELEASE_ACK 后确认回执可回收。删除属于纯垃圾回收，不影响
+     * ownership 正确性，因此只标脏并随 30 秒 checkpoint 批量持久化，避免每次卸载再做
+     * 一次 fsync。checkpoint 前崩溃最多让已无害的回执暂时复活；重复确认仍直接成功。
+     */
+    public boolean confirmReleaseReceipt(UUID releaseId, UUID groupId) {
+        if (releaseId == null || groupId == null) {
+            return false;
+        }
+        synchronized (claimLock) {
+            ChunkReleaseReceipt receipt = releaseReceipts.get(releaseId);
+            if (receipt == null) {
+                return true;
+            }
+            if (!groupId.equals(receipt.groupId())) {
+                return false;
+            }
+            releaseReceipts.remove(releaseId);
+            markDirtyLocked();
+            return true;
+        }
+    }
+
     /** 释放某组占用的全部区块（主客户端掉线时调用）。返回释放的区块数。 */
     public int releaseAll(UUID groupId) {
         if (groupId == null) {
@@ -191,7 +282,9 @@ public final class ChunkRegistry {
             }
             boolean hasClaims = claims.values().stream()
                     .anyMatch(info -> groupId.equals(info.groupId()));
-            if (hasClaims) {
+            boolean hasReceipts = releaseReceipts.values().stream()
+                    .anyMatch(receipt -> groupId.equals(receipt.groupId()));
+            if (hasClaims || hasReceipts) {
                 journal.appendRemoveGroup(groupId);
             }
             var it = claims.entrySet().iterator();
@@ -201,7 +294,8 @@ public final class ChunkRegistry {
                     released++;
                 }
             }
-            if (released > 0) {
+            int removedReceipts = removeReceiptsForGroupLocked(groupId);
+            if (released > 0 || removedReceipts > 0) {
                 markDirtyLocked();
             }
         }
@@ -232,8 +326,9 @@ public final class ChunkRegistry {
                         iterator.remove();
                     }
                 }
+                int removedReceipts = removeReceiptsForGroupLocked(groupId);
                 try {
-                    if (!removed.isEmpty()) {
+                    if (!removed.isEmpty() || removedReceipts > 0) {
                         markDirtyLocked();
                     }
                     saveCurrentClaimsLocked();
@@ -371,8 +466,9 @@ public final class ChunkRegistry {
                         claims.remove(key);
                     }
                 }
+                int removedReceipts = removeReceiptsForGroupLocked(groupId);
                 try {
-                    if (!removed.isEmpty()) {
+                    if (!removed.isEmpty() || removedReceipts > 0) {
                         markDirtyLocked();
                     }
                     saveCurrentClaimsLocked();
@@ -500,12 +596,15 @@ public final class ChunkRegistry {
      */
     public void load() {
         boolean replayedJournal = journal.hasEntries();
-        Map<ChunkKey, UUID> loaded = journal.replay(store.load());
+        RegistryMutationJournal.ReplayState recovered = journal.replayState(
+                store.load(), journal.loadReleaseReceipts());
+        Map<ChunkKey, UUID> loaded = recovered.claims();
         long now = System.currentTimeMillis();
         synchronized (claimLock) {
             for (Map.Entry<ChunkKey, UUID> e : loaded.entrySet()) {
                 claims.put(e.getKey(), new ClaimInfo(e.getValue(), now));
             }
+            releaseReceipts.putAll(recovered.releaseReceipts());
         }
         if (replayedJournal) {
             changeVersion.incrementAndGet();
@@ -551,8 +650,11 @@ public final class ChunkRegistry {
             synchronized (claimLock) {
                 long snapshotVersion = changeVersion.get();
                 Map<ChunkKey, UUID> snapshot = claimsSnapshotLocked();
+                Map<UUID, ChunkReleaseReceipt> receipts =
+                        Map.copyOf(releaseReceipts);
                 journal.appendCheckpoint(snapshot);
                 store.save(snapshot);
+                journal.saveReleaseReceipts(receipts);
                 journal.clear();
                 persistedVersion.accumulateAndGet(snapshotVersion, Math::max);
             }
@@ -563,8 +665,10 @@ public final class ChunkRegistry {
     private void saveCurrentClaimsLocked() {
         long snapshotVersion = changeVersion.get();
         Map<ChunkKey, UUID> snapshot = claimsSnapshotLocked();
+        Map<UUID, ChunkReleaseReceipt> receipts = Map.copyOf(releaseReceipts);
         journal.appendCheckpoint(snapshot);
         store.save(snapshot);
+        journal.saveReleaseReceipts(receipts);
         journal.clear();
         persistedVersion.accumulateAndGet(snapshotVersion, Math::max);
     }
@@ -575,6 +679,14 @@ public final class ChunkRegistry {
             snapshot.put(entry.getKey(), entry.getValue().groupId());
         }
         return snapshot;
+    }
+
+    /** claimLock 内删除已终结组无法再确认的普通释放回执。 */
+    private int removeReceiptsForGroupLocked(UUID groupId) {
+        int before = releaseReceipts.size();
+        releaseReceipts.values().removeIf(
+                receipt -> groupId.equals(receipt.groupId()));
+        return before - releaseReceipts.size();
     }
 
     private void markDirtyLocked() {

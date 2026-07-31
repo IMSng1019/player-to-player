@@ -8,8 +8,15 @@ package imsng.player_to_player.netproto;
  */
 public final class Protocol {
 
-    /** 协议版本：HELLO 握手时双方校验，不一致直接拒绝（避免新旧节点混连产生隐性错误）。 */
-    public static final int VERSION = 3;
+    /**
+     * 协议版本：HELLO 握手时双方校验，不一致直接拒绝。
+     * <p>
+     * v4 将退出事务改为增量提交：客户端不再为干净区块发送 preserveExisting 消息，
+     * 而是在 EXIT_COMMIT.writtenChunks 中一次性声明实际上传集合；普通 CHUNK_RELEASE
+     * 同时增加稳定 releaseId 与回执确认消息，保证正 ACK 丢失、连接超时和服务端重启后
+     * 能重放第一次成功结果。v3 服务端无法解释这些语义，因此必须拒绝新旧节点混连。
+     */
+    public static final int VERSION = 4;
 
     /** 单帧最大长度（16 MB）：超限视为恶意/损坏连接，立即断开。环境文件按块传输不会超过它。 */
     public static final int MAX_FRAME_BYTES = 16 * 1024 * 1024;

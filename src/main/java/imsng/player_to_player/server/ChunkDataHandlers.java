@@ -75,13 +75,12 @@ public final class ChunkDataHandlers {
 
     private final MinecraftServer server;
     private final ChunkRegistry registry;
-    private final Object[] writeLocks = new Object[256];
+    private final ChunkWriteCoordinator writes = new ChunkWriteCoordinator();
     private volatile ExitTransactionHandlers exits;
 
     private ChunkDataHandlers(MinecraftServer server, ChunkRegistry registry) {
         this.server = server;
         this.registry = registry;
-        java.util.Arrays.setAll(writeLocks, ignored -> new Object());
     }
 
     /**
@@ -188,22 +187,33 @@ public final class ChunkDataHandlers {
      * hasServerData 的 region 文件探测必须能看到刚写入的数据。
      * 调用方（RegistryHandlers）已在 io 池上，阻塞安全。
      */
-    boolean writeFinalAndFlush(ChunkKey key, UUID uploader, byte[] gzipNbt) {
-        return validateAndWrite(key, uploader, gzipNbt, true, false);
+    ChunkWriteback.ReleaseResult finalizeAndRelease(
+            ChunkKey key, UUID uploader, byte[] gzipNbt,
+            ChunkWriteback.ReleaseTransaction transaction) {
+        boolean hasFinalData = gzipNbt != null && gzipNbt.length > 0;
+        return writes.finalizeAndRelease(
+                key,
+                hasFinalData,
+                hasFinalData
+                        ? () -> validateAndWriteLocked(
+                        key, uploader, gzipNbt, true, false,
+                        MAX_COMPRESSED_BYTES)
+                        : null,
+                transaction);
     }
 
     /** RegistryHandlers 使用的最终释放写回接口。 */
     ChunkWriteback releaseWriteback() {
-        return this::writeFinalAndFlush;
+        return this::finalizeAndRelease;
     }
 
     /**
-     * 退出事务区块写入。preserveExisting 表示客户端确认本地没有更新快照，服务端保留
-     * 最近一次实时上行；无论是否携带数据，都必须仍由该 pending 事务的组占用。
+     * 退出事务区块写入。协议 v4 新事务只会传实际 written 数据；preserveExisting 分支
+     * 仅供升级前已经 committed 的 data/marker 暂存恢复。两种情况都要求事务组仍持有区块。
      */
     boolean writeExit(UUID groupId, ChunkKey key, byte[] gzipNbt,
                       boolean preserveExisting) {
-        synchronized (writeLock(key)) {
+        return writes.withLock(key, () -> {
             UUID owner = registry.ownerOf(key);
             if (owner == null || !owner.equals(groupId)) {
                 LOGGER.warn("拒绝退出区块写入（所有权不符）: {} 事务组={} 占用组={}",
@@ -215,13 +225,13 @@ public final class ChunkDataHandlers {
             }
             return validateAndWriteLocked(key, groupId, gzipNbt, false, true,
                     ExitPayloadProtocol.MAX_ASSEMBLED_BYTES);
-        }
+        });
     }
 
-    /** pending 暂存前只做所有权与 NBT 校验，不修改正式 region。 */
+    /** pending 暂存前只做所有权与 NBT 校验，不修改正式 region；preserve 仅兼容旧恢复。 */
     boolean validateExit(UUID groupId, ChunkKey key, byte[] gzipNbt,
                          boolean preserveExisting) {
-        synchronized (writeLock(key)) {
+        return writes.withLock(key, () -> {
             UUID owner = registry.ownerOf(key);
             if (owner == null || !owner.equals(groupId)) {
                 return false;
@@ -236,7 +246,7 @@ public final class ChunkDataHandlers {
                 LOGGER.warn("退出区块暂存校验失败: {}", key.asString(), e);
                 return false;
             }
-        }
+        });
     }
 
     /** 刷新全部维度的 I/O worker；退出提交确认前调用。 */
@@ -253,11 +263,9 @@ public final class ChunkDataHandlers {
      */
     private boolean validateAndWrite(ChunkKey key, UUID uploader, byte[] gzipNbt,
                                      boolean flush, boolean allowExitFrozen) {
-        synchronized (writeLock(key)) {
-            return validateAndWriteLocked(
+        return writes.withLock(key, () -> validateAndWriteLocked(
                     key, uploader, gzipNbt, flush, allowExitFrozen,
-                    MAX_COMPRESSED_BYTES);
-        }
+                    MAX_COMPRESSED_BYTES));
     }
 
     private boolean validateAndWriteLocked(ChunkKey key, UUID uploader, byte[] gzipNbt,
@@ -333,7 +341,7 @@ public final class ChunkDataHandlers {
         return tag;
     }
 
-    /** preserveExisting 只有在 IOWorker 能实际读到该区块时才算收到。 */
+    /** legacy preserve marker 只有在 IOWorker 能实际读到该区块时才能完成恢复。 */
     private boolean existingChunkIsReadable(ChunkKey key) {
         try {
             ServerLevel level = resolveLevel(key.dimension());
@@ -352,10 +360,6 @@ public final class ChunkDataHandlers {
             LOGGER.warn("验证退出保留区块失败: {}", key.asString(), e);
             return false;
         }
-    }
-
-    private Object writeLock(ChunkKey key) {
-        return writeLocks[(key.hashCode() & Integer.MAX_VALUE) % writeLocks.length];
     }
 
     // ------------------------------------------------------------ 工具

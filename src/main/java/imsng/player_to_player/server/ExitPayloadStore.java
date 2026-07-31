@@ -14,13 +14,15 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Comparator;
+import java.util.Set;
 import java.util.UUID;
 
 /**
  * 最终退出载荷的耐久暂存区。
  * <p>
  * pending 阶段只写本目录，绝不触碰正式世界；committed 后由
- * {@link #apply(ExitManifest)} 幂等写入全部正式玩家/区块数据并 flush。
+ * {@link #apply(ExitManifest, ExitTransactionLedger.ChunkDisposition)} 按耐久计划
+ * 幂等写入正式玩家/区块数据并 flush。
  */
 public final class ExitPayloadStore
         implements ExitTransactionHandlers.PayloadStore {
@@ -39,9 +41,6 @@ public final class ExitPayloadStore
 
         void flush();
     }
-
-    private static final byte[] PRESERVE_MARKER = "preserve\n".getBytes(
-            StandardCharsets.US_ASCII);
 
     private final Path root;
     private final PlayerWriter playerWriter;
@@ -73,26 +72,22 @@ public final class ExitPayloadStore
     @Override
     public boolean stageChunk(ExitManifest manifest, ChunkKey key,
                               byte[] gzipNbt, boolean preserveExisting) {
-        if (manifest == null || key == null || !manifest.chunks().contains(key)
+        // 协议 v4 的干净区块由 EXIT_COMMIT 中未声明隐式表达，不再允许新建 marker。
+        // preserve 目录只保留给升级前已经 committed 的旧事务恢复使用。
+        if (preserveExisting || manifest == null || key == null
+                || !manifest.chunks().contains(key)
                 || chunks == null
                 || !chunks.validate(manifest.groupId(), key, gzipNbt,
-                preserveExisting)) {
+                false)) {
             return false;
         }
         Path data = chunkDataPath(manifest.shutdownId(), key);
         Path marker = chunkPreservePath(manifest.shutdownId(), key);
         try {
-            if (preserveExisting) {
-                if (Files.isRegularFile(data)) {
-                    return false;
-                }
-                writeAtomic(marker, PRESERVE_MARKER);
-            } else {
-                if (gzipNbt == null || Files.isRegularFile(marker)) {
-                    return false;
-                }
-                writeAtomic(data, gzipNbt);
+            if (gzipNbt == null || Files.isRegularFile(marker)) {
+                return false;
             }
+            writeAtomic(data, gzipNbt);
             return true;
         } catch (Exception e) {
             return false;
@@ -100,8 +95,10 @@ public final class ExitPayloadStore
     }
 
     @Override
-    public void apply(ExitManifest manifest) {
-        if (manifest == null || playerWriter == null || chunks == null) {
+    public void apply(ExitManifest manifest,
+                      ExitTransactionLedger.ChunkDisposition disposition) {
+        if (manifest == null || disposition == null
+                || playerWriter == null || chunks == null) {
             throw new IllegalStateException("退出暂存应用器未完整配置");
         }
         try {
@@ -113,25 +110,58 @@ public final class ExitPayloadStore
                     throw new IOException("正式玩家数据写入失败: " + playerId);
                 }
             }
-            for (ChunkKey key : manifest.chunks().stream()
-                    .sorted(Comparator.comparing(ChunkKey::asString)).toList()) {
-                Path dataPath = chunkDataPath(manifest.shutdownId(), key);
-                Path markerPath = chunkPreservePath(manifest.shutdownId(), key);
-                boolean hasData = Files.isRegularFile(dataPath);
-                boolean preserve = Files.isRegularFile(markerPath);
-                if (hasData == preserve) {
-                    throw new IOException("退出区块暂存类型缺失或冲突: "
-                            + key.asString());
-                }
-                byte[] data = hasData ? Files.readAllBytes(dataPath) : null;
-                if (!chunks.write(manifest.groupId(), key, data, preserve)) {
-                    throw new IOException("正式区块数据写入失败: " + key.asString());
-                }
+            if (disposition.explicit()) {
+                applyExplicitChunks(manifest, disposition.writtenChunks());
+            } else {
+                applyLegacyChunks(manifest);
             }
             chunks.flush();
         } catch (Exception e) {
             throw new IllegalStateException("应用退出暂存数据失败: "
                     + manifest.shutdownId(), e);
+        }
+    }
+
+    /**
+     * 新事务只读取 committed 时声明的 written 文件。manifest 中其余干净区块完全不访问
+     * region 和暂存目录，因此退出耗时与脏区块量相关，而不再与 ownership 总量相关。
+     */
+    private void applyExplicitChunks(ExitManifest manifest, Set<ChunkKey> writtenChunks)
+            throws IOException {
+        if (!manifest.chunks().containsAll(writtenChunks)) {
+            throw new IOException("退出 written 计划超出 ownership 清单");
+        }
+        for (ChunkKey key : writtenChunks.stream()
+                .sorted(Comparator.comparing(ChunkKey::asString)).toList()) {
+            Path dataPath = chunkDataPath(manifest.shutdownId(), key);
+            if (!Files.isRegularFile(dataPath)
+                    || Files.isRegularFile(chunkPreservePath(manifest.shutdownId(), key))) {
+                throw new IOException("退出 written 区块暂存缺失或冲突: "
+                        + key.asString());
+            }
+            byte[] data = Files.readAllBytes(dataPath);
+            if (!chunks.write(manifest.groupId(), key, data, false)) {
+                throw new IOException("正式区块数据写入失败: " + key.asString());
+            }
+        }
+    }
+
+    /** 兼容升级前 committed 事务：旧格式必须继续按完整 data/marker 二选一扫描。 */
+    private void applyLegacyChunks(ExitManifest manifest) throws IOException {
+        for (ChunkKey key : manifest.chunks().stream()
+                .sorted(Comparator.comparing(ChunkKey::asString)).toList()) {
+            Path dataPath = chunkDataPath(manifest.shutdownId(), key);
+            Path markerPath = chunkPreservePath(manifest.shutdownId(), key);
+            boolean hasData = Files.isRegularFile(dataPath);
+            boolean preserve = Files.isRegularFile(markerPath);
+            if (hasData == preserve) {
+                throw new IOException("旧退出区块暂存类型缺失或冲突: "
+                        + key.asString());
+            }
+            byte[] data = hasData ? Files.readAllBytes(dataPath) : null;
+            if (!chunks.write(manifest.groupId(), key, data, preserve)) {
+                throw new IOException("旧退出区块数据应用失败: " + key.asString());
+            }
         }
     }
 

@@ -139,7 +139,7 @@ public final class ClientExitCoordinator {
             ExitTransactionClient.BeginOutcome begin =
                     transaction.beginUntilAccepted(local);
             GroupRuntime.adoptExitManifest(begin.manifest());
-            LOGGER.info("物理服务端已确认退出保护意图: shutdownId={} 区块={} 玩家={}",
+            LOGGER.info("物理服务端已确认退出保护意图: shutdownId={} ownedChunks={} players={}",
                     shutdownId, begin.manifest().chunks().size(),
                     begin.manifest().playerIds().size());
 
@@ -170,6 +170,10 @@ public final class ClientExitCoordinator {
             disconnected.join();
 
             ExitBundle bundle = finalBundle.join();
+            LOGGER.info("主客户端退出最终数据已收集: shutdownId={} ownedChunks={} "
+                            + "writtenChunks={} compressedBytes={}",
+                    shutdownId, bundle.manifest().chunks().size(),
+                    bundle.writtenChunks().size(), bundle.compressedBytes());
             transaction.commitUntilAccepted(bundle);
             LOGGER.info("主客户端退出事务已提交: shutdownId={}", shutdownId);
             WorldSession.teardownSession();

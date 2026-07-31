@@ -78,6 +78,12 @@ public final class ExitTransactionStore implements ExitTransactionPersistence {
         JsonArray chunks = new JsonArray();
         manifest.chunks().stream().map(ChunkKey::asString).sorted().forEach(chunks::add);
         root.add("chunks", chunks);
+        if (record.writtenChunksDeclared()) {
+            JsonArray writtenChunks = new JsonArray();
+            record.writtenChunks().stream().map(ChunkKey::asString).sorted()
+                    .forEach(writtenChunks::add);
+            root.add("writtenChunks", writtenChunks);
+        }
         return root;
     }
 
@@ -107,8 +113,15 @@ public final class ExitTransactionStore implements ExitTransactionPersistence {
                 // 旧协议在 committed 前已经把全部最终帧直接写入正式世界；
                 // 因此旧 committed 即使 cleanup 尚未完成，也不能再寻找新暂存目录。
                 : committed && !abandoned;
-        return new ExitTransactionRecord(manifest, committed, dataApplied,
-                cleanupComplete, abandoned);
+        boolean writtenChunksDeclared = root.has("writtenChunks");
+        Set<ChunkKey> writtenChunks = new HashSet<>();
+        if (writtenChunksDeclared) {
+            for (JsonElement element : requiredArray(root, "writtenChunks")) {
+                writtenChunks.add(ChunkKey.parse(element.getAsString()));
+            }
+        }
+        return new ExitTransactionRecord(manifest, committed, writtenChunks,
+                writtenChunksDeclared, dataApplied, cleanupComplete, abandoned);
     }
 
     private static JsonArray requiredArray(JsonObject root, String name) {

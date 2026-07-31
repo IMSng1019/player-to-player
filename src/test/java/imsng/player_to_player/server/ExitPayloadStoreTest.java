@@ -3,12 +3,14 @@ package imsng.player_to_player.server;
 import imsng.player_to_player.group.ExitManifest;
 import imsng.player_to_player.group.PlayerStateNbt;
 import imsng.player_to_player.registry.ChunkKey;
+import imsng.player_to_player.util.Sha256;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.DoubleTag;
 import net.minecraft.nbt.ListTag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -16,9 +18,12 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -30,6 +35,8 @@ class ExitPayloadStoreTest {
             UUID.fromString("9207ce8d-2b04-4fd8-a9f7-a437ce1211a0");
     private static final ChunkKey CHUNK =
             new ChunkKey("minecraft:overworld", -7, 0);
+    private static final ChunkKey CLEAN =
+            new ChunkKey("minecraft:overworld", -6, 0);
 
     @TempDir
     Path temporary;
@@ -50,7 +57,7 @@ class ExitPayloadStoreTest {
 
         ExitPayloadStore recovered = store(
                 writtenPlayers, writtenChunks, flushed, false);
-        recovered.apply(manifest());
+        recovered.apply(manifest(), explicit(Set.of(CHUNK)));
 
         assertArrayEquals(player, writtenPlayers.get(0));
         assertArrayEquals(chunk, writtenChunks.get(0));
@@ -71,7 +78,8 @@ class ExitPayloadStoreTest {
 
         assertTrue(writtenPlayers.isEmpty());
         assertTrue(writtenChunks.isEmpty());
-        assertThrows(IllegalStateException.class, () -> store.apply(manifest()));
+        assertThrows(IllegalStateException.class,
+                () -> store.apply(manifest(), explicit(Set.of(CHUNK))));
     }
 
     @Test
@@ -84,8 +92,9 @@ class ExitPayloadStoreTest {
         assertTrue(store.stagePlayer(manifest(), CLIENT, validPlayer()));
         assertTrue(store.stageChunk(manifest(), CHUNK, new byte[]{9}, false));
 
-        assertThrows(IllegalStateException.class, () -> store.apply(manifest()));
-        store.apply(manifest());
+        assertThrows(IllegalStateException.class,
+                () -> store.apply(manifest(), explicit(Set.of(CHUNK))));
+        store.apply(manifest(), explicit(Set.of(CHUNK)));
 
         assertTrue(writtenPlayers.size() == 2);
         assertTrue(writtenChunks.size() == 1);
@@ -97,6 +106,75 @@ class ExitPayloadStoreTest {
                 new ArrayList<>(), new ArrayList<>(), new AtomicBoolean(), false);
 
         assertFalse(store.stagePlayer(manifest(), CLIENT, new byte[]{1, 2, 3}));
+    }
+
+    @Test
+    void explicitPlanWritesOnlyDeclaredChunksAndFlushesOnce() throws Exception {
+        List<ChunkKey> written = new ArrayList<>();
+        AtomicInteger flushes = new AtomicInteger();
+        ExitPayloadStore store = new ExitPayloadStore(temporary,
+                (playerId, data) -> true,
+                new ExitPayloadStore.ChunkAccess() {
+                    @Override
+                    public boolean validate(UUID groupId, ChunkKey key, byte[] data,
+                                            boolean preserveExisting) {
+                        return !preserveExisting && data != null;
+                    }
+
+                    @Override
+                    public boolean write(UUID groupId, ChunkKey key, byte[] data,
+                                         boolean preserveExisting) {
+                        written.add(key);
+                        return !preserveExisting && data != null;
+                    }
+
+                    @Override
+                    public void flush() {
+                        flushes.incrementAndGet();
+                    }
+                });
+        ExitManifest manifest = manifest(Set.of(CHUNK, CLEAN));
+        assertTrue(store.stagePlayer(manifest, CLIENT, validPlayer()));
+        assertTrue(store.stageChunk(manifest, CHUNK, new byte[]{7}, false));
+
+        store.apply(manifest, explicit(Set.of(CHUNK)));
+
+        assertEquals(List.of(CHUNK), written);
+        assertEquals(1, flushes.get());
+    }
+
+    @Test
+    void explicitPlanRejectsMissingWrittenPayloadAndNewPreserveStage()
+            throws Exception {
+        ExitPayloadStore store = store(
+                new ArrayList<>(), new ArrayList<>(), new AtomicBoolean(), false);
+        assertTrue(store.stagePlayer(manifest(), CLIENT, validPlayer()));
+
+        assertFalse(store.stageChunk(manifest(), CHUNK, null, true));
+        assertThrows(IllegalStateException.class,
+                () -> store.apply(manifest(), explicit(Set.of(CHUNK))));
+    }
+
+    @Test
+    void legacyDispositionStillRestoresPreserveMarkers() throws Exception {
+        List<byte[]> writtenChunks = new ArrayList<>();
+        AtomicBoolean flushed = new AtomicBoolean();
+        ExitPayloadStore store = store(
+                new ArrayList<>(), writtenChunks, flushed, false);
+        assertTrue(store.stagePlayer(manifest(), CLIENT, validPlayer()));
+        Path marker = temporary.resolve(SHUTDOWN.toString())
+                .resolve("preserve")
+                .resolve(Sha256.hex(CHUNK.asString().getBytes(StandardCharsets.UTF_8))
+                        + ".marker");
+        Files.createDirectories(marker.getParent());
+        Files.writeString(marker, "preserve\n", StandardCharsets.US_ASCII);
+
+        store.apply(manifest(),
+                new ExitTransactionLedger.ChunkDisposition(Set.of(), false));
+
+        assertEquals(1, writtenChunks.size());
+        assertNull(writtenChunks.get(0));
+        assertTrue(flushed.get());
     }
 
     private ExitPayloadStore store(List<byte[]> players, List<byte[]> chunks,
@@ -137,8 +215,17 @@ class ExitPayloadStoreTest {
     }
 
     private static ExitManifest manifest() {
+        return manifest(Set.of(CHUNK));
+    }
+
+    private static ExitManifest manifest(Set<ChunkKey> chunks) {
         return new ExitManifest(SHUTDOWN, CLIENT, CLIENT,
-                Set.of(CLIENT), Set.of(CHUNK));
+                Set.of(CLIENT), chunks);
+    }
+
+    private static ExitTransactionLedger.ChunkDisposition explicit(
+            Set<ChunkKey> writtenChunks) {
+        return new ExitTransactionLedger.ChunkDisposition(writtenChunks, true);
     }
 
     private static byte[] validPlayer() throws Exception {

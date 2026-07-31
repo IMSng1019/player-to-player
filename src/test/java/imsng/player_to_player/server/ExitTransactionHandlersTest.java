@@ -1,5 +1,6 @@
 package imsng.player_to_player.server;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import imsng.player_to_player.group.ExitManifest;
 import imsng.player_to_player.netproto.ControlConnection;
@@ -34,6 +35,67 @@ class ExitTransactionHandlersTest {
             UUID.fromString("9207ce8d-2b04-4fd8-a9f7-a437ce1211a0");
     private static final ChunkKey CHUNK =
             new ChunkKey("minecraft:overworld", -7, 0);
+    private static final ChunkKey CLEAN =
+            new ChunkKey("minecraft:overworld", -6, 0);
+
+    @Test
+    void commitAcceptsDeclaredWrittenSubsetWithoutReceivingCleanChunks()
+            throws Exception {
+        ExitTransactionLedger ledger = new ExitTransactionLedger(
+                new InMemoryPersistence());
+        AtomicInteger applies = new AtomicInteger();
+        ExitTransactionHandlers handlers = new ExitTransactionHandlers(
+                ledger,
+                (peer, requested) -> requested,
+                ignored -> {
+                },
+                new ExitTransactionHandlers.PayloadStore() {
+                    @Override
+                    public boolean stagePlayer(ExitManifest manifest, UUID playerId,
+                                               byte[] gzipNbt) {
+                        return true;
+                    }
+
+                    @Override
+                    public boolean stageChunk(ExitManifest manifest, ChunkKey key,
+                                              byte[] gzipNbt,
+                                              boolean preserveExisting) {
+                        return !preserveExisting;
+                    }
+
+                    @Override
+                    public void apply(
+                            ExitManifest manifest,
+                            ExitTransactionLedger.ChunkDisposition disposition) {
+                        applies.incrementAndGet();
+                    }
+
+                    @Override
+                    public void discard(ExitManifest manifest) {
+                    }
+                },
+                () -> {
+                },
+                ignored -> {
+                },
+                Runnable::run);
+        FakeRegistry registry = new FakeRegistry();
+        handlers.register(registry);
+        FakeConnection connection = new FakeConnection(CLIENT_ID);
+        ExitManifest manifest = new ExitManifest(
+                SHUTDOWN_ID, CLIENT_ID, CLIENT_ID,
+                Set.of(CLIENT_ID), Set.of(CHUNK, CLEAN));
+
+        registry.handle(connection, ControlMessage.of(
+                MessageType.EXIT_BEGIN, manifest.toJson()));
+        sendPlayer(registry, connection, new byte[]{1});
+        sendChunk(registry, connection, new byte[]{2});
+        registry.handle(connection, ControlMessage.of(
+                MessageType.EXIT_COMMIT, commitJson(Set.of(CHUNK))));
+
+        assertTrue(connection.last().json().get("committed").getAsBoolean());
+        assertEquals(1, applies.get());
+    }
 
     @Test
     void finalPayloadsDoNotTouchOfficialSinksBeforeCommit() throws Exception {
@@ -129,7 +191,7 @@ class ExitTransactionHandlersTest {
         sendPlayer(registry, connection, new byte[]{1});
         sendChunk(registry, connection, new byte[]{2});
         registry.handle(connection, ControlMessage.of(
-                MessageType.EXIT_COMMIT, idJson()));
+                MessageType.EXIT_COMMIT, commitJson(Set.of(CHUNK))));
         int stagesBeforeLateFrame = payloads.playerStages;
 
         JsonObject late = idJson();
@@ -167,10 +229,10 @@ class ExitTransactionHandlersTest {
         sendChunk(registry, connection, new byte[]{2});
 
         registry.handle(connection, ControlMessage.of(
-                MessageType.EXIT_COMMIT, idJson()));
+                MessageType.EXIT_COMMIT, commitJson(Set.of(CHUNK))));
         assertFalse(connection.last().json().get("committed").getAsBoolean());
         registry.handle(connection, ControlMessage.of(
-                MessageType.EXIT_COMMIT, idJson()));
+                MessageType.EXIT_COMMIT, commitJson(Set.of(CHUNK))));
 
         assertTrue(connection.last().json().get("committed").getAsBoolean());
         assertEquals(1, payloads.applies);
@@ -218,7 +280,7 @@ class ExitTransactionHandlersTest {
                 connection.last().json().getAsJsonObject("manifest")));
 
         registry.handle(connection, ControlMessage.of(MessageType.EXIT_COMMIT,
-                idJson()));
+                commitJson(Set.of(CHUNK))));
         assertFalse(connection.last().json().get("committed").getAsBoolean());
 
         JsonObject player = idJson();
@@ -237,7 +299,7 @@ class ExitTransactionHandlersTest {
         assertTrue(connection.last().json().get("written").getAsBoolean());
 
         registry.handle(connection, ControlMessage.of(MessageType.EXIT_COMMIT,
-                idJson()));
+                commitJson(Set.of(CHUNK))));
         assertTrue(connection.last().json().get("committed").getAsBoolean());
         assertEquals(List.of("protect", "player", "chunk", "flush", "cleanup"),
                 events);
@@ -255,7 +317,7 @@ class ExitTransactionHandlersTest {
         assertTrue(payloads.stageChunk(manifest(), CHUNK, new byte[]{2}, false));
         first.markPlayerReceived(CLIENT_ID, SHUTDOWN_ID, CLIENT_ID);
         first.markChunkReceived(CLIENT_ID, SHUTDOWN_ID, CHUNK);
-        first.commit(CLIENT_ID, SHUTDOWN_ID);
+        first.commit(CLIENT_ID, SHUTDOWN_ID, Set.of(CHUNK));
 
         List<ExitManifest> cleaned = new ArrayList<>();
         ExitTransactionHandlers recovered = new ExitTransactionHandlers(
@@ -357,7 +419,7 @@ class ExitTransactionHandlersTest {
         assertFalse(connection.last().json().get("written").getAsBoolean());
 
         registry.handle(connection, ControlMessage.of(
-                MessageType.EXIT_COMMIT, idJson()));
+                MessageType.EXIT_COMMIT, commitJson(Set.of(CHUNK))));
         assertFalse(connection.last().json().get("committed").getAsBoolean());
     }
 
@@ -448,6 +510,14 @@ class ExitTransactionHandlersTest {
     private static JsonObject idJson() {
         JsonObject json = new JsonObject();
         json.addProperty("shutdownId", SHUTDOWN_ID.toString());
+        return json;
+    }
+
+    private static JsonObject commitJson(Set<ChunkKey> writtenChunks) {
+        JsonObject json = idJson();
+        JsonArray written = new JsonArray();
+        writtenChunks.stream().map(ChunkKey::asString).sorted().forEach(written::add);
+        json.add("writtenChunks", written);
         return json;
     }
 
@@ -605,9 +675,13 @@ class ExitTransactionHandlersTest {
         }
 
         @Override
-        public void apply(ExitManifest manifest) {
+        public void apply(
+                ExitManifest manifest,
+                ExitTransactionLedger.ChunkDisposition disposition) {
+            Set<ChunkKey> requiredChunks = disposition.explicit()
+                    ? disposition.writtenChunks() : manifest.chunks();
             if (!players.containsAll(manifest.playerIds())
-                    || !chunks.containsAll(manifest.chunks())) {
+                    || !chunks.containsAll(requiredChunks)) {
                 throw new IllegalStateException("测试暂存数据不完整");
             }
             applies++;

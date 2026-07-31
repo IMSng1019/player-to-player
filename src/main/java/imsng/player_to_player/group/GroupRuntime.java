@@ -5,10 +5,7 @@ import imsng.player_to_player.netproto.ControlConnection;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.core.registries.Registries;
-import net.minecraft.resources.ResourceKey;
-import net.minecraft.resources.ResourceLocation;
-import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.storage.ChunkSerializer;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.nbt.CompoundTag;
@@ -71,6 +68,9 @@ public final class GroupRuntime {
     /** 区块上行服务（attach 时创建，detach 时关停）。 */
     private static volatile ChunkUploadService uploadService;
 
+    /** 区块预卸载 ACK 屏障（attach 时创建，detach 时关停）。 */
+    private static volatile ChunkPreUnloadService preUnloadService;
+
     /** 组内完整玩家 NBT 的实时确认上传器。 */
     private static volatile PlayerStateUploadService playerUploadService;
 
@@ -96,10 +96,11 @@ public final class GroupRuntime {
     /** 耐久退出固定清单；非 null 表示普通 teardown 已被退出事务接管。 */
     private static volatile ExitManifest exitManifest;
 
+    /** 正在等待预卸载 quiescent 的共享退出准备 future，防止重复点击创建并行冻结流程。 */
+    private static volatile CompletableFuture<ExitManifest> exitPreparation;
+
     /** 退出前/停服期间捕获的最终状态（值始终为独立 NBT 副本）。 */
     private static final Map<UUID, CompoundTag> exitPlayers =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    private static final Map<imsng.player_to_player.registry.ChunkKey, CompoundTag> exitChunks =
             new java.util.concurrent.ConcurrentHashMap<>();
 
     /** 客户端会话层接收最终 bundle 的桥；只在客户端入口设置。 */
@@ -136,7 +137,12 @@ public final class GroupRuntime {
         armedPlan = null;
         managedServer = server;
         claimClient = new ChunkClaimClient(plan.serverConn(), plan.groupId(), plan.claimRetrySeconds());
-        uploadService = new ChunkUploadService(plan.serverConn(), plan.groupId());
+        // 显式把实时 CHUNK_DATA_UPLOAD 正 ACK 接到本组 claim 客户端，建立“服务端已有
+        // 数据”基线。不要在上传服务内部依赖静态全局查找，否则 ACK 与组生命周期竞态时
+        // 无法测试也容易误更新已迁移区块。
+        uploadService = new ChunkUploadService(
+                plan.serverConn(), plan.groupId(), claimClient::markServerDataKnown);
+        preUnloadService = new ChunkPreUnloadService(claimClient, uploadService);
         playerUploadService = new PlayerStateUploadService(
                 plan.serverConn(), imsng.player_to_player.util.ThreadPools.io(),
                 task -> imsng.player_to_player.util.ThreadPools.scheduler()
@@ -161,6 +167,7 @@ public final class GroupRuntime {
         }
         ChunkClaimClient claims = claimClient;
         ChunkUploadService uploads = uploadService;
+        ChunkPreUnloadService preUnloads = preUnloadService;
         PlayerStateUploadService playerUploads = playerUploadService;
         ExitManifest finishingExit = exitManifest;
         Map<UUID, CompoundTag> finalPlayers = new HashMap<>();
@@ -180,10 +187,8 @@ public final class GroupRuntime {
                 }
             }
             for (imsng.player_to_player.registry.ChunkKey key : finishingExit.chunks()) {
-                CompoundTag tag = exitChunks.get(key);
-                if (tag == null && uploads != null) {
-                    tag = uploads.latestSnapshot(key);
-                }
+                CompoundTag tag = uploads != null
+                        ? uploads.latestUnacknowledged(key) : null;
                 if (tag != null) {
                     finalChunks.put(key, tag.copy());
                 }
@@ -191,12 +196,16 @@ public final class GroupRuntime {
         }
         claimClient = null;
         uploadService = null;
+        preUnloadService = null;
         playerUploadService = null;
         serverConn = null;
         groupId = null;
         managedServer = null;
         tickFrozen = false; // 冻结旗标不得跨接管残留
         LogUploader.stop(); // Phase 4：日志上行随接管终止
+        if (preUnloads != null) {
+            preUnloads.shutdown();
+        }
         if (claims != null) {
             claims.shutdown();
         }
@@ -232,8 +241,8 @@ public final class GroupRuntime {
                         () -> {
                             synchronized (EXIT_LOCK) {
                                 exitManifest = null;
+                                exitPreparation = null;
                                 exitPlayers.clear();
-                                exitChunks.clear();
                             }
                         });
             });
@@ -292,44 +301,87 @@ public final class GroupRuntime {
      * 集成服务端线程，调用方只能在后台等待。
      */
     public static CompletableFuture<ExitManifest> beginExitDrain(UUID shutdownId) {
-        CompletableFuture<ExitManifest> future = new CompletableFuture<>();
         MinecraftServer server = managedServer;
         ChunkClaimClient claims = claimClient;
+        ChunkUploadService uploads = uploadService;
+        ChunkPreUnloadService preUnloads = preUnloadService;
         UUID activeGroup = groupId;
         UUID clientId = NodeContext.get().clientId();
-        if (server == null || claims == null || activeGroup == null || clientId == null) {
-            future.completeExceptionally(new IllegalStateException("当前没有被接管的组世界"));
-            return future;
+        if (server == null || claims == null || uploads == null || preUnloads == null
+                || activeGroup == null || clientId == null) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("当前没有完整接管的组世界"));
         }
+        CompletableFuture<ExitManifest> future;
         synchronized (EXIT_LOCK) {
             if (exitManifest != null) {
-                future.complete(exitManifest);
-                return future;
+                return CompletableFuture.completedFuture(exitManifest);
             }
+            if (exitPreparation != null) {
+                return exitPreparation;
+            }
+            future = new CompletableFuture<>();
+            exitPreparation = future;
         }
-        server.execute(() -> {
+
+        // 先停止新 claim；预卸载仍可在 preparation 阶段登记，并被 awaitQuiescent 原子纳入。
+        claims.beginExitPreparation();
+        preUnloads.beginExitPreparation();
+        preUnloads.awaitQuiescent().whenComplete((ignored, preparationError) -> {
+            if (preparationError != null) {
+                failExitPreparation(future, preparationError);
+                return;
+            }
             try {
-                Set<imsng.player_to_player.registry.ChunkKey> chunks = claims.freezeForExit();
-                Set<UUID> players = new HashSet<>();
-                for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-                    players.add(player.getUUID());
-                    exitPlayers.put(player.getUUID(),
-                            player.saveWithoutId(new CompoundTag()).copy());
-                }
-                players.add(clientId);
-                ExitManifest manifest = new ExitManifest(
-                        shutdownId, clientId, activeGroup, players, chunks);
-                synchronized (EXIT_LOCK) {
-                    if (exitManifest == null) {
-                        exitManifest = manifest;
+                server.execute(() -> {
+                    try {
+                        if (managedServer != server || claimClient != claims
+                                || uploadService != uploads || preUnloadService != preUnloads) {
+                            throw new IllegalStateException("退出准备期间组运行时已经切换");
+                        }
+                        preUnloads.freezeForExit();
+                        Set<imsng.player_to_player.registry.ChunkKey> chunks =
+                                claims.freezeForExit();
+                        uploads.freezeForExit();
+                        Set<UUID> players = new HashSet<>();
+                        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+                            players.add(player.getUUID());
+                            exitPlayers.put(player.getUUID(),
+                                    player.saveWithoutId(new CompoundTag()).copy());
+                        }
+                        players.add(clientId);
+                        ExitManifest candidate = new ExitManifest(
+                                shutdownId, clientId, activeGroup, players, chunks);
+                        ExitManifest resolved;
+                        synchronized (EXIT_LOCK) {
+                            if (exitManifest == null) {
+                                exitManifest = candidate;
+                            }
+                            resolved = exitManifest;
+                            if (exitPreparation == future) {
+                                exitPreparation = null;
+                            }
+                        }
+                        future.complete(resolved);
+                    } catch (Throwable error) {
+                        failExitPreparation(future, error);
                     }
-                    future.complete(exitManifest);
-                }
-            } catch (Exception e) {
-                future.completeExceptionally(e);
+                });
+            } catch (RuntimeException schedulingError) {
+                failExitPreparation(future, schedulingError);
             }
         });
         return future;
+    }
+
+    private static void failExitPreparation(
+            CompletableFuture<ExitManifest> future, Throwable error) {
+        synchronized (EXIT_LOCK) {
+            if (exitPreparation == future) {
+                exitPreparation = null;
+            }
+        }
+        future.completeExceptionally(error);
     }
 
     /** EXIT_BEGIN 应答下发的服务端权威清单替换本地候选清单。 */
@@ -354,12 +406,15 @@ public final class GroupRuntime {
     public static void recordExitChunk(imsng.player_to_player.registry.ChunkKey key,
                                        CompoundTag tag) {
         ExitManifest manifest = exitManifest;
-        if (manifest != null && key != null && tag != null && manifest.chunks().contains(key)) {
-            exitChunks.put(key, tag.copy());
+        ChunkUploadService uploads = uploadService;
+        if (manifest != null && uploads != null && key != null && tag != null
+                && manifest.chunks().contains(key)) {
+            // 退出冻结后的 enqueue 只覆盖 latestUnacknowledged，不会再启动普通实时请求。
+            uploads.enqueue(key, tag);
         }
     }
 
-    /** SERVER_STOPPING：在世界仍可读时补抓玩家和所有清单区块。 */
+    /** SERVER_STOPPING：只补抓玩家；区块由停服 save 的 ChunkStorageMixin 增量捕获。 */
     public static void captureExitStopping(MinecraftServer server) {
         ExitManifest manifest = exitManifest;
         if (manifest == null || managedServer != server) {
@@ -369,26 +424,6 @@ public final class GroupRuntime {
             if (manifest.playerIds().contains(player.getUUID())) {
                 exitPlayers.put(player.getUUID(),
                         player.saveWithoutId(new CompoundTag()).copy());
-            }
-        }
-        for (imsng.player_to_player.registry.ChunkKey key : manifest.chunks()) {
-            try {
-                ResourceLocation location = ResourceLocation.tryParse(key.dimension());
-                if (location == null) {
-                    continue;
-                }
-                ServerLevel level = server.getLevel(
-                        ResourceKey.create(Registries.DIMENSION, location));
-                if (level == null) {
-                    continue;
-                }
-                LevelChunk chunk = level.getChunkSource().getChunkNow(key.x(), key.z());
-                if (chunk != null) {
-                    recordExitChunk(key, ChunkSerializer.write(level, chunk));
-                }
-            } catch (Exception e) {
-                LOGGER.warn("停服前捕获退出区块失败，稍后使用最近上行快照: {}",
-                        key.asString(), e);
             }
         }
     }
@@ -425,6 +460,104 @@ public final class GroupRuntime {
     /** 区块上行服务；未接管时为 null（调用方须判空）。 */
     public static ChunkUploadService uploads() {
         return uploadService;
+    }
+
+    /** 区块预卸载服务；未接管时为 null（Mixin/防御性卸载钩子使用）。 */
+    public static ChunkPreUnloadService preUnloads() {
+        return preUnloadService;
+    }
+
+    /**
+     * 为 ChunkMap.scheduleUnload 建立预卸载依赖。
+     * <p>
+     * holder 的原始 chunkToSave 可能由世界生成线程完成，因此先等待它，再把真正的状态检查
+     * 和 ChunkSerializer.write 调度回集成服务端主线程。返回 future 只有物理服正 ACK 后才完成。
+     */
+    public static CompletableFuture<Void> beginChunkPreUnload(
+            ServerLevel level, CompletableFuture<ChunkAccess> originalChunkToSave) {
+        ChunkPreUnloadService service = preUnloadService;
+        MinecraftServer server = managedServer;
+        if (service == null || server == null || level == null
+                || level.getServer() != server || originalChunkToSave == null) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        CompletableFuture<Void> dependency = new CompletableFuture<>();
+        originalChunkToSave.whenComplete((chunk, error) -> {
+            if (error != null) {
+                dependency.completeExceptionally(error);
+                return;
+            }
+            if (chunk == null) {
+                dependency.complete(null);
+                return;
+            }
+            Runnable install = () -> {
+                if (managedServer != server || preUnloadService != service
+                        || !isManagedLevel(level)) {
+                    dependency.complete(null);
+                    return;
+                }
+                imsng.player_to_player.registry.ChunkKey key =
+                        new imsng.player_to_player.registry.ChunkKey(
+                                level.dimension().location().toString(),
+                                chunk.getPos().x, chunk.getPos().z);
+                service.begin(key, chunk.isUnsaved(),
+                        () -> captureChunkSnapshot(level, chunk))
+                        .whenComplete((ignored, releaseError) -> {
+                            if (releaseError != null) {
+                                dependency.completeExceptionally(releaseError);
+                            } else {
+                                dependency.complete(null);
+                            }
+                        });
+            };
+            try {
+                if (server.isSameThread()) {
+                    install.run();
+                } else {
+                    server.execute(install);
+                }
+            } catch (RuntimeException schedulingError) {
+                dependency.completeExceptionally(schedulingError);
+            }
+        });
+        return dependency;
+    }
+
+    /**
+     * 每次预卸载重试都重新回服务器主线程生成最终 NBT，绝不从 scheduler/io 线程直接读取
+     * ChunkAccess。返回的 CompoundTag 是新对象，随后可安全交给后台 gzip。
+     */
+    static CompletableFuture<CompoundTag> captureChunkSnapshot(
+            ServerLevel level, ChunkAccess chunk) {
+        MinecraftServer server = managedServer;
+        if (server == null || level == null || chunk == null
+                || level.getServer() != server) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("集成服务端已解除接管，无法捕获区块快照"));
+        }
+        CompletableFuture<CompoundTag> future = new CompletableFuture<>();
+        Runnable capture = () -> {
+            try {
+                if (!isManagedLevel(level)) {
+                    throw new IllegalStateException("区块所属世界已不再受组运行时接管");
+                }
+                future.complete(ChunkSerializer.write(level, chunk));
+            } catch (Throwable error) {
+                future.completeExceptionally(error);
+            }
+        };
+        try {
+            if (server.isSameThread()) {
+                capture.run();
+            } else {
+                server.execute(capture);
+            }
+        } catch (RuntimeException schedulingError) {
+            future.completeExceptionally(schedulingError);
+        }
+        return future;
     }
 
     public static PlayerStateUploadService playerUploads() {
@@ -472,10 +605,7 @@ public final class GroupRuntime {
                 }
                 chunks.put(entry.getKey(), encoded);
             }
-            Set<imsng.player_to_player.registry.ChunkKey> preserve =
-                    new HashSet<>(manifest.chunks());
-            preserve.removeAll(chunks.keySet());
-            return new ExitBundle(manifest, players, chunks, preserve);
+            return new ExitBundle(manifest, players, chunks);
         } catch (Exception e) {
             throw new IllegalStateException("构建最终退出 bundle 失败", e);
         }

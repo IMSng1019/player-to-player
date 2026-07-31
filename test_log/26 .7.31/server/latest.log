@@ -1,0 +1,301 @@
+[16:11:10] [main/INFO]: Loading Minecraft 1.20.4 with Fabric Loader 0.19.3
+[16:11:10] [main/INFO]: Loading 43 mods:
+	- fabric-api 0.97.3+1.20.4
+	   |-- fabric-api-base 0.4.37+78d798af4f
+	   |-- fabric-api-lookup-api-v1 1.6.50+82b1bb3e4f
+	   |-- fabric-biome-api-v1 13.0.17+78d798af4f
+	   |-- fabric-block-api-v1 1.0.17+3e2216cb4f
+	   |-- fabric-block-view-api-v2 1.0.5+78d798af4f
+	   |-- fabric-blockrenderlayer-v1 1.1.47+78d798af4f
+	   |-- fabric-client-tags-api-v1 1.1.8+78d798af4f
+	   |-- fabric-command-api-v1 1.2.42+f71b366f4f
+	   |-- fabric-command-api-v2 2.2.21+78d798af4f
+	   |-- fabric-commands-v0 0.2.59+df3654b34f
+	   |-- fabric-containers-v0 0.1.88+df3654b34f
+	   |-- fabric-content-registries-v0 5.0.16+78d798af4f
+	   |-- fabric-convention-tags-v1 1.5.11+78d798af4f
+	   |-- fabric-crash-report-info-v1 0.2.24+78d798af4f
+	   |-- fabric-data-attachment-api-v1 1.1.5+b90db5744f
+	   |-- fabric-data-generation-api-v1 13.2.6+5c0133444f
+	   |-- fabric-dimensions-v1 2.1.63+6605d1a84f
+	   |-- fabric-entity-events-v1 1.6.2+09fc25014f
+	   |-- fabric-events-interaction-v0 0.7.2+389931eb4f
+	   |-- fabric-events-lifecycle-v0 0.2.76+df3654b34f
+	   |-- fabric-game-rule-api-v1 1.0.47+78d798af4f
+	   |-- fabric-item-api-v1 2.3.1+cadc140c4f
+	   |-- fabric-item-group-api-v1 4.0.27+ee30b13a4f
+	   |-- fabric-key-binding-api-v1 1.0.42+78d798af4f
+	   |-- fabric-keybindings-v0 0.2.40+df3654b34f
+	   |-- fabric-lifecycle-events-v1 2.3.1+a67ffb5d4f
+	   |-- fabric-loot-api-v2 2.1.10+78d798af4f
+	   |-- fabric-message-api-v1 6.0.6+78d798af4f
+	   |-- fabric-mining-level-api-v1 2.1.66+78d798af4f
+	   |-- fabric-model-loading-api-v1 1.0.9+78d798af4f
+	   |-- fabric-models-v0 0.4.8+9386d8a74f
+	   |-- fabric-networking-api-v1 3.1.9+6abb6a4b4f
+	   |-- fabric-object-builder-api-v1 13.1.0+dba1195c4f
+	   |-- fabric-particles-v1 1.1.8+78d798af4f
+	   |-- fabric-recipe-api-v1 2.0.22+78d798af4f
+	   |-- fabric-registry-sync-v0 4.0.21+ee30b13a4f
+	   |-- fabric-renderer-api-v1 3.2.5+78d798af4f
+	   |-- fabric-renderer-indigo 1.5.6+d331d3144f
+	   |-- fabric-renderer-registries-v1 3.2.54+df3654b34f
+	   |-- fabric-rendering-data-attachment-v1 0.3.43+73761d2e4f
+	   |-- fabric-rendering-fluids-v1 3.1.2+e761c6694f
+	   |-- fabric-rendering-v0 1.1.57+df3654b34f
+	   |-- fabric-rendering-v1 3.2.1+6fd945a04f
+	   |-- fabric-resource-conditions-api-v1 2.3.15+78d798af4f
+	   |-- fabric-resource-loader-v0 0.11.21+ee30b13a4f
+	   |-- fabric-screen-api-v1 2.0.18+78d798af4f
+	   |-- fabric-screen-handler-api-v1 1.3.57+78d798af4f
+	   |-- fabric-sound-api-v1 1.0.18+78d798af4f
+	   |-- fabric-transfer-api-v1 4.0.12+90f2d7b14f
+	   \-- fabric-transitive-access-wideners-v1 5.0.15+78d798af4f
+	- fabricloader 0.19.3
+	   \-- mixinextras 0.5.4
+	- java 21
+	- minecraft 1.20.4
+	- player_to_player 1.0.2
+[16:11:10] [main/INFO]: SpongePowered MIXIN Subsystem Version=0.8.7 Source=file:/home/container/libraries/net/fabricmc/sponge-mixin/0.17.3+mixin.0.8.7/sponge-mixin-0.17.3+mixin.0.8.7.jar Service=Knot/Fabric Env=SERVER
+[16:11:10] [main/INFO]: Compatibility level set to JAVA_17
+[16:11:11] [main/INFO]: Initializing MixinExtras via com.llamalad7.mixinextras.service.MixinExtrasServiceImpl(version=0.5.4).
+[16:11:20] [main/INFO]: player_to_player 初始化完成: mode=server, root=/home/container/player-to-player
+[16:11:20] [main/INFO]: Environment: Environment[sessionHost=https://sessionserver.mojang.com, servicesHost=https://api.minecraftservices.com, name=PROD]
+[16:11:22] [main/INFO]: Loaded 7 recipes
+[16:11:23] [main/INFO]: Loaded 1271 advancements
+[16:11:23] [main/INFO]: Applied 0 biome modifications to 0 of 64 new biomes in 1.813 ms
+[16:11:23] [Server thread/INFO]: Starting minecraft server version 1.20.4
+[16:11:23] [Server thread/INFO]: Loading properties
+[16:11:23] [Server thread/INFO]: Default game type: CREATIVE
+[16:11:23] [Server thread/INFO]: Generating keypair
+[16:11:24] [Server thread/INFO]: Starting Minecraft server on 0.0.0.0:37869
+[16:11:24] [Server thread/INFO]: Using epoll channel type
+[16:11:24] [Server thread/INFO]: Preparing level "world"
+[16:11:28] [Server thread/INFO]: 已跳过出生点常加载区块的预热与等待（disableSpawnChunks=true）：区块加载全部交由客户端经区块注册表申领
+[16:11:28] [Server thread/INFO]: Done (3.825s)! For help, type "help"
+[16:11:28] [Server thread/INFO]: 区块注册表已恢复 0 条占用记录（后端: 本地 JSON (/home/container/player-to-player/registry)）
+[16:11:28] [Server thread/INFO]: 控制服务器已监听端口 15953
+[16:11:28] [Server thread/INFO]: 控制服务器已监听端口 40774
+[16:11:28] [Server thread/INFO]: 中转服务已启动，端口 40774
+[16:11:28] [Server thread/INFO]: 服务端兼任中转 (relayPort=40774)
+[16:11:28] [Server thread/INFO]: P2P 服务端主服务已启动: controlPort=15953, 世界=world
+[16:11:28] [Server thread/INFO]: 服务端世界 tick 已挂起（suspendWorldTick=true）：世界演算下放至主客户端，仅保留区块服务（加载/发包/存盘）与实体装载；如需恢复原版行为请在 config.json 中关闭该项
+[16:11:29] [p2p-io-1/INFO]: 环境快照已发布: id=3accd00ac470a9df61114424cb84fcf603e223a50f04945ade8db186e447170f 文件数=141
+[16:12:28] [p2p-sched-1/INFO]: 已回收过期环境快照: 4b8b00c061c5a909d53507106654331a388f691f07ab068497fd0cea4453cbad
+[16:12:28] [p2p-sched-1/INFO]: 已回收过期环境快照: b9018e068b2d28bc4a3a9f3b5c9c21ccb70ef6455e670b45674c4fc2ac9099d2
+[16:12:28] [p2p-sched-1/INFO]: 已回收过期环境快照: 70a8c36e1122d2ea478c74254aad42910ddc3ac2ea2992ff1fd45c80fdd18415
+[16:12:28] [p2p-sched-1/INFO]: 已回收过期环境快照: 12738f5a06cea558f597bc44600023b6cfb2b9c9a49678e8b27689e315494f5d
+[16:14:04] [User Authenticator #1/INFO]: UUID of player LXW1019 is 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0
+[16:14:06] [Server thread/INFO]: LXW1019[/113.248.224.138:43088] logged in with entity id 1 at (-107.04178617898495, 116.0, 10.831364490039894)
+[16:14:06] [Server thread/INFO]: LXW1019 joined the game
+[16:14:07] [Server thread/WARN]: Can't keep up! Is the server overloaded? Running 2018ms or 40 ticks behind
+[16:14:07] [Server thread/INFO]: 物理服务端区块存盘已取消（suspendWorldTick=true）：MCA 的唯一写入来源为主客户端上行，防止陈旧内存态覆盖
+[16:14:07] [p2p-netty-worker-1/INFO]: 客户端握手成功: LXW1019 (9207ce8d-2b04-4fd8-a9f7-a437ce1211a0) mode=client nat=PORT_RESTRICTED_CONE 来自 /113.248.224.138:43101
+[16:14:08] [Server thread/INFO]: 玩家数据已下发: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0（在线快照，800 字节压缩）
+[16:14:08] [p2p-io-2/INFO]: 组已创建: groupId=9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (主客户端)
+[16:14:08] [p2p-io-2/INFO]: 角色指派: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 → 主客户端（目标区块 minecraft:overworld;-7;0）
+[16:14:15] [p2p-io-165/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 805 字节压缩)
+[16:14:16] [p2p-io-324/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 805 字节压缩)
+[16:14:17] [p2p-io-282/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 804 字节压缩)
+[16:14:18] [p2p-io-144/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 806 字节压缩)
+[16:14:18] [p2p-io-272/INFO]: 环境快照已发布: id=4c684b79e22c0faf5eb5061d9bcb0db20f344e2627ad00edca266d6155cfe576 文件数=141
+[16:14:19] [p2p-io-108/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 806 字节压缩)
+[16:14:20] [p2p-io-143/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 804 字节压缩)
+[16:14:20] [p2p-io-272/INFO]: 环境快照已发布: id=6989fe238e80c978164d9b5bad1376d14b0199e464bfddc4b9b38659fe1b8174 文件数=141
+[16:14:21] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 808 字节压缩)
+[16:14:21] [p2p-io-272/INFO]: 环境快照已发布: id=d65e47ccbf0ca700517165d73a720d9c1a53f359d7ae0806f39f468fa44fc77b 文件数=141
+[16:14:22] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 802 字节压缩)
+[16:14:23] [p2p-io-272/INFO]: 环境快照已发布: id=9b86332721008147d7c75755835423db31e45be2210ff3ba8f78f08924b06d57 文件数=141
+[16:14:23] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 806 字节压缩)
+[16:14:24] [p2p-io-272/INFO]: 环境快照已发布: id=bb75d89fdc3b6eacd3728f87f7d9ea1dc3a0a858f3f4571c658b9a9b30a2381d 文件数=141
+[16:14:24] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 825 字节压缩)
+[16:14:25] [p2p-io-272/INFO]: 环境快照已发布: id=3ecbbd110082c39e1cf3e9d17dbe730c891574110b0543fcd9a86d01902830a5 文件数=141
+[16:14:25] [p2p-io-218/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 805 字节压缩)
+[16:14:26] [p2p-io-218/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 806 字节压缩)
+[16:14:26] [p2p-io-272/INFO]: 环境快照已发布: id=0fe7ab3b2a1ca0f3a8948754331b54da89b33a0c8c452ce9b40889a52bcf0263 文件数=141
+[16:14:27] [p2p-io-218/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 804 字节压缩)
+[16:14:28] [p2p-io-272/INFO]: 环境快照已发布: id=8e8a498e4d1fedffded5b5f4fa07a85e1417844fb76e8d966410a850be91744e 文件数=141
+[16:14:28] [p2p-io-218/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 802 字节压缩)
+[16:14:29] [p2p-io-272/INFO]: 环境快照已发布: id=1e1ddb0eccbf1b9ce3f3c4d209049a6f4851799affd969498a0c0d1ca2e0aa01 文件数=141
+[16:14:29] [p2p-io-218/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 801 字节压缩)
+[16:14:30] [p2p-io-272/INFO]: 环境快照已发布: id=2e619aa2b8bf0c11a4b804af6c08c7f8b5cd0a88b65b8ea78d492fb8bd9fbcfb 文件数=141
+[16:14:30] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 841 字节压缩)
+[16:14:31] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 836 字节压缩)
+[16:14:31] [p2p-io-272/INFO]: 环境快照已发布: id=12985199520ae77fd1d957a83a570a7ee018b161404bc676786ad06ffcea2f44 文件数=141
+[16:14:32] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 803 字节压缩)
+[16:14:32] [p2p-io-272/INFO]: 环境快照已发布: id=eb95354a61fa4462350bc7deb278830d11dc4bc16f190699927a83e2eacbe454 文件数=141
+[16:14:33] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 837 字节压缩)
+[16:14:33] [p2p-io-272/INFO]: 环境快照已发布: id=0f0ff8e25e01f4335801c3cdc72b220b05a0948aaa53871bb2d342a02fd218f5 文件数=141
+[16:14:34] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 819 字节压缩)
+[16:14:35] [p2p-io-272/INFO]: 环境快照已发布: id=956f2b77f3f4c21d3f78a426faffe64e324dc26c5c1e304f4f3136b0179ed3a7 文件数=141
+[16:14:35] [p2p-io-155/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 828 字节压缩)
+[16:14:36] [p2p-io-272/INFO]: 环境快照已发布: id=d0b8b494fdad8699a276707d92cbbd5b251076ca21cad4141bc198319f51d3b4 文件数=141
+[16:14:36] [p2p-io-155/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 832 字节压缩)
+[16:14:36] [Server thread/INFO]: LXW1019 lost connection: Timed out
+[16:14:36] [Server thread/INFO]: LXW1019 left the game
+[16:14:36] [Server thread/WARN]: handleDisconnection() called twice
+[16:14:37] [p2p-io-155/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 825 字节压缩)
+[16:14:37] [p2p-io-272/INFO]: 环境快照已发布: id=c7239c34c6d5e5e0e7f5a993a601e32da5e57a1a2bcdd64214ed56b9389bc1b2 文件数=141
+[16:14:38] [p2p-io-155/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 798 字节压缩)
+[16:14:39] [p2p-io-272/INFO]: 环境快照已发布: id=7805a6bdcffcd603e470c6f4c2009f44b07c6475755ab966d17a69b8c891a46e 文件数=141
+[16:14:39] [p2p-io-18/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 802 字节压缩)
+[16:14:40] [p2p-io-272/INFO]: 环境快照已发布: id=6d3e9e31730105a70aac1c727b7c7ead315b16d598e6c00383fbf838d17a0a22 文件数=141
+[16:14:40] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 802 字节压缩)
+[16:14:41] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 805 字节压缩)
+[16:14:41] [p2p-io-272/INFO]: 环境快照已发布: id=a3bd82dab6992ece1c598c3ea201e26359249f272b30569bc5a9e01c5b23d37d 文件数=141
+[16:14:42] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 797 字节压缩)
+[16:14:42] [p2p-io-272/INFO]: 环境快照已发布: id=fd71247396409d5a258c1d431d4e051305e10a496c39eeef33ea47f9da1eec78 文件数=141
+[16:14:43] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 811 字节压缩)
+[16:14:44] [p2p-io-272/INFO]: 环境快照已发布: id=4d4b4ddbc6687cda7d5e7d18c1054af956bef3090ce8b040770944074badfd69 文件数=141
+[16:14:44] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 802 字节压缩)
+[16:14:45] [p2p-io-151/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 800 字节压缩)
+[16:14:45] [p2p-io-272/INFO]: 环境快照已发布: id=750ca66c756e31f703dbc1ba4f0a02180e6feaaddbcd6da55b0269086478f44f 文件数=141
+[16:14:46] [p2p-io-279/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 810 字节压缩)
+[16:14:46] [p2p-io-272/INFO]: 环境快照已发布: id=0f0ec130f86eaca65e27e30f22981e647a27e2079a4efec4fc4330beb0043a71 文件数=141
+[16:14:47] [p2p-io-279/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 796 字节压缩)
+[16:14:48] [p2p-io-272/INFO]: 环境快照已发布: id=972d62982368a8bd018683b8a857c3052a9f6e9775757daf8c48a0fa139a663d 文件数=141
+[16:14:48] [p2p-io-279/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 797 字节压缩)
+[16:14:49] [p2p-io-279/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 800 字节压缩)
+[16:14:49] [p2p-io-272/INFO]: 环境快照已发布: id=c2ee19502c45a6eff9bbe38b2f340011d23deea0f2adeeb728cde09dedb8a796 文件数=141
+[16:14:50] [p2p-io-279/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 796 字节压缩)
+[16:14:50] [p2p-io-272/INFO]: 环境快照已发布: id=bf3fdfe88396dbc7acfa15410cc1fbe5e6d8b333889ece9e6d0cbf13e6a0209f 文件数=141
+[16:14:51] [p2p-io-279/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 803 字节压缩)
+[16:14:51] [p2p-io-272/INFO]: 环境快照已发布: id=07dfd372046aae102a5e97966cc9b8b009562652f182ce56e75c3eaab5b3a3f3 文件数=141
+[16:14:52] [p2p-io-279/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 798 字节压缩)
+[16:14:53] [p2p-io-272/INFO]: 环境快照已发布: id=7c8a6b16b0c09c3ba88cadff11f421a85304df3b772138df3e31fdb6d86a4cae 文件数=141
+[16:14:54] [p2p-io-272/INFO]: 环境快照已发布: id=7c8a6b16b0c09c3ba88cadff11f421a85304df3b772138df3e31fdb6d86a4cae 文件数=141
+[16:16:18] [p2p-io-412/INFO]: 环境快照已发布: id=1be2ff62bd5b63fc4b37069e6ce33e55cebe0e6acb1cec5f9d854d21dcf29805 文件数=141
+[16:16:19] [p2p-io-272/INFO]: 组 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 已解散（主客户端 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 离线，1 名成员）
+[16:16:20] [p2p-io-272/INFO]: 客户端断开清理完成: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0，耐久释放 0 个区块
+[16:16:32] [p2p-io-272/INFO]: 环境快照已发布: id=5ea2d4d668376a28f4f279652dded889050b4d3deef9f208323df4e9c6b4760f 文件数=141
+[16:16:40] [User Authenticator #2/INFO]: UUID of player LXW1019 is 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0
+[16:16:41] [Server thread/INFO]: LXW1019[/113.248.224.138:43439] logged in with entity id 592 at (-71.32061221478274, 122.28140656568871, 36.09490443772548)
+[16:16:41] [Server thread/INFO]: LXW1019 joined the game
+[16:16:41] [p2p-netty-worker-2/INFO]: 客户端握手成功: LXW1019 (9207ce8d-2b04-4fd8-a9f7-a437ce1211a0) mode=client nat=PORT_RESTRICTED_CONE 来自 /113.248.224.138:43454
+[16:16:42] [Server thread/INFO]: 玩家数据已下发: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0（在线快照，797 字节压缩）
+[16:16:42] [p2p-io-272/INFO]: 组已创建: groupId=9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (主客户端)
+[16:16:42] [p2p-io-272/INFO]: 角色指派: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 → 主客户端（目标区块 minecraft:overworld;-5;2）
+[16:16:43] [p2p-io-272/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 797 字节压缩)
+[16:16:45] [p2p-io-523/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 798 字节压缩)
+[16:16:46] [p2p-io-695/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 801 字节压缩)
+[16:16:46] [p2p-io-592/INFO]: 环境快照已发布: id=576082a05c7fa917da9aacc7fd651ceaeb624336154bb8ea3e66a33bb35026f8 文件数=141
+[16:16:47] [p2p-io-805/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 803 字节压缩)
+[16:16:47] [p2p-io-592/INFO]: 环境快照已发布: id=24b9b2273cb953c70a6d2247e7cd0e8ec42add1f9fdcd802e4f0316a9efd0459 文件数=141
+[16:16:48] [p2p-io-805/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 793 字节压缩)
+[16:16:48] [p2p-io-592/INFO]: 环境快照已发布: id=19da539e2685bffa377eef239c18c3f36f4d1e065a8e3635a47722722f42a135 文件数=141
+[16:16:49] [p2p-io-805/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 797 字节压缩)
+[16:16:50] [p2p-io-805/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 796 字节压缩)
+[16:16:50] [p2p-io-592/INFO]: 环境快照已发布: id=057d1c37942d5ac091870606e82808dbf28955e8024d7ff3c55bd637a971ce4b 文件数=141
+[16:16:51] [p2p-io-539/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 796 字节压缩)
+[16:16:51] [p2p-io-592/INFO]: 环境快照已发布: id=c2722b67586d3ee9e8eb5f2ac21e6d56747c4f3f74f5b77ce016f81aa7873a01 文件数=141
+[16:16:52] [p2p-io-539/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 797 字节压缩)
+[16:16:52] [p2p-io-592/INFO]: 环境快照已发布: id=ffb540f6d7409cd9a3f6584c300cd2a29a941e074654c17b02f017ff0e080d94 文件数=141
+[16:16:53] [p2p-io-592/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 798 字节压缩)
+[16:16:54] [p2p-io-477/INFO]: 环境快照已发布: id=2ca37a10fe876b8811954aa38011ac7bbc93ef7296d1196c06fd87b50ebffa18 文件数=141
+[16:16:54] [p2p-io-758/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 794 字节压缩)
+[16:16:55] [p2p-io-758/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 819 字节压缩)
+[16:16:56] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 795 字节压缩)
+[16:16:57] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 798 字节压缩)
+[16:16:57] [p2p-io-771/INFO]: 环境快照已发布: id=6f725794fe8f02fc72f55f33d8ac214ccbdb4ccca130f7dc163c71cd51564460 文件数=141
+[16:16:58] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 821 字节压缩)
+[16:16:58] [p2p-io-771/INFO]: 环境快照已发布: id=92314a56a5b50547830cc60f60433e17122ea30d071b0f9dc3578c1eadb87be2 文件数=141
+[16:16:59] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 794 字节压缩)
+[16:16:59] [p2p-io-771/INFO]: 环境快照已发布: id=df98eb8234082655c2505b42222757162edc8e2573b2ee6037c289dc1a2585dd 文件数=141
+[16:17:00] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 797 字节压缩)
+[16:17:00] [p2p-io-771/INFO]: 环境快照已发布: id=c9b439e6c04f90521a392c7ed77b61292856976c7f038e54bea7acf1582844ee 文件数=141
+[16:17:01] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 813 字节压缩)
+[16:17:01] [p2p-io-771/INFO]: 环境快照已发布: id=5f514e1d8534c38efeb0e06fc1df53c5743cca329e4bf350b2c887509b96414a 文件数=141
+[16:17:02] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 804 字节压缩)
+[16:17:03] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 843 字节压缩)
+[16:17:03] [p2p-io-771/INFO]: 环境快照已发布: id=742bd33a2fd150a70c5fbfee2eaf92fc10e2fa1a68917b0a1713acf345734a38 文件数=141
+[16:17:04] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 834 字节压缩)
+[16:17:04] [p2p-io-771/INFO]: 环境快照已发布: id=39d0a93cfbf203eef786558dc4c0aba9565c78514c15d2b28bfe41f5901cf5b5 文件数=141
+[16:17:05] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 824 字节压缩)
+[16:17:06] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 811 字节压缩)
+[16:17:06] [p2p-io-771/INFO]: 环境快照已发布: id=95c98d144b5c3f6371442d27ada8ab4ef68ca5e5e544c615b08b979ad714fb83 文件数=141
+[16:17:07] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 819 字节压缩)
+[16:17:07] [p2p-io-771/INFO]: 环境快照已发布: id=ef91a362f0d0c0c542d171f3d6167b1cbbfe2ca823690e26f830d3236cde9cab 文件数=141
+[16:17:08] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 820 字节压缩)
+[16:17:09] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 817 字节压缩)
+[16:17:09] [p2p-io-771/INFO]: 环境快照已发布: id=4709b3536666935b762cd43da067f37d650f482148c86b3cf7a97fc9854ea3b8 文件数=141
+[16:17:10] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 803 字节压缩)
+[16:17:10] [p2p-io-771/INFO]: 环境快照已发布: id=18ab17d44d979cb8c618caf87c3a5d2c75e7dbc513974df426239c62fe29f6a1 文件数=141
+[16:17:11] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 835 字节压缩)
+[16:17:11] [Server thread/INFO]: LXW1019 lost connection: Timed out
+[16:17:11] [Server thread/INFO]: LXW1019 left the game
+[16:17:12] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 804 字节压缩)
+[16:17:12] [p2p-io-771/INFO]: 环境快照已发布: id=6bd864c91a624ab77d9aded8ab2396483aef4697f0d4b5b151ba6abc2994890c 文件数=141
+[16:17:13] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 813 字节压缩)
+[16:17:13] [p2p-io-771/INFO]: 环境快照已发布: id=7beb7fd9e4253ec858096d809111e4e103049e4aa203fa737d3c0e33634648e4 文件数=141
+[16:17:14] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 837 字节压缩)
+[16:17:14] [p2p-io-771/INFO]: 环境快照已发布: id=1f811d949803a772de6186a837f62d5d77397c3babaad4a2a56af6423a7b7b47 文件数=141
+[16:17:15] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 843 字节压缩)
+[16:17:15] [p2p-io-771/INFO]: 环境快照已发布: id=0ffa2c540ddbffbddd50fe13c6f6e61208867c4c7ea44d3aa60dbfa5bbe636a7 文件数=141
+[16:17:16] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 833 字节压缩)
+[16:17:16] [p2p-io-771/INFO]: 环境快照已发布: id=4f9653c1467fba36db7f3cad8d6aa4c287e3b9f18c6588b6c425e9e644f5a2cf 文件数=141
+[16:17:17] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 840 字节压缩)
+[16:17:18] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 801 字节压缩)
+[16:17:18] [p2p-io-771/INFO]: 环境快照已发布: id=3de62d1e0978d3aaeb4a54a808cddd5cbf5339f007fea30793c01a73fb02765b 文件数=141
+[16:17:19] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 810 字节压缩)
+[16:17:19] [p2p-io-771/INFO]: 环境快照已发布: id=d4378ed093d93bcaa4577b7c85f8a0dc9827bc313337a706241ab4e03c547598 文件数=141
+[16:17:20] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 835 字节压缩)
+[16:17:20] [p2p-io-771/INFO]: 环境快照已发布: id=34b2333be08ad3240d04d3695e4db3254ee0ef6da1895368cdd5602b3b4c5a27 文件数=141
+[16:17:21] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 840 字节压缩)
+[16:17:22] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 831 字节压缩)
+[16:17:22] [p2p-io-771/INFO]: 环境快照已发布: id=b148c5f1700637e4313957f21457fea16f33ebfae21276043957c32d58872b22 文件数=141
+[16:17:23] [p2p-io-696/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 842 字节压缩)
+[16:17:23] [p2p-io-771/INFO]: 环境快照已发布: id=de9d3a436847b28477fc81bf854003ecf1d1448e3c6e0588dba9ef1f04ca7e37 文件数=141
+[16:17:24] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 826 字节压缩)
+[16:17:24] [p2p-io-771/INFO]: 环境快照已发布: id=510e36e700a24175336c497e51a45085d00271a8266b5d7eba9661acf8bfbf99 文件数=141
+[16:17:25] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 839 字节压缩)
+[16:17:25] [p2p-io-771/INFO]: 环境快照已发布: id=e9e42f7075e8e1c342e20cff13ba173da12c75493c622b6425bfd634093fd953 文件数=141
+[16:17:26] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 840 字节压缩)
+[16:17:26] [p2p-io-771/INFO]: 环境快照已发布: id=dbbe173e5186faf3e2e618d6ee87b6b1edcf7431742da831ff6f319839b9c5b0 文件数=141
+[16:17:27] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 837 字节压缩)
+[16:17:28] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 840 字节压缩)
+[16:17:28] [p2p-io-771/INFO]: 环境快照已发布: id=bb9fea9125a047186d1264d32d753db26b383ba8a33009ab56dfd189ed95d31b 文件数=141
+[16:17:29] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 840 字节压缩)
+[16:17:29] [p2p-io-771/INFO]: 环境快照已发布: id=da5c15ecca7d9fee6b6b16d18f68f75cab23cdeb8bc7abbd6215a2e7f538fb5c 文件数=141
+[16:17:30] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 835 字节压缩)
+[16:17:30] [p2p-io-771/INFO]: 环境快照已发布: id=5a7645058663e6340d2afc3eefce762e3c3218d2f71f94e72010051a37ebc1af 文件数=141
+[16:17:31] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 828 字节压缩)
+[16:17:31] [p2p-io-771/INFO]: 环境快照已发布: id=4160499063e790c554e39c160628da3e353577e559870b15cc5c4cbeffdc02c7 文件数=141
+[16:17:32] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 834 字节压缩)
+[16:17:33] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 808 字节压缩)
+[16:17:33] [p2p-io-771/INFO]: 环境快照已发布: id=8cac030435641e9cec6905d10cca5d3f9fe302c3f877969b295ed4d0959f91f8 文件数=141
+[16:17:34] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 806 字节压缩)
+[16:17:34] [p2p-io-771/INFO]: 环境快照已发布: id=a6cbf3609f9405c154248caaa336c67444eb2439ad04b84bf2a790b5a416be74 文件数=141
+[16:17:35] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 802 字节压缩)
+[16:17:35] [p2p-io-771/INFO]: 环境快照已发布: id=59cac55c9a2f1bb72686965340506e128652c9a5e57ea1a849aed97b62f535b4 文件数=141
+[16:17:36] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 833 字节压缩)
+[16:17:37] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 840 字节压缩)
+[16:17:37] [p2p-io-771/INFO]: 环境快照已发布: id=7d2a721b6dc9655bb948a01e993ca791b7587729eec80c1355309d0afcf8c290 文件数=141
+[16:17:38] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 825 字节压缩)
+[16:17:38] [p2p-io-771/INFO]: 环境快照已发布: id=4c4c2ff86a0109324b7fea7d34ec2da32a7fda2eb3adf42dc96d416c2bfc70d5 文件数=141
+[16:17:39] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 836 字节压缩)
+[16:17:39] [p2p-io-771/INFO]: 环境快照已发布: id=3bb3e523ea420b340f63a8dce66212767c43e0752ec0b1e8bceb8a2a77cfe0b3 文件数=141
+[16:17:40] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 837 字节压缩)
+[16:17:40] [p2p-io-771/INFO]: 环境快照已发布: id=ac86d09fd76739f0f88f707bf53e9c96c6a4e06007c0c1f9112569422dfa39e5 文件数=141
+[16:17:41] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 841 字节压缩)
+[16:17:41] [p2p-io-771/INFO]: 环境快照已发布: id=208e85a14e85ff2aa637093aa2f321a4ba4681bc931dd0f63616b2038da2670f 文件数=141
+[16:17:42] [p2p-io-755/INFO]: 玩家数据已写回: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 (上传方 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0, 831 字节压缩)
+[16:17:43] [p2p-io-771/INFO]: 环境快照已发布: id=fae0bb58f7d3480874c2a37920d48965a857946ebb809223bd625137043220e4 文件数=141
+[16:17:44] [p2p-io-771/INFO]: 环境快照已发布: id=fae0bb58f7d3480874c2a37920d48965a857946ebb809223bd625137043220e4 文件数=141
+[16:19:05] [p2p-io-855/INFO]: 环境快照已发布: id=6b71fd84fc38877af74a551fe349ca0c4a063120b24841d6ba4e9191c699ab25 文件数=141
+[16:19:06] [p2p-io-771/INFO]: 组 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 已解散（主客户端 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0 离线，1 名成员）
+[16:19:07] [p2p-io-771/INFO]: 客户端断开清理完成: 9207ce8d-2b04-4fd8-a9f7-a437ce1211a0，耐久释放 0 个区块
+[16:19:44] [Server thread/INFO]: Stopping the server
+[16:19:44] [Server thread/INFO]: 控制服务器已停止 (端口 15953)
+[16:19:44] [Server thread/INFO]: 控制服务器已停止 (端口 40774)
+[16:19:44] [Server thread/INFO]: 中转服务已停止
+[16:19:44] [Server thread/INFO]: P2P 服务端主服务已停止
+[16:19:44] [Server thread/INFO]: Stopping server
+[16:19:44] [Server thread/INFO]: Saving players
+[16:19:44] [Server thread/INFO]: Saving worlds
+[16:19:44] [Server thread/INFO]: Saving chunks for level 'ServerLevel[world]'/minecraft:overworld
+[16:19:44] [Server thread/INFO]: Saving chunks for level 'ServerLevel[world]'/minecraft:the_end
+[16:19:44] [Server thread/INFO]: Saving chunks for level 'ServerLevel[world]'/minecraft:the_nether
+[16:19:44] [Server thread/INFO]: ThreadedAnvilChunkStorage (world): All chunks are saved
+[16:19:44] [Server thread/INFO]: ThreadedAnvilChunkStorage (DIM1): All chunks are saved
+[16:19:44] [Server thread/INFO]: ThreadedAnvilChunkStorage (DIM-1): All chunks are saved
+[16:19:44] [Server thread/INFO]: ThreadedAnvilChunkStorage: All dimensions are saved

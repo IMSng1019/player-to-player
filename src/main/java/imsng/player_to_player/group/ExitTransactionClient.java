@@ -1,5 +1,6 @@
 package imsng.player_to_player.group;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
@@ -92,16 +93,18 @@ public final class ExitTransactionClient {
                             bundle.playerData(playerId));
                 }
                 Comparator<ChunkKey> byKey = Comparator.comparing(ChunkKey::asString);
-                for (ChunkKey key : bundle.writtenChunks().stream().sorted(byKey).toList()) {
-                    sendChunk(connection, bundle, key, false, bundle.chunkData(key));
+                var writtenChunks = bundle.writtenChunks().stream().sorted(byKey).toList();
+                for (ChunkKey key : writtenChunks) {
+                    sendChunk(connection, bundle, key, bundle.chunkData(key));
                 }
-                for (ChunkKey key : bundle.preserveExistingChunks().stream()
-                        .sorted(byKey).toList()) {
-                    sendChunk(connection, bundle, key, true, null);
+                JsonObject commitJson = idJson(bundle.manifest().shutdownId());
+                JsonArray writtenChunkKeys = new JsonArray(writtenChunks.size());
+                for (ChunkKey key : writtenChunks) {
+                    writtenChunkKeys.add(key.asString());
                 }
+                commitJson.add("writtenChunks", writtenChunkKeys);
                 ControlMessage commit = request(connection, ControlMessage.of(
-                        MessageType.EXIT_COMMIT,
-                        idJson(bundle.manifest().shutdownId())));
+                        MessageType.EXIT_COMMIT, commitJson));
                 requireBoolean(commit, MessageType.EXIT_COMMIT, "committed");
                 return;
             } catch (Exception e) {
@@ -132,19 +135,12 @@ public final class ExitTransactionClient {
     }
 
     private void sendChunk(ControlConnection connection, ExitBundle bundle,
-                           ChunkKey key, boolean preserve, byte[] data) throws Exception {
+                           ChunkKey key, byte[] data) throws Exception {
         JsonObject json = idJson(bundle.manifest().shutdownId());
         json.addProperty("dimension", key.dimension());
         json.addProperty("x", key.x());
         json.addProperty("z", key.z());
-        json.addProperty("preserveExisting", preserve);
-        if (preserve) {
-            ControlMessage response = request(connection, ControlMessage.of(
-                    MessageType.EXIT_CHUNK_DATA, json));
-            requireBoolean(response, MessageType.EXIT_CHUNK_DATA, "written");
-        } else {
-            sendPayload(connection, MessageType.EXIT_CHUNK_DATA, json, data);
-        }
+        sendPayload(connection, MessageType.EXIT_CHUNK_DATA, json, data);
     }
 
     private void sendPayload(ControlConnection connection, MessageType type,

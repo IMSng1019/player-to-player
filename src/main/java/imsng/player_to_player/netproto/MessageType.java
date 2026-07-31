@@ -55,9 +55,9 @@ public enum MessageType {
     CHUNK_CLAIM_REQUEST(20),
     /** S→C 申请结果（granted / 拒绝原因：占用组、阻塞区块；hasServerData 指示走服务端数据还是种子生成）。 */
     CHUNK_CLAIM_RESPONSE(21),
-    /** C→S 卸载区块（json: dimension, x, z, groupId；binary: 最终区块数据，Phase 2 起携带）。 */
+    /** C→S 卸载区块（json: dimension, x, z, groupId, releaseId；binary: 可选最终区块数据）。 */
     CHUNK_RELEASE(22),
-    /** S→C 卸载确认。 */
+    /** S→C 卸载确认（json: released, finalDataWritten；相同 releaseId 重放原结果）。 */
     CHUNK_RELEASE_ACK(23),
     /** C→S 区块数据增量上传（主客户端实时同步修改；Phase 2）。 */
     CHUNK_DATA_UPLOAD(24),
@@ -74,6 +74,11 @@ public enum MessageType {
     CHUNK_PROBE_REQUEST(27),
     /** S→C 探测结果（json: blocked, blockingChunk, blockingGroup；空闲时 blocked=false）。 */
     CHUNK_PROBE_RESPONSE(28),
+    /**
+     * C→S 客户端已收到正释放 ACK，可回收对应耐久回执（json: releaseId, groupId）。
+     * 服务端以同类型回复 accepted；重复确认始终安全。
+     */
+    CHUNK_RELEASE_RECEIPT_CONFIRM(29),
 
     // ---------------------------------------------------------- 算力角色 30-39
     /** C→S 算力上报（json: ComputeScore 序列化）。 */
@@ -238,13 +243,14 @@ public enum MessageType {
      */
     EXIT_PLAYER_DATA(101),
     /**
-     * C→S 最终区块 NBT 分片（除区块键与 preserveExisting 外，字段同玩家分片；
-     * preserveExisting=true 时不带分片）。同类型应答 json: accepted, written。
+     * C→S 实际需要覆盖的最终区块 NBT 分片（除区块键外，字段同玩家分片）。
+     * 干净区块不发送本消息；同类型应答 json: accepted, written。
      */
     EXIT_CHUNK_DATA(102),
     /**
-     * C→S 提交退出事务（json: shutdownId）。服务端确认本轮数据齐全、刷新存储、
-     * 持久化 committed 并清理组占用后，以同类型应答 json: committed。
+     * C→S 提交退出事务（json: shutdownId, writtenChunks[]）。服务端验证已收到的区块
+     * 与声明集合完全相等，先持久化 committed 计划，再只应用 written 数据、刷新存储并
+     * 释放完整 ownership 清单；完成后以同类型应答 json: committed。
      */
     EXIT_COMMIT(103);
 

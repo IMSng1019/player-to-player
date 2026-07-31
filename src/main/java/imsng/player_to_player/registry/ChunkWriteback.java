@@ -13,14 +13,34 @@ import java.util.UUID;
 @FunctionalInterface
 public interface ChunkWriteback {
 
+    record ReleaseResult(boolean finalDataWritten, boolean released) {
+    }
+
     /**
-     * 校验并把最终区块数据写回存档，<b>并阻塞至落盘</b>（保证释放后其他组
-     * 的 hasServerData 探测能看到该数据）。
+     * 在同一区块写锁内参与释放的幂等事务。
+     * {@link #replay()} 在任何 NBT 写入前查询既有耐久回执；只有首次操作才调用
+     * {@link #commit(boolean)} 建立回执并删除 ownership。
+     */
+    interface ReleaseTransaction {
+
+        /** @return 已完成操作的原始结果；首次执行返回 null */
+        ReleaseResult replay();
+
+        /** 最终数据处理完成后原子提交释放；失败返回 released=false。 */
+        ReleaseResult commit(boolean finalDataWritten);
+    }
+
+    /**
+     * 在该区块与实时上行共用的锁内，校验并写回最终数据、阻塞至落盘，然后调用
+     * release 删除 ownership。实现必须保证回调返回前不释放区块写锁，防迟到实时
+     * 上行插入“最终落盘”和“所有权删除”之间。
      *
      * @param key      区块键
      * @param uploader 上传方 clientId（权威校验：必须等于注册表登记的占用组）
-     * @param gzipNbt  压缩的区块 NBT（NbtIo.writeCompressed 产物）
-     * @return 是否成功写回（失败只记日志，不阻断释放流程）
+     * @param gzipNbt  压缩的区块 NBT；null/空表示干净区块只释放 ownership
+     * @param transaction 同区块锁内先查回执、首次完成时再提交的释放事务
+     * @return 最终数据与 ownership 各自是否已确认
      */
-    boolean writeFinalAndFlush(ChunkKey key, UUID uploader, byte[] gzipNbt);
+    ReleaseResult finalizeAndRelease(ChunkKey key, UUID uploader, byte[] gzipNbt,
+                                     ReleaseTransaction transaction);
 }
