@@ -1,8 +1,8 @@
 {
 	"schemaVersion": 1,
-	"id": "金织 player_to_player",
+	"id": "player_to_player",
 	"version": "${version}",
-	"name": "Player to Player(P2P)",
+	"name": "金织 Player to Player(P2P)",
 	"description": "P2P 分布式算力模组：通过玩家间 P2P 打洞连接，由多台客户端分担世界主线程运算。",
 	"authors": [
 		"IMSng"
