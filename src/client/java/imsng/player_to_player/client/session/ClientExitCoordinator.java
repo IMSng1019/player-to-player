@@ -124,24 +124,32 @@ public final class ClientExitCoordinator {
         minecraft.setScreen(progress);
         CompletableFuture<ExitBundle> finalBundle = new CompletableFuture<>();
         bundleFuture = finalBundle;
+        long workflowStartedNanos = System.nanoTime();
 
         ThreadPools.io().execute(() -> runWorkflow(
-                minecraft, sourceScreen, progress, kind, finalBundle));
+                minecraft, sourceScreen, progress, kind, finalBundle,
+                workflowStartedNanos));
     }
 
     private static void runWorkflow(Minecraft minecraft, Screen sourceScreen,
                                     ProgressScreen progress, ExitKind kind,
-                                    CompletableFuture<ExitBundle> finalBundle) {
+                                    CompletableFuture<ExitBundle> finalBundle,
+                                    long workflowStartedNanos) {
         try {
             UUID shutdownId = UUID.randomUUID();
+            long phaseStarted = System.nanoTime();
             ExitManifest local = beginLocalUntilReady(shutdownId);
+            long prepareMillis = elapsedMillis(phaseStarted);
             ExitTransactionClient transaction = WorldSession.createExitTransactionClient();
+            phaseStarted = System.nanoTime();
             ExitTransactionClient.BeginOutcome begin =
                     transaction.beginUntilAccepted(local);
+            long beginMillis = elapsedMillis(phaseStarted);
             GroupRuntime.adoptExitManifest(begin.manifest());
-            LOGGER.info("物理服务端已确认退出保护意图: shutdownId={} ownedChunks={} players={}",
+            LOGGER.info("物理服务端已确认退出保护意图: shutdownId={} ownedChunks={} players={} "
+                            + "exit.prepare_ms={} exit.begin_ms={}",
                     shutdownId, begin.manifest().chunks().size(),
-                    begin.manifest().playerIds().size());
+                    begin.manifest().playerIds().size(), prepareMillis, beginMillis);
 
             CompletableFuture<Void> disconnected = new CompletableFuture<>();
             minecraft.execute(() -> {
@@ -169,14 +177,24 @@ public final class ClientExitCoordinator {
             });
             disconnected.join();
 
+            phaseStarted = System.nanoTime();
             ExitBundle bundle = finalBundle.join();
+            long saveMillis = elapsedMillis(phaseStarted);
             LOGGER.info("主客户端退出最终数据已收集: shutdownId={} ownedChunks={} "
-                            + "writtenChunks={} compressedBytes={}",
+                            + "writtenChunks={} compressedBytes={} exit.save_ms={}",
                     shutdownId, bundle.manifest().chunks().size(),
-                    bundle.writtenChunks().size(), bundle.compressedBytes());
+                    bundle.writtenChunks().size(), bundle.compressedBytes(), saveMillis);
+            phaseStarted = System.nanoTime();
             transaction.commitUntilAccepted(bundle);
-            LOGGER.info("主客户端退出事务已提交: shutdownId={}", shutdownId);
+            long commitMillis = elapsedMillis(phaseStarted);
+            long durableTotalMillis = elapsedMillis(workflowStartedNanos);
+            LOGGER.info("主客户端退出事务已提交: shutdownId={} exit.commit_ms={} "
+                            + "exit.total_to_durable_ms={}",
+                    shutdownId, commitMillis, durableTotalMillis);
+            phaseStarted = System.nanoTime();
             WorldSession.teardownSession();
+            LOGGER.info("主客户端退出会话清理完成: shutdownId={} exit.teardown_ms={}",
+                    shutdownId, elapsedMillis(phaseStarted));
 
             minecraft.execute(() -> {
                 bundleFuture = null;
@@ -227,5 +245,9 @@ public final class ClientExitCoordinator {
                 // 用户明确要求退出事务不可取消。
             }
         }
+    }
+
+    private static long elapsedMillis(long startedNanos) {
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos);
     }
 }

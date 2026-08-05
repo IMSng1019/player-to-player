@@ -2,6 +2,8 @@ package imsng.player_to_player.server;
 
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import imsng.player_to_player.group.ChunkDelta;
+import imsng.player_to_player.group.ChunkDeltaBatch;
 import imsng.player_to_player.group.ExitManifest;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
@@ -10,6 +12,7 @@ import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.registry.ChunkKey;
 import imsng.player_to_player.util.JsonUtil;
 import imsng.player_to_player.util.Sha256;
+import imsng.player_to_player.util.ThreadPools;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -17,6 +20,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -71,6 +75,30 @@ public final class ExitTransactionHandlers {
         boolean stageChunk(ExitManifest manifest, ChunkKey key, byte[] gzipNbt,
                            boolean preserveExisting);
 
+        /**
+         * v5 退出尾部批次的默认兼容实现。生产 {@link ExitPayloadStore} 会覆盖此方法，
+         * 把整批二进制写成一个可重建文件，避免退化为逐区块临时文件写入。
+         */
+        default boolean stageChunkBatch(ExitManifest manifest,
+                                        ChunkDeltaBatch batch) {
+            for (ChunkDelta delta : batch.deltas()) {
+                if (!stageChunk(manifest, delta.key(), delta.payload(), false)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /**
+         * 从可重建暂存区组装最终复合 WAL 载荷。只有启用 v5 世界 WAL 的生产路径调用；
+         * 旧测试/兼容实现可继续只实现 stage/apply。
+         */
+        default ExitCommitPayload prepareCommit(
+                ExitManifest manifest,
+                ExitTransactionLedger.ChunkDisposition disposition) {
+            throw new UnsupportedOperationException("未配置退出复合提交组装器");
+        }
+
         void apply(ExitManifest manifest,
                    ExitTransactionLedger.ChunkDisposition disposition);
 
@@ -95,7 +123,20 @@ public final class ExitTransactionHandlers {
     private final SessionGuard sessionGuard;
     private final CommitCleanup cleanup;
     private final Executor executor;
+    /** 非空表示启用 v5 复合世界 WAL，最终 ACK 不再等待正式物化。 */
+    private final DurableChunkJournal durableJournal;
     private final ConcurrentHashMap<UUID, CompletableFuture<Void>> beginBarriers =
+            new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, Boolean> cleanupTasks =
+            new ConcurrentHashMap<>();
+    /**
+     * 同一退出事务的正式数据应用与 ownership/组表清理必须严格串行。
+     *
+     * <p>后台 ACK 后清理、服务端启动恢复以及 ROLE_REQUEST 重进恢复都可能同时
+     * 到达这里。只依赖 ledger 的分步状态检查会形成 check-then-act 竞态，使旧退出
+     * 快照重复覆盖玩家文件，并让较慢的旧清理误删已经重建的新组。</p>
+     */
+    private final ConcurrentHashMap<UUID, CompletableFuture<Void>> cleanupBarriers =
             new ConcurrentHashMap<>();
     private final ExitPayloadAssembler payloadAssembler = new ExitPayloadAssembler();
 
@@ -121,7 +162,7 @@ public final class ExitTransactionHandlers {
                                    Executor executor) {
         this(ledger, authorizer, pendingProtection, payloadStore,
                 flushRealtime, cleanup, executor,
-                (connection, action) -> action.getAsBoolean());
+                (connection, action) -> action.getAsBoolean(), null);
     }
 
     public ExitTransactionHandlers(ExitTransactionLedger ledger,
@@ -140,13 +181,36 @@ public final class ExitTransactionHandlers {
         this.cleanup = cleanup;
         this.executor = executor;
         this.sessionGuard = sessionGuard;
+        this.durableJournal = null;
+    }
+
+    public ExitTransactionHandlers(ExitTransactionLedger ledger,
+                                   BeginAuthorizer authorizer,
+                                   PendingProtection pendingProtection,
+                                   PayloadStore payloadStore,
+                                   Runnable flushRealtime,
+                                   CommitCleanup cleanup,
+                                   Executor executor,
+                                   SessionGuard sessionGuard,
+                                   DurableChunkJournal durableJournal) {
+        this.ledger = ledger;
+        this.authorizer = authorizer;
+        this.pendingProtection = pendingProtection;
+        this.payloadStore = payloadStore;
+        this.flushRealtime = flushRealtime;
+        this.cleanup = cleanup;
+        this.executor = executor;
+        this.sessionGuard = sessionGuard;
+        this.durableJournal = durableJournal;
     }
 
     public void register(HandlerRegistry registry) {
         registry.on(MessageType.EXIT_BEGIN, this::handleBegin);
         registry.on(MessageType.EXIT_PLAYER_DATA, this::handlePlayer);
         registry.on(MessageType.EXIT_CHUNK_DATA, this::handleChunk);
+        registry.on(MessageType.EXIT_CHUNK_BATCH, this::handleChunkBatch);
         registry.on(MessageType.EXIT_COMMIT, this::handleCommit);
+        registry.on(MessageType.EXIT_STATUS, this::handleStatus);
     }
 
     public boolean isProtectedAfterBegins(UUID clientId) {
@@ -255,6 +319,8 @@ public final class ExitTransactionHandlers {
                 previous.handle((ignored, failure) -> null).join();
             }
             JsonObject out = new JsonObject();
+            java.util.concurrent.atomic.AtomicReference<ExitManifest> cleanupAfterReply =
+                    new java.util.concurrent.atomic.AtomicReference<>();
             boolean current = sessionGuard.run(connection, () -> {
                 try {
                 UUID currentPeer = connection.peerId();
@@ -279,7 +345,11 @@ public final class ExitTransactionHandlers {
                         throw e;
                     }
                     if (result.accepted() && result.committed()) {
-                        ensureCleanupComplete(effective);
+                        if (durableJournal == null) {
+                            ensureCleanupComplete(effective);
+                        } else {
+                            cleanupAfterReply.set(effective);
+                        }
                     } else if (result.accepted()) {
                         // ledger pending 已耐久后再把注册表校准并持久化；失败不回 ACK，
                         // 客户端重放 BEGIN 时会重复保护，不能在半保护状态下断开。
@@ -306,6 +376,10 @@ public final class ExitTransactionHandlers {
             }
             try {
                 connection.send(message.reply(MessageType.EXIT_BEGIN, out, null));
+                ExitManifest cleanupManifest = cleanupAfterReply.get();
+                if (cleanupManifest != null) {
+                    scheduleCleanup(cleanupManifest);
+                }
             } finally {
                 barrier.complete(null);
                 if (peerId != null) {
@@ -406,9 +480,61 @@ public final class ExitTransactionHandlers {
         });
     }
 
+    /**
+     * v5 退出尾部批次处理：先完整解码/校验批次，再由 PayloadStore 一次性暂存，
+     * 最后原子登记整批区块已收到。重复 batchId 会由存储层幂等接受。
+     */
+    private void handleChunkBatch(ControlConnection connection, ControlMessage message) {
+        executor.execute(() -> {
+            boolean accepted = false;
+            boolean written = false;
+            try {
+                UUID peerId = connection.peerId();
+                UUID shutdownId = parseUuid(message.json(), "shutdownId");
+                ChunkDeltaBatch batch = ChunkDeltaBatch.decode(message.binary());
+                String declaredBatch = JsonUtil.getString(message.json(), "batchId", "");
+                int declaredSequence = JsonUtil.getInt(message.json(), "sequence", -1);
+                String declaredSha256 = JsonUtil.getString(
+                        message.json(), "sha256", "");
+                if (!batch.batchId().toString().equals(declaredBatch)
+                        || batch.sequence() != declaredSequence
+                        || !Sha256.hex(message.binary()).equals(declaredSha256)) {
+                    throw new IllegalArgumentException("退出批次身份不一致");
+                }
+                ExitManifest manifest = ledger.manifest(peerId, shutdownId);
+                if (manifest == null || batch.deltas().isEmpty()) {
+                    throw new IllegalStateException("退出事务不存在或批次为空");
+                }
+                Set<ChunkKey> keys = new HashSet<>();
+                for (ChunkDelta delta : batch.deltas()) {
+                    if (!keys.add(delta.key()) || !manifest.chunks().contains(delta.key())) {
+                        throw new IllegalArgumentException("退出批次区块不在 ownership 清单");
+                    }
+                }
+                boolean[] stored = new boolean[1];
+                boolean current = sessionGuard.run(connection, () -> {
+                    stored[0] = ledger.receiveChunks(peerId, shutdownId, keys,
+                            () -> payloadStore.stageChunkBatch(manifest, batch));
+                    return true;
+                });
+                written = current && stored[0];
+                accepted = written;
+            } catch (Exception e) {
+                LOGGER.warn("EXIT_CHUNK_BATCH 处理失败", e);
+            }
+            JsonObject out = new JsonObject();
+            out.addProperty("accepted", accepted);
+            out.addProperty("written", written);
+            connection.send(message.reply(MessageType.EXIT_CHUNK_BATCH, out, null));
+        });
+    }
+
     private void handleCommit(ControlConnection connection, ControlMessage message) {
         executor.execute(() -> {
+            long started = System.nanoTime();
             boolean[] committed = new boolean[1];
+            java.util.concurrent.atomic.AtomicReference<ExitManifest> cleanupAfterReply =
+                    new java.util.concurrent.atomic.AtomicReference<>();
             sessionGuard.run(connection, () -> {
                 try {
                 UUID peerId = connection.peerId();
@@ -416,11 +542,36 @@ public final class ExitTransactionHandlers {
                 Set<ChunkKey> writtenChunks = parseWrittenChunks(message.json());
                 ExitManifest manifest = ledger.manifest(peerId, shutdownId);
                 if (manifest != null) {
-                    // 暂存对象已经逐个 force；先耐久写 committed 意图，再应用正式数据。
-                    if (ledger.commit(peerId, shutdownId, writtenChunks)) {
-                        ensureCleanupComplete(manifest);
-                        // 只有正式数据和清理元数据全部耐久完成后才允许客户端关闭。
-                        committed[0] = true;
+                    if (durableJournal == null) {
+                        if (ledger.commit(peerId, shutdownId, writtenChunks)) {
+                            ensureCleanupComplete(manifest);
+                            committed[0] = true;
+                        }
+                    } else {
+                        ExitCommitPayload prepared = null;
+                        if (!ledger.isCommitted(peerId, shutdownId)) {
+                            if (!ledger.isReadyToCommit(
+                                    peerId, shutdownId, writtenChunks)) {
+                                return true;
+                            }
+                            prepared = payloadStore.prepareCommit(manifest,
+                                    new ExitTransactionLedger.ChunkDisposition(
+                                            writtenChunks, true));
+                        }
+                        ExitCommitPayload finalPrepared = prepared;
+                        if (ledger.commitAfterDurable(
+                                peerId, shutdownId, writtenChunks, () -> {
+                                    if (finalPrepared == null) {
+                                        return true;
+                                    }
+                                    durableJournal.appendExitCommit(finalPrepared);
+                                    return true;
+                                })) {
+                            // force 成功已经证明最终数据与退出意图可恢复；正式文件、MCA、
+                            // 注册表 checkpoint 和组表清理全部移到 ACK 后重试。
+                            committed[0] = true;
+                            cleanupAfterReply.set(manifest);
+                        }
                     }
                 }
                 } catch (Exception e) {
@@ -430,11 +581,122 @@ public final class ExitTransactionHandlers {
             });
             JsonObject out = new JsonObject();
             out.addProperty("committed", committed[0]);
+            if (committed[0]) {
+                LOGGER.info("退出事务耐久提交完成: shutdownId={} exit.commit_ms={}",
+                        JsonUtil.getString(message.json(), "shutdownId", ""),
+                        java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
+                                System.nanoTime() - started));
+            }
             connection.send(message.reply(MessageType.EXIT_COMMIT, out, null));
+            ExitManifest cleanupManifest = cleanupAfterReply.get();
+            if (cleanupManifest != null) {
+                scheduleCleanup(cleanupManifest);
+            }
         });
     }
 
+    /** 断线重连的只读状态查询；不会改变 pending/committed 状态。 */
+    private void handleStatus(ControlConnection connection, ControlMessage message) {
+        executor.execute(() -> {
+            JsonObject out = new JsonObject();
+            ExitManifest cleanupManifest = null;
+            try {
+                UUID peerId = connection.peerId();
+                UUID shutdownId = parseUuid(message.json(), "shutdownId");
+                ExitManifest manifest = ledger.manifest(peerId, shutdownId);
+                out.addProperty("accepted", manifest != null);
+                out.addProperty("committed",
+                        manifest != null && ledger.isCommitted(peerId, shutdownId));
+                out.addProperty("cleanupComplete",
+                        manifest != null && ledger.isCleanupComplete(peerId, shutdownId));
+                if (manifest != null) {
+                    out.add("manifest", manifest.toJson());
+                    if (durableJournal != null
+                            && ledger.isCommitted(peerId, shutdownId)
+                            && !ledger.isCleanupComplete(peerId, shutdownId)) {
+                        cleanupManifest = manifest;
+                    }
+                }
+            } catch (Exception e) {
+                out.addProperty("accepted", false);
+                out.addProperty("committed", false);
+                out.addProperty("cleanupComplete", false);
+            }
+            connection.send(message.reply(MessageType.EXIT_STATUS, out, null));
+            if (cleanupManifest != null) {
+                scheduleCleanup(cleanupManifest);
+            }
+        });
+    }
+
+    /** 同一 shutdownId 只允许一个后台物化/清理重试链，避免重复 COMMIT 制造并发写。 */
+    private void scheduleCleanup(ExitManifest manifest) {
+        UUID shutdownId = manifest.shutdownId();
+        if (cleanupTasks.putIfAbsent(shutdownId, Boolean.TRUE) != null) {
+            return;
+        }
+        try {
+            executor.execute(() -> runCleanupAttempt(manifest));
+        } catch (RuntimeException e) {
+            cleanupTasks.remove(shutdownId);
+            LOGGER.warn("退出后台清理任务提交失败，将由重连/重启恢复: {}",
+                    shutdownId, e);
+        }
+    }
+
+    private void runCleanupAttempt(ExitManifest manifest) {
+        UUID shutdownId = manifest.shutdownId();
+        try {
+            ensureCleanupComplete(manifest);
+            cleanupTasks.remove(shutdownId);
+        } catch (RuntimeException e) {
+            LOGGER.warn("退出事务后台物化/清理失败，1 秒后继续重试: {}",
+                    shutdownId, e);
+            try {
+                ThreadPools.scheduler().schedule(() -> {
+                    try {
+                        executor.execute(() -> runCleanupAttempt(manifest));
+                    } catch (RuntimeException submitFailure) {
+                        cleanupTasks.remove(shutdownId);
+                        LOGGER.warn("退出后台清理重试提交失败，将由重连/重启恢复: {}",
+                                shutdownId, submitFailure);
+                    }
+                }, 1, TimeUnit.SECONDS);
+            } catch (RuntimeException scheduleFailure) {
+                cleanupTasks.remove(shutdownId);
+                LOGGER.warn("退出后台清理重试调度失败，将由重连/重启恢复: {}",
+                        shutdownId, scheduleFailure);
+            }
+        }
+    }
+
     private void ensureCleanupComplete(ExitManifest manifest) {
+        UUID shutdownId = manifest.shutdownId();
+        while (true) {
+            CompletableFuture<Void> existing = cleanupBarriers.get(shutdownId);
+            if (existing != null) {
+                existing.join();
+                return;
+            }
+            CompletableFuture<Void> owned = new CompletableFuture<>();
+            if (cleanupBarriers.putIfAbsent(shutdownId, owned) != null) {
+                continue;
+            }
+            try {
+                ensureCleanupCompleteOnce(manifest);
+                owned.complete(null);
+                return;
+            } catch (RuntimeException | Error failure) {
+                owned.completeExceptionally(failure);
+                throw failure;
+            } finally {
+                cleanupBarriers.remove(shutdownId, owned);
+            }
+        }
+    }
+
+    /** 调用方已经取得 shutdownId 专属屏障。 */
+    private void ensureCleanupCompleteOnce(ExitManifest manifest) {
         if (ledger.isCleanupComplete(manifest.clientId(), manifest.shutdownId())) {
             discardCompletedBestEffort(manifest);
             return;
@@ -552,6 +814,17 @@ public final class ExitTransactionHandlers {
                     .put(key, new ChunkPayload(
                             gzipNbt != null ? gzipNbt.clone() : null,
                             preserveExisting));
+            return true;
+        }
+
+        @Override
+        public synchronized boolean stageChunkBatch(ExitManifest manifest,
+                                                     ChunkDeltaBatch batch) {
+            for (ChunkDelta delta : batch.deltas()) {
+                if (!stageChunk(manifest, delta.key(), delta.payload(), false)) {
+                    return false;
+                }
+            }
             return true;
         }
 

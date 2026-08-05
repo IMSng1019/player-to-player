@@ -14,6 +14,7 @@ import java.nio.file.Path;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -56,6 +57,25 @@ class ExitTransactionStoreTest {
         assertEquals(Set.of(OVERWORLD), committed.writtenChunks());
         assertTrue(committed.writtenChunksDeclared());
         assertFalse(committed.legacyDisposition());
+    }
+
+    @Test
+    void eachStateTransitionUsesOneWalForceAndLatestRecordWins() {
+        AtomicInteger forces = new AtomicInteger();
+        ExitTransactionStore store = new ExitTransactionStore(
+                tempDir, elapsedNanos -> forces.incrementAndGet());
+        ExitManifest manifest = new ExitManifest(SHUTDOWN_ID, CLIENT_ID, CLIENT_ID,
+                Set.of(CLIENT_ID), Set.of(OVERWORLD));
+
+        store.save(new ExitTransactionRecord(manifest, false));
+        store.save(new ExitTransactionRecord(
+                manifest, true, Set.of(OVERWORLD)));
+
+        assertEquals(2, forces.get());
+        ExitTransactionRecord recovered =
+                new ExitTransactionStore(tempDir).load().get(SHUTDOWN_ID);
+        assertTrue(recovered.committed());
+        assertEquals(Set.of(OVERWORLD), recovered.writtenChunks());
     }
 
     @Test

@@ -10,8 +10,10 @@ import imsng.player_to_player.netproto.MessageHandler;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.registry.ChunkKey;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.net.SocketAddress;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -28,6 +30,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ExitTransactionHandlersTest {
+
+    @TempDir
+    Path temporary;
 
     private static final UUID SHUTDOWN_ID =
             UUID.fromString("c768829c-9160-43c7-a4fd-ecc2290936f4");
@@ -95,6 +100,172 @@ class ExitTransactionHandlersTest {
 
         assertTrue(connection.last().json().get("committed").getAsBoolean());
         assertEquals(1, applies.get());
+    }
+
+    @Test
+    void durableCommitRepliesBeforePayloadApplyAndCleanup() throws Exception {
+        ExitTransactionLedger ledger = new ExitTransactionLedger(
+                new InMemoryPersistence());
+        DurableChunkJournal journal = new DurableChunkJournal(
+                temporary.resolve("world-wal"));
+        java.util.ArrayDeque<Runnable> tasks = new java.util.ArrayDeque<>();
+        AtomicInteger applies = new AtomicInteger();
+        AtomicInteger cleanups = new AtomicInteger();
+        ExitTransactionHandlers.PayloadStore payloads =
+                new ExitTransactionHandlers.PayloadStore() {
+                    @Override
+                    public boolean stagePlayer(ExitManifest manifest, UUID playerId,
+                                               byte[] gzipNbt) {
+                        return true;
+                    }
+
+                    @Override
+                    public boolean stageChunk(ExitManifest manifest, ChunkKey key,
+                                              byte[] gzipNbt,
+                                              boolean preserveExisting) {
+                        return !preserveExisting;
+                    }
+
+                    @Override
+                    public ExitCommitPayload prepareCommit(
+                            ExitManifest manifest,
+                            ExitTransactionLedger.ChunkDisposition disposition) {
+                        return new ExitCommitPayload(
+                                manifest, Map.of(CLIENT_ID, new byte[]{1}),
+                                List.of(imsng.player_to_player.group.ChunkDelta.of(
+                                        CHUNK, 1, new byte[]{2})));
+                    }
+
+                    @Override
+                    public void apply(
+                            ExitManifest manifest,
+                            ExitTransactionLedger.ChunkDisposition disposition) {
+                        applies.incrementAndGet();
+                    }
+
+                    @Override
+                    public void discard(ExitManifest manifest) {
+                    }
+                };
+        ExitTransactionHandlers handlers = new ExitTransactionHandlers(
+                ledger,
+                (peer, requested) -> requested,
+                ignored -> {
+                },
+                payloads,
+                () -> {
+                },
+                ignored -> cleanups.incrementAndGet(),
+                tasks::add,
+                (connection, action) -> action.getAsBoolean(),
+                journal);
+        FakeRegistry registry = new FakeRegistry();
+        handlers.register(registry);
+        FakeConnection connection = new FakeConnection(CLIENT_ID);
+
+        registry.handle(connection, ControlMessage.of(
+                MessageType.EXIT_BEGIN, manifest().toJson()));
+        tasks.removeFirst().run();
+        sendPlayerQueued(registry, connection, tasks, new byte[]{1});
+        sendChunkQueued(registry, connection, tasks, new byte[]{2});
+        registry.handle(connection, ControlMessage.of(
+                MessageType.EXIT_COMMIT, commitJson(Set.of(CHUNK))));
+
+        tasks.removeFirst().run();
+        assertTrue(connection.last().json().get("committed").getAsBoolean());
+        assertTrue(journal.exitCommit(SHUTDOWN_ID).isPresent());
+        assertEquals(0, applies.get());
+        assertEquals(0, cleanups.get());
+        assertEquals(1, tasks.size(), "正式物化必须在 ACK 后另行排队");
+
+        tasks.removeFirst().run();
+        assertEquals(1, applies.get());
+        assertEquals(1, cleanups.get());
+        journal.close();
+    }
+
+    @Test
+    void cleanupForSameTransactionIsSerializedBeforeRejoinContinues()
+            throws Exception {
+        ExitTransactionLedger ledger = new ExitTransactionLedger(
+                new InMemoryPersistence());
+        ledger.begin(CLIENT_ID, manifest());
+        ledger.markPlayerReceived(CLIENT_ID, SHUTDOWN_ID, CLIENT_ID);
+        ledger.markChunkReceived(CLIENT_ID, SHUTDOWN_ID, CHUNK);
+        assertTrue(ledger.commit(CLIENT_ID, SHUTDOWN_ID, Set.of(CHUNK)));
+
+        AtomicInteger applies = new AtomicInteger();
+        AtomicInteger cleanups = new AtomicInteger();
+        CountDownLatch firstApplyEntered = new CountDownLatch(1);
+        CountDownLatch secondApplyEntered = new CountDownLatch(1);
+        CountDownLatch allowFirstApply = new CountDownLatch(1);
+        ExitTransactionHandlers.PayloadStore payloads =
+                new ExitTransactionHandlers.PayloadStore() {
+                    @Override
+                    public boolean stagePlayer(ExitManifest manifest, UUID playerId,
+                                               byte[] gzipNbt) {
+                        return true;
+                    }
+
+                    @Override
+                    public boolean stageChunk(ExitManifest manifest, ChunkKey key,
+                                              byte[] gzipNbt,
+                                              boolean preserveExisting) {
+                        return true;
+                    }
+
+                    @Override
+                    public void apply(
+                            ExitManifest manifest,
+                            ExitTransactionLedger.ChunkDisposition disposition) {
+                        int invocation = applies.incrementAndGet();
+                        if (invocation == 1) {
+                            firstApplyEntered.countDown();
+                            try {
+                                allowFirstApply.await();
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                throw new IllegalStateException(e);
+                            }
+                        } else {
+                            secondApplyEntered.countDown();
+                        }
+                    }
+
+                    @Override
+                    public void discard(ExitManifest manifest) {
+                    }
+                };
+        ExitTransactionHandlers handlers = new ExitTransactionHandlers(
+                ledger,
+                (peer, requested) -> requested,
+                ignored -> {
+                },
+                payloads,
+                () -> {
+                },
+                ignored -> cleanups.incrementAndGet(),
+                Runnable::run);
+
+        CompletableFuture<Void> background = CompletableFuture.runAsync(
+                handlers::recoverDurableState);
+        assertTrue(firstApplyEntered.await(5, TimeUnit.SECONDS));
+        CompletableFuture<Integer> rejoin = CompletableFuture.supplyAsync(
+                () -> handlers.abandonPendingForRejoinNow(CLIENT_ID));
+
+        boolean duplicateApplyStarted = secondApplyEntered.await(
+                500, TimeUnit.MILLISECONDS);
+        boolean rejoinPassedCleanup = rejoin.isDone();
+        allowFirstApply.countDown();
+        background.get(5, TimeUnit.SECONDS);
+        assertEquals(0, rejoin.get(5, TimeUnit.SECONDS));
+
+        assertFalse(duplicateApplyStarted,
+                "同一退出事务不得并发重复应用正式数据");
+        assertFalse(rejoinPassedCleanup,
+                "角色重连必须等待旧退出清理完成");
+        assertEquals(1, applies.get());
+        assertEquals(1, cleanups.get());
     }
 
     @Test
@@ -541,6 +712,33 @@ class ExitTransactionHandlersTest {
         chunk.addProperty("preserveExisting", false);
         registry.handle(connection, ControlMessage.of(
                 MessageType.EXIT_CHUNK_DATA, chunk, data));
+        assertTrue(connection.last().json().get("written").getAsBoolean());
+    }
+
+    private static void sendPlayerQueued(FakeRegistry registry,
+                                         FakeConnection connection,
+                                         java.util.ArrayDeque<Runnable> tasks,
+                                         byte[] data) throws Exception {
+        JsonObject player = idJson();
+        player.addProperty("playerUuid", CLIENT_ID.toString());
+        registry.handle(connection, ControlMessage.of(
+                MessageType.EXIT_PLAYER_DATA, player, data));
+        tasks.removeFirst().run();
+        assertTrue(connection.last().json().get("written").getAsBoolean());
+    }
+
+    private static void sendChunkQueued(FakeRegistry registry,
+                                        FakeConnection connection,
+                                        java.util.ArrayDeque<Runnable> tasks,
+                                        byte[] data) throws Exception {
+        JsonObject chunk = idJson();
+        chunk.addProperty("dimension", CHUNK.dimension());
+        chunk.addProperty("x", CHUNK.x());
+        chunk.addProperty("z", CHUNK.z());
+        chunk.addProperty("preserveExisting", false);
+        registry.handle(connection, ControlMessage.of(
+                MessageType.EXIT_CHUNK_DATA, chunk, data));
+        tasks.removeFirst().run();
         assertTrue(connection.last().json().get("written").getAsBoolean());
     }
 

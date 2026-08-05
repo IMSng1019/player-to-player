@@ -1,6 +1,8 @@
 package imsng.player_to_player.server;
 
 import imsng.player_to_player.group.ExitManifest;
+import imsng.player_to_player.group.ChunkDelta;
+import imsng.player_to_player.group.ChunkDeltaBatch;
 import imsng.player_to_player.group.PlayerStateNbt;
 import imsng.player_to_player.registry.ChunkKey;
 import imsng.player_to_player.util.Sha256;
@@ -141,6 +143,103 @@ class ExitPayloadStoreTest {
 
         assertEquals(List.of(CHUNK), written);
         assertEquals(1, flushes.get());
+    }
+
+    @Test
+    void chunkBatchStagesOneDurableFileAndAppliesAllChunks() throws Exception {
+        List<byte[]> writtenChunks = new ArrayList<>();
+        AtomicBoolean flushed = new AtomicBoolean();
+        ExitPayloadStore store = store(
+                new ArrayList<>(), writtenChunks, flushed, false);
+        ExitManifest manifest = manifest(Set.of(CHUNK, CLEAN));
+        assertTrue(store.stagePlayer(manifest, CLIENT, validPlayer()));
+        ChunkDeltaBatch batch = new ChunkDeltaBatch(SHUTDOWN, 0, 0, List.of(
+                ChunkDelta.of(CHUNK, 1, new byte[]{1, 2}),
+                ChunkDelta.of(CLEAN, 1, new byte[]{3, 4})));
+
+        assertTrue(store.stageChunkBatch(manifest, batch));
+        Path batchDirectory = temporary.resolve(SHUTDOWN.toString())
+                .resolve("chunk-batches");
+        try (var files = Files.list(batchDirectory)) {
+            assertEquals(1, files.filter(Files::isRegularFile).count());
+        }
+
+        store.apply(manifest, explicit(Set.of(CHUNK, CLEAN)));
+
+        assertEquals(2, writtenChunks.size());
+        assertTrue(flushed.get());
+    }
+
+    @Test
+    void stagedBatchIsInvisibleUntilCompositeCommitBecomesDurable()
+            throws Exception {
+        List<byte[]> writtenPlayers = new ArrayList<>();
+        List<byte[]> writtenChunks = new ArrayList<>();
+        AtomicBoolean flushed = new AtomicBoolean();
+        AtomicInteger materializeBatches = new AtomicInteger();
+        DurableChunkJournal journal = new DurableChunkJournal(
+                temporary.resolve("world-wal"));
+        ExitPayloadStore store = new ExitPayloadStore(temporary.resolve("payloads"),
+                (playerId, data) -> {
+                    writtenPlayers.add(data.clone());
+                    return true;
+                },
+                new ExitPayloadStore.ChunkAccess() {
+                    @Override
+                    public boolean validate(UUID groupId, ChunkKey key, byte[] data,
+                                            boolean preserveExisting) {
+                        return !preserveExisting && data != null;
+                    }
+
+                    @Override
+                    public boolean write(UUID groupId, ChunkKey key, byte[] data,
+                                         boolean preserveExisting) {
+                        writtenChunks.add(data.clone());
+                        return true;
+                    }
+
+                    @Override
+                    public void materialize(UUID groupId, ChunkKey key, byte[] data) {
+                        writtenChunks.add(data.clone());
+                    }
+
+                    @Override
+                    public void materializeBatch(UUID groupId,
+                                                 List<ChunkDelta> deltas) {
+                        materializeBatches.incrementAndGet();
+                        deltas.forEach(delta -> writtenChunks.add(
+                                delta.payload()));
+                    }
+
+                    @Override
+                    public void flush() {
+                        flushed.set(true);
+                    }
+                }, journal);
+        ExitManifest manifest = manifest(Set.of(CHUNK, CLEAN));
+        ChunkDeltaBatch batch = new ChunkDeltaBatch(SHUTDOWN, 0, 0, List.of(
+                ChunkDelta.of(CHUNK, 3, new byte[]{1, 2}),
+                ChunkDelta.of(CLEAN, 4, new byte[]{3, 4})));
+        assertTrue(store.stagePlayer(manifest, CLIENT, validPlayer()));
+        assertTrue(store.stageChunkBatch(manifest, batch));
+        assertFalse(journal.latest(CHUNK).isPresent());
+        assertFalse(journal.latest(CLEAN).isPresent());
+
+        ExitCommitPayload prepared = store.prepareCommit(
+                manifest, explicit(Set.of(CHUNK, CLEAN)));
+        assertEquals(Set.of(CHUNK, CLEAN), prepared.writtenChunks());
+        assertFalse(journal.latest(CHUNK).isPresent());
+
+        journal.appendExitCommit(prepared);
+        assertTrue(journal.latest(CHUNK).isPresent());
+        assertTrue(journal.latest(CLEAN).isPresent());
+        store.apply(manifest, explicit(Set.of(CHUNK, CLEAN)));
+
+        assertEquals(1, writtenPlayers.size());
+        assertEquals(2, writtenChunks.size());
+        assertEquals(1, materializeBatches.get());
+        assertFalse(flushed.get(), "WAL 模式下 MCA 物化不得同步 flush");
+        journal.close();
     }
 
     @Test

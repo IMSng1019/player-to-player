@@ -14,6 +14,8 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Comparator;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -25,6 +27,11 @@ public final class ExitTransactionClient {
 
     private static final Logger LOGGER =
             LoggerFactory.getLogger("player_to_player/exit-client");
+
+    /** 小批次沿用单区块消息形态以减少封装开销；大退出一律走 v5 批次。 */
+    private static final int BATCH_MIN_CHUNKS = 3;
+    /** 单批记录预算，留出批次头、JSON 与控制帧余量。 */
+    private static final int BATCH_RECORD_BYTES = 4 * 1024 * 1024;
 
     public interface ConnectionFactory {
         ControlConnection connect() throws Exception;
@@ -94,8 +101,12 @@ public final class ExitTransactionClient {
                 }
                 Comparator<ChunkKey> byKey = Comparator.comparing(ChunkKey::asString);
                 var writtenChunks = bundle.writtenChunks().stream().sorted(byKey).toList();
-                for (ChunkKey key : writtenChunks) {
-                    sendChunk(connection, bundle, key, bundle.chunkData(key));
+                if (writtenChunks.size() >= BATCH_MIN_CHUNKS) {
+                    sendChunkBatches(connection, bundle, writtenChunks);
+                } else {
+                    for (ChunkKey key : writtenChunks) {
+                        sendChunk(connection, bundle, key, bundle.chunkData(key));
+                    }
                 }
                 JsonObject commitJson = idJson(bundle.manifest().shutdownId());
                 JsonArray writtenChunkKeys = new JsonArray(writtenChunks.size());
@@ -141,6 +152,52 @@ public final class ExitTransactionClient {
         json.addProperty("x", key.x());
         json.addProperty("z", key.z());
         sendPayload(connection, MessageType.EXIT_CHUNK_DATA, json, data);
+    }
+
+    /**
+     * 将退出尾部区块合并为少量批次。每个批次只有一次 request/ACK，服务端在 WAL
+     * 暂存完成后应答；最终耐久性由 EXIT_COMMIT 的复合 WAL 提供。断线时外层会从
+     * EXIT_BEGIN 重连并按 batchId 幂等重放。
+     */
+    private void sendChunkBatches(ControlConnection connection, ExitBundle bundle,
+                                  List<ChunkKey> writtenChunks) throws Exception {
+        List<ChunkDelta> deltas = new ArrayList<>(writtenChunks.size());
+        for (ChunkKey key : writtenChunks) {
+            byte[] payload = bundle.chunkData(key);
+            if (payload == null || payload.length == 0) {
+                throw new IOException("退出区块载荷缺失: " + key.asString());
+            }
+            // 退出清单中的每个坐标只保留最终快照；服务端用批次 epoch 保证顺序，
+            // version=0 仅用于批内重复检测，不依赖客户端重启后的计数器。
+            deltas.add(ChunkDelta.of(key, 0, payload));
+        }
+        List<ChunkDeltaBatch> batches = ChunkDeltaBatch.split(
+                bundle.manifest().shutdownId(), 0, deltas, BATCH_RECORD_BYTES);
+        long started = System.nanoTime();
+        long bytes = 0;
+        for (ChunkDeltaBatch batch : batches) {
+            byte[] encoded = batch.encode();
+            if (encoded.length >= Protocol.MAX_FRAME_BYTES) {
+                throw new IOException("退出区块批次超过控制帧上限: " + encoded.length);
+            }
+            JsonObject json = idJson(bundle.manifest().shutdownId());
+            json.addProperty("batchId", batch.batchId().toString());
+            json.addProperty("sequence", batch.sequence());
+            json.addProperty("epoch", batch.epoch());
+            json.addProperty("deltaCount", batch.deltas().size());
+            json.addProperty("sha256", Sha256.hex(encoded));
+            ControlMessage response = request(connection, ControlMessage.of(
+                    MessageType.EXIT_CHUNK_BATCH, json, encoded));
+            if (response.type() != MessageType.EXIT_CHUNK_BATCH
+                    || !JsonUtil.getBoolean(response.json(), "accepted", false)
+                    || !JsonUtil.getBoolean(response.json(), "written", false)) {
+                throw new IOException("退出区块批次应答失败 sequence=" + batch.sequence());
+            }
+            bytes += encoded.length;
+        }
+        LOGGER.info("退出区块尾部批次提交完成: batches={}, bytes={}, upload_ms={}",
+                batches.size(), bytes,
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
     }
 
     private void sendPayload(ControlConnection connection, MessageType type,

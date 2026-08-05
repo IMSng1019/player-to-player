@@ -31,7 +31,6 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -66,6 +65,7 @@ public final class P2PServerService {
 
     private static volatile ControlServer controlServer;
     private static volatile ChunkRegistry chunkRegistry;
+    private static volatile DurableChunkJournal durableChunkJournal;
     private static volatile PlayerTable playerTable;
     private static volatile ComputeTable computeTable;
     private static volatile GroupTable groupTable;
@@ -110,6 +110,11 @@ public final class P2PServerService {
                 config.envSnapshotRetentionMinutes);
         snapshots.start();
 
+        // c. 运行期区块 WAL 先恢复，再创建注册表。WAL 是 MCA 的领先视图，服务端
+        // 重启后即使后台物化尚未完成，新的 claim 也必须走服务端数据读取路径。
+        DurableChunkJournal durableJournal = new DurableChunkJournal(
+                paths.durableChunkJournalDir());
+
         // c. 区块注册表：后端选择（Phase 4：MySQL 可选，连接失败回退 JSON —— 注册表
         //    可用性优先于后端偏好）+ 世界 region 文件探测器（hasServerData 判定用）
         RegistryStore store = null;
@@ -125,7 +130,7 @@ public final class P2PServerService {
             store = new JsonRegistryStore(paths.registryDir());
         }
         ChunkRegistry registry = new ChunkRegistry(
-                store, new RegionFileProbe(worldRoot),
+                store, new RegionFileProbe(worldRoot, durableJournal::contains),
                 new RegistryMutationJournal(paths.registryMutationJournal()));
         registry.load();            // 恢复上次运行的占用状态（服务端重启不丢注册表）
         registry.startAutoPersist(); // 定期落盘（scheduler 驱动，崩溃最多丢一个周期）
@@ -143,7 +148,9 @@ public final class P2PServerService {
         EnvSyncServerHandlers.register(control, snapshots, config);
         // 区块数据面（Phase 2）：CHUNK_DATA_REQUEST 下发 / CHUNK_DATA_UPLOAD 实时上行；
         // 返回的写回接口交给 RegistryHandlers 处理 CHUNK_RELEASE 携带的最终数据
-        ChunkDataHandlers chunkData = ChunkDataHandlers.register(control, server, registry);
+        ChunkDataHandlers chunkData = ChunkDataHandlers.register(
+                control, server, registry, durableJournal);
+        chunkData.materializeRecovered();
         ComputeHandlers.register(control, computes);
         LogCollector.register(control, paths.logsDir());
         P2PBrokerHandlers.register(control, config);
@@ -154,6 +161,9 @@ public final class P2PServerService {
         // committed；客户端断线/服务端重启均可用同一 shutdownId 幂等恢复。
         ExitTransactionLedger exitLedger = new ExitTransactionLedger(
                 new ExitTransactionStore(paths.exitTransactionsDir()));
+        // 世界 WAL 的 committed 事实比可能仍停留在 pending 的事务元数据更新；
+        // 必须在开放网络前合并，确保 ACK 后崩溃仍能继续物化与 ownership 清理。
+        exitLedger.restoreDurableCommits(durableJournal.exitCommits());
         ExitPayloadStore exitPayloads = new ExitPayloadStore(
                 paths.exitPayloadsDir(),
                 (playerId, gzipNbt) -> PlayerDataFileStore.write(
@@ -177,10 +187,26 @@ public final class P2PServerService {
                     }
 
                     @Override
+                    public void materialize(UUID groupId,
+                                            imsng.player_to_player.registry.ChunkKey key,
+                                            byte[] gzipNbt) {
+                        chunkData.materializeDurable(key, gzipNbt);
+                    }
+
+                    @Override
+                    public void materializeBatch(
+                            UUID groupId,
+                            List<imsng.player_to_player.group.ChunkDelta> deltas) {
+                        chunkData.materializeDurableBatch(deltas);
+                    }
+
+                    @Override
                     public void flush() {
                         chunkData.flushAll();
                     }
-                });
+                }, durableJournal);
+        DisconnectCleanupBarrier disconnectCleanups =
+                new DisconnectCleanupBarrier();
         ExitTransactionHandlers exits = new ExitTransactionHandlers(
                 exitLedger,
                 (peerId, requested) -> {
@@ -188,6 +214,9 @@ public final class P2PServerService {
                             || !peerId.equals(requested.groupId())) {
                         return null;
                     }
+                    // 旧连接若已发布普通断连清理，必须等 ownership 释放与组表删除
+                    // 全部完成后再判断在线组/orphan，避免旧 release 删除新 BEGIN 的保护。
+                    disconnectCleanups.await(peerId);
                     UUID currentPrimary = groups.primaryOf(requested.groupId());
                     boolean recoverOrphan = currentPrimary == null
                             && !groups.exists(requested.groupId());
@@ -196,9 +225,9 @@ public final class P2PServerService {
                     }
                     Set<UUID> currentMembers;
                     if (recoverOrphan) {
-                        // 物理服重启后组表不可恢复。只允许主客户端自己的玩家文件，
-                        // 防恶意清单借恢复路径覆盖任意其他玩家；副客户端沿用实时确认态。
-                        currentMembers = Set.of(peerId);
+                        // 注册表会把请求玩家清单与服务端断连时耐久记录的组成员严格比对；
+                        // 未通过前这里只保留候选值，不能单凭客户端声明授权玩家文件。
+                        currentMembers = requested.playerIds();
                     } else {
                         currentMembers = groups.membersOf(requested.groupId());
                         if (currentMembers.isEmpty()
@@ -210,7 +239,8 @@ public final class P2PServerService {
                     merges.abortInvolving(requested.groupId());
                     Set<imsng.player_to_player.registry.ChunkKey> currentClaims =
                             new HashSet<>(registry.freezeOrRecoverForExit(
-                                    requested.groupId(), requested.chunks(), recoverOrphan));
+                                    requested.groupId(), requested.chunks(),
+                                    requested.playerIds(), recoverOrphan));
                     return new imsng.player_to_player.group.ExitManifest(
                             requested.shutdownId(), requested.clientId(),
                             requested.groupId(), currentMembers, currentClaims);
@@ -236,24 +266,22 @@ public final class P2PServerService {
                     groups.removeClient(manifest.clientId());
                 },
                 imsng.player_to_player.util.ThreadPools.io(),
-                HelloHandler::withCurrentSession);
+                HelloHandler::withCurrentSession,
+                durableJournal);
         exits.register(control);
         chunkData.setExitTransactions(exits);
         RegistryHandlers.register(
                 control, registry, players, chunkData.releaseWriteback(), exits);
         // 玩家实时上行在 EXIT_BEGIN 后必须被拒绝，防旧 IO 任务覆盖最终玩家文件。
         PlayerDataHandlers.register(control, server, groups, exits);
-        ConcurrentHashMap<UUID, CompletableFuture<Void>> disconnectCleanups =
-                new ConcurrentHashMap<>();
         // 角色指派（Phase 2）：正常重进前先结束强杀遗留的 pending，保留实时数据。
         control.on(MessageType.ROLE_REQUEST,
                 new RoleAssignHandler(server, config, registry, groups, computes,
                         clientId -> {
-                            CompletableFuture<Void> cleanup =
-                                    disconnectCleanups.get(clientId);
-                            if (cleanup != null) {
-                                cleanup.join();
-                            }
+                            disconnectCleanups.await(clientId);
+                            // ROLE_REQUEST 表示客户端选择正常重进而非继续旧退出；先耐久
+                            // 消费断连 ownership 凭证，防服务重启后被旧退出包再次利用。
+                            registry.discardDisconnectRecoveryDurably(clientId);
                             exits.awaitPendingBegins(clientId);
                         },
                         exits::abandonPendingForRejoinNow));
@@ -298,6 +326,8 @@ public final class P2PServerService {
             CompletableFuture<Void> cleanup = new CompletableFuture<>();
             java.util.concurrent.atomic.AtomicBoolean protectedExit =
                     new java.util.concurrent.atomic.AtomicBoolean();
+            java.util.concurrent.atomic.AtomicReference<Set<UUID>> disconnectedMembers =
+                    new java.util.concurrent.atomic.AtomicReference<>(Set.of(peerId));
             // 旧会话摘除、易被新 HELLO 覆盖的内存状态清理、以及断连清理 future
             // 发布必须处于同一临界区。这样替换连接的 ROLE_REQUEST 必然能观察并等待
             // 旧组完成 flush + 耐久释放，不会在发布空窗中创建随后被旧清理删除的新组。
@@ -308,7 +338,11 @@ public final class P2PServerService {
                     // 区块冻结必须先于替换 HELLO 可见，否则新连接可在 cleanup
                     // future 已发布但冻结尚未执行的空窗中抢到随后会被旧清理释放的 claim。
                     registry.freezeForExit(peerId);
-                    disconnectCleanups.put(peerId, cleanup);
+                    disconnectCleanups.publish(peerId, cleanup);
+                }
+                Set<UUID> members = groups.membersOf(peerId);
+                if (!members.isEmpty() && members.contains(peerId)) {
+                    disconnectedMembers.set(Set.copyOf(members));
                 }
                 players.remove(peerId);
                 computes.remove(peerId);
@@ -335,7 +369,8 @@ public final class P2PServerService {
                     attempt++;
                     try {
                         chunkData.flushAll();
-                        int released = registry.releaseAllDurably(peerId);
+                        int released = registry.releaseAllDurably(
+                                peerId, disconnectedMembers.get());
                         groups.removeClient(peerId);
                         LOGGER.info("客户端断开清理完成: {}，耐久释放 {} 个区块",
                                 peerId, released);
@@ -348,8 +383,6 @@ public final class P2PServerService {
                     }
                 }
             });
-            cleanup.whenComplete((ignored, failure) ->
-                    disconnectCleanups.remove(peerId, cleanup));
         });
         control.start();
 
@@ -365,6 +398,7 @@ public final class P2PServerService {
 
         // 全部组件就绪后统一发布（volatile 写），stop() 据此收尾
         chunkRegistry = registry;
+        durableChunkJournal = durableJournal;
         playerTable = players;
         computeTable = computes;
         groupTable = groups;
@@ -453,6 +487,13 @@ public final class P2PServerService {
         chunkRegistry = null;
         if (registry != null) {
             registry.shutdown(); // 停自动落盘并做最终 persist
+        }
+        DurableChunkJournal durable = durableChunkJournal;
+        durableChunkJournal = null;
+        if (durable != null) {
+            // WAL 已在每个批次 ACK 前 force；关闭时只关闭句柄，不删除日志。日志由后台
+            // 物化和下一次启动恢复共同消费，避免停服阶段再次同步遍历所有区块。
+            durable.close();
         }
 
         RelayCore relay = relayCore;

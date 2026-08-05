@@ -175,6 +175,12 @@ public final class GroupRuntime {
                 new HashMap<>();
         Map<UUID, byte[]> playerFallback = new HashMap<>();
         if (finishingExit != null) {
+            // SERVER_STOPPED 前的强制 save 可能再次捕获与实时 ACK 完全相同的 NBT。
+            // 在构建最终 bundle 前做一次后台压缩摘要去重，避免把已 durable 的区块
+            // 重新计入退出尾部。
+            if (uploads != null) {
+                uploads.compactForExit();
+            }
             for (UUID playerId : finishingExit.playerIds()) {
                 CompoundTag tag = exitPlayers.get(playerId);
                 if (tag != null) {

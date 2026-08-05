@@ -148,6 +148,37 @@ public final class ExitTransactionLedger {
     }
 
     /**
+     * 批量登记退出区块。所有区块在同一把 ledger 锁内完成清单校验，stage 成功后一次性
+     * 发布 received 集合，避免客户端为每个区块等待一个 RTT。stage 是可重建暂存，
+     * 不要求 force；失败时不发布任何新的 received 标记，客户端会重放批次。
+     */
+    public boolean receiveChunks(UUID peerId, UUID shutdownId,
+                                 Set<ChunkKey> chunks, BooleanSupplier stage) {
+        synchronized (lock) {
+            RuntimeTransaction transaction = authorizedPending(peerId, shutdownId);
+            if (transaction == null || chunks == null || chunks.isEmpty()
+                    || !transaction.manifest.chunks().containsAll(chunks)
+                    || stage == null) {
+                return false;
+            }
+            Set<ChunkKey> requested;
+            try {
+                requested = Set.copyOf(chunks);
+            } catch (RuntimeException invalid) {
+                return false;
+            }
+            if (transaction.receivedChunks.containsAll(requested)) {
+                return true;
+            }
+            if (!stage.getAsBoolean()) {
+                return false;
+            }
+            transaction.receivedChunks.addAll(requested);
+            return true;
+        }
+    }
+
+    /**
      * 数据齐全时把事务标为 committed 并先落盘。重复提交已经 committed 的事务
      * 同样返回 true，用于最终 ACK 丢失后的重连恢复。
      */
@@ -179,6 +210,86 @@ public final class ExitTransactionLedger {
                 transaction.writtenChunksDeclared = true;
             });
             return true;
+        }
+    }
+
+    /**
+     * 复合世界 WAL 路径的最终提交。durableWrite 必须把玩家数据、区块尾部和退出终态
+     * 作为一个原子耐久单元写入；成功后这里只发布内存状态，不再同步写事务元数据，
+     * 从而避免最终 ACK 前出现第二次 force。
+     */
+    public boolean commitAfterDurable(UUID peerId, UUID shutdownId,
+                                      Set<ChunkKey> declaredWrittenChunks,
+                                      BooleanSupplier durableWrite) {
+        synchronized (lock) {
+            RuntimeTransaction transaction = authorized(peerId, shutdownId);
+            Set<ChunkKey> writtenChunks = immutableWrittenSubset(
+                    transaction, declaredWrittenChunks);
+            if (transaction == null || writtenChunks == null || durableWrite == null) {
+                return false;
+            }
+            if (transaction.committed) {
+                return !transaction.writtenChunksDeclared
+                        || transaction.writtenChunks.equals(writtenChunks);
+            }
+            if (!transaction.receivedPlayers.containsAll(transaction.manifest.playerIds())
+                    || !transaction.receivedChunks.equals(writtenChunks)) {
+                return false;
+            }
+            if (!durableWrite.getAsBoolean()) {
+                return false;
+            }
+            transaction.committed = true;
+            transaction.writtenChunks = writtenChunks;
+            transaction.writtenChunksDeclared = true;
+            return true;
+        }
+    }
+
+    /**
+     * 服务端开放网络前，把复合世界 WAL 中的 committed 事实合并进事务状态机。
+     * WAL 比可能仍是 pending 的事务元数据更新；已落盘的 dataApplied/cleanupComplete
+     * 标记则继续保留，避免重启后重复覆盖后来产生的正式玩家状态。
+     */
+    public void restoreDurableCommits(
+            Map<UUID, DurableChunkJournal.ExitCommitEntry> durableCommits) {
+        if (durableCommits == null || durableCommits.isEmpty()) {
+            return;
+        }
+        synchronized (lock) {
+            durableCommits.entrySet().stream()
+                    .sorted(java.util.Comparator.comparingLong(
+                            item -> item.getValue().durableEpoch()))
+                    .forEach(item -> {
+                        DurableChunkJournal.ExitCommitEntry entry = item.getValue();
+                        ExitCommitPayload payload = entry.payload();
+                        ExitManifest manifest = payload.manifest();
+                        UUID shutdownId = manifest.shutdownId();
+                        if (!shutdownId.equals(item.getKey())) {
+                            throw new IllegalStateException(
+                                    "退出复合 WAL 索引键与 manifest 不一致");
+                        }
+                        RuntimeTransaction transaction = transactions.get(shutdownId);
+                        if (transaction == null) {
+                            transaction = new RuntimeTransaction(new ExitTransactionRecord(
+                                    manifest, true, payload.writtenChunks(), true,
+                                    false, false, false));
+                            transactions.put(shutdownId, transaction);
+                            return;
+                        }
+                        if (!transaction.manifest.equals(manifest)
+                                || transaction.abandoned
+                                || (transaction.committed
+                                && transaction.writtenChunksDeclared
+                                && !transaction.writtenChunks.equals(
+                                payload.writtenChunks()))) {
+                            throw new IllegalStateException(
+                                    "退出复合 WAL 与事务元数据冲突: " + shutdownId);
+                        }
+                        transaction.committed = true;
+                        transaction.writtenChunks = payload.writtenChunks();
+                        transaction.writtenChunksDeclared = true;
+                    });
         }
     }
 
@@ -406,26 +517,13 @@ public final class ExitTransactionLedger {
     }
 
     /**
-     * 成功返回前先完成持久化，再发布对应内存状态。原子替换已经发生、随后 force
-     * 抛错时，目标文件可能已经可见；此时回读到完全相同的记录就保守发布内存状态，
-     * 但仍抛出原异常，确保本轮协议不会错误返回耐久 ACK，客户端会继续重试。
+     * 成功返回前先完成持久化，再发布对应内存状态。force 抛错后的结果属于不确定态；
+     * 即使文件当前可读也不能发布，否则下一次幂等请求会跳过重新 force，把未确认数据
+     * 错当成耐久终态。保留旧内存状态即可让客户端重试同一记录。
      */
     private void persistThenPublish(ExitTransactionRecord record,
                                     Runnable publish) {
-        try {
-            persistence.save(record);
-        } catch (RuntimeException saveFailure) {
-            try {
-                ExitTransactionRecord visible = persistence.load().get(
-                        record.manifest().shutdownId());
-                if (record.equals(visible)) {
-                    publish.run();
-                }
-            } catch (RuntimeException loadFailure) {
-                saveFailure.addSuppressed(loadFailure);
-            }
-            throw saveFailure;
-        }
+        persistence.save(record);
         publish.run();
     }
 

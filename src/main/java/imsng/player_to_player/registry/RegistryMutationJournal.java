@@ -36,18 +36,31 @@ public final class RegistryMutationJournal {
             new RegistryMutationJournal(null);
 
     private final Path file;
-    /** 周期 checkpoint 后保存成功回执的原子快照；WAL 负责跨双文件写入窗口恢复。 */
+    /** 周期 checkpoint 后保存回执与断连凭证的原子快照；WAL 负责跨文件窗口恢复。 */
     private final Path receiptSnapshotFile;
     private final int maxRecordBytes;
 
     /** 注册表 WAL 重放后的完整状态；回执与 ownership 必须来自同一条有序日志。 */
     public record ReplayState(
             Map<ChunkKey, UUID> claims,
-            Map<UUID, ChunkReleaseReceipt> releaseReceipts) {
+            Map<UUID, ChunkReleaseReceipt> releaseReceipts,
+            Map<UUID, DisconnectClaimRecovery> disconnectRecoveries) {
 
         public ReplayState {
             claims = Map.copyOf(claims);
             releaseReceipts = Map.copyOf(releaseReceipts);
+            disconnectRecoveries = Map.copyOf(disconnectRecoveries);
+        }
+    }
+
+    /** checkpoint 辅助快照，不包含由 RegistryStore 保存的 ownership 主表。 */
+    public record AuxiliaryState(
+            Map<UUID, ChunkReleaseReceipt> releaseReceipts,
+            Map<UUID, DisconnectClaimRecovery> disconnectRecoveries) {
+
+        public AuxiliaryState {
+            releaseReceipts = Map.copyOf(releaseReceipts);
+            disconnectRecoveries = Map.copyOf(disconnectRecoveries);
         }
     }
 
@@ -106,16 +119,26 @@ public final class RegistryMutationJournal {
         append(releaseJson(receipt));
     }
 
-    /** 读取上次 checkpoint 已整体落盘的成功回执。损坏时拒绝启动，不能丢失幂等证据。 */
+    /** 兼容旧调用：读取上次 checkpoint 已整体落盘的成功回执。 */
     public synchronized Map<UUID, ChunkReleaseReceipt> loadReleaseReceipts() {
+        return loadAuxiliaryState().releaseReceipts();
+    }
+
+    /**
+     * 读取成功回执与断连恢复凭证。损坏时拒绝启动，不能丢失幂等或 ownership 证据。
+     * version=1 的旧快照只包含回执，按空恢复凭证兼容加载。
+     */
+    public synchronized AuxiliaryState loadAuxiliaryState() {
         if (receiptSnapshotFile == null
                 || !Files.isRegularFile(receiptSnapshotFile)) {
-            return Map.of();
+            return new AuxiliaryState(Map.of(), Map.of());
         }
         try {
             JsonObject root = JsonUtil.readFile(
                     receiptSnapshotFile, JsonObject.class);
-            if (root == null || JsonUtil.getInt(root, "version", -1) != 1) {
+            int version = root != null
+                    ? JsonUtil.getInt(root, "version", -1) : -1;
+            if (version != 1 && version != 2) {
                 throw new IllegalArgumentException("释放回执快照版本缺失或不支持");
             }
             JsonElement rawReceipts = root.get("receipts");
@@ -137,10 +160,29 @@ public final class RegistryMutationJournal {
                             "释放回执快照含重复 releaseId: " + receipt.releaseId());
                 }
             }
-            return Map.copyOf(result);
+            Map<UUID, DisconnectClaimRecovery> recoveries = new HashMap<>();
+            if (version >= 2) {
+                JsonElement rawRecoveries = root.get("disconnectRecoveries");
+                if (rawRecoveries == null || !rawRecoveries.isJsonArray()) {
+                    throw new IllegalArgumentException(
+                            "辅助快照缺少 disconnectRecoveries 数组");
+                }
+                for (JsonElement raw : rawRecoveries.getAsJsonArray()) {
+                    if (!raw.isJsonObject()) {
+                        throw new IllegalArgumentException("断连恢复凭证条目不是对象");
+                    }
+                    DisconnectClaimRecovery recovery = parseDisconnectRecovery(
+                            raw.getAsJsonObject());
+                    if (recoveries.putIfAbsent(recovery.groupId(), recovery) != null) {
+                        throw new IllegalArgumentException(
+                                "辅助快照含重复断连恢复组: " + recovery.groupId());
+                    }
+                }
+            }
+            return new AuxiliaryState(result, recoveries);
         } catch (Exception e) {
             throw new IllegalStateException(
-                    "读取释放回执快照失败: " + receiptSnapshotFile, e);
+                    "读取注册表辅助快照失败: " + receiptSnapshotFile, e);
         }
     }
 
@@ -150,12 +192,20 @@ public final class RegistryMutationJournal {
      */
     public synchronized void saveReleaseReceipts(
             Map<UUID, ChunkReleaseReceipt> receipts) {
+        saveAuxiliaryState(receipts, Map.of());
+    }
+
+    /** 原子保存成功回执与仍可使用的断连 ownership 恢复凭证。 */
+    public synchronized void saveAuxiliaryState(
+            Map<UUID, ChunkReleaseReceipt> receipts,
+            Map<UUID, DisconnectClaimRecovery> recoveries) {
         if (receiptSnapshotFile == null) {
             return;
         }
         Objects.requireNonNull(receipts, "receipts");
+        Objects.requireNonNull(recoveries, "recoveries");
         JsonObject root = new JsonObject();
-        root.addProperty("version", 1);
+        root.addProperty("version", 2);
         JsonArray array = new JsonArray();
         receipts.values().stream()
                 .sorted(java.util.Comparator.comparing(
@@ -163,16 +213,38 @@ public final class RegistryMutationJournal {
                 .map(RegistryMutationJournal::releaseJson)
                 .forEach(array::add);
         root.add("receipts", array);
+        JsonArray recoveryArray = new JsonArray();
+        recoveries.values().stream()
+                .sorted(java.util.Comparator.comparing(
+                        recovery -> recovery.groupId().toString()))
+                .map(RegistryMutationJournal::disconnectRecoveryJson)
+                .forEach(recoveryArray::add);
+        root.add("disconnectRecoveries", recoveryArray);
         try {
             JsonUtil.writeFileAtomic(receiptSnapshotFile, root);
         } catch (IOException e) {
             throw new IllegalStateException(
-                    "保存释放回执快照失败: " + receiptSnapshotFile, e);
+                    "保存注册表辅助快照失败: " + receiptSnapshotFile, e);
         }
     }
 
     public void appendRemoveGroup(UUID groupId) {
         append(base("remove_group", groupId));
+    }
+
+    /** 一帧同时耐久记录普通断连 ownership 删除和可验证恢复凭证建立。 */
+    public void appendDisconnectRelease(DisconnectClaimRecovery recovery) {
+        Objects.requireNonNull(recovery, "recovery");
+        JsonObject json = disconnectRecoveryJson(recovery);
+        json.addProperty("type", "disconnect_release");
+        append(json);
+    }
+
+    /** 正常 ROLE 已选择放弃旧退出时，按 recoveryId 幂等消费旧断连凭证。 */
+    public void appendConsumeDisconnectRecovery(UUID groupId, UUID recoveryId) {
+        JsonObject json = base("consume_disconnect_recovery", groupId);
+        json.addProperty("recoveryId", recoveryId.toString());
+        append(json);
     }
 
     public void appendRemoveKeys(UUID groupId, Set<ChunkKey> keys) {
@@ -214,17 +286,27 @@ public final class RegistryMutationJournal {
 
     public synchronized Map<ChunkKey, UUID> replay(
             Map<ChunkKey, UUID> baseline) {
-        return replayState(baseline, Map.of()).claims();
+        return replayState(baseline, Map.of(), Map.of()).claims();
     }
 
     /** 在快照后端的 ownership 与回执基线上重放 WAL。 */
     public synchronized ReplayState replayState(
             Map<ChunkKey, UUID> baseline,
             Map<UUID, ChunkReleaseReceipt> receiptBaseline) {
+        return replayState(baseline, receiptBaseline, Map.of());
+    }
+
+    /** 在 ownership、回执和断连凭证三个 checkpoint 基线上重放 WAL。 */
+    public synchronized ReplayState replayState(
+            Map<ChunkKey, UUID> baseline,
+            Map<UUID, ChunkReleaseReceipt> receiptBaseline,
+            Map<UUID, DisconnectClaimRecovery> recoveryBaseline) {
         Map<ChunkKey, UUID> result = new HashMap<>(baseline);
         Map<UUID, ChunkReleaseReceipt> receipts = new HashMap<>(receiptBaseline);
+        Map<UUID, DisconnectClaimRecovery> recoveries =
+                new HashMap<>(recoveryBaseline);
         if (file == null || !Files.isRegularFile(file)) {
-            return new ReplayState(result, receipts);
+            return new ReplayState(result, receipts, recoveries);
         }
         try (FileChannel channel = FileChannel.open(file,
                 StandardOpenOption.READ, StandardOpenOption.WRITE)) {
@@ -263,11 +345,11 @@ public final class RegistryMutationJournal {
                             bytes, 0, length, StandardCharsets.UTF_8);
                     if (!text.isBlank()) {
                         try {
-                            apply(result, receipts, decodeRecord(text));
+                            apply(result, receipts, recoveries, decodeRecord(text));
                         } catch (RecoverableTailException e) {
                             if (offset == fileSize) {
                                 truncateTail(channel, lineStart);
-                                return new ReplayState(result, receipts);
+                                return new ReplayState(result, receipts, recoveries);
                             }
                             throw new IllegalStateException(
                                     "注册表变更日志损坏，行 " + lineNumber, e);
@@ -288,7 +370,7 @@ public final class RegistryMutationJournal {
                 // 必然属于未确认写入，截断后才能保证下次 append 不接在残片后。
                 truncateTail(channel, lineStart);
             }
-            return new ReplayState(result, receipts);
+            return new ReplayState(result, receipts, recoveries);
         } catch (IOException e) {
             throw new IllegalStateException("读取注册表变更日志失败: " + file, e);
         }
@@ -355,6 +437,7 @@ public final class RegistryMutationJournal {
 
     private static void apply(Map<ChunkKey, UUID> state,
                               Map<UUID, ChunkReleaseReceipt> receipts,
+                              Map<UUID, DisconnectClaimRecovery> recoveries,
                               JsonObject json) {
         String type = requiredString(json, "type");
         if ("replace_all".equals(type)) {
@@ -390,6 +473,25 @@ public final class RegistryMutationJournal {
                         entry -> group.equals(entry.getValue()));
                 receipts.values().removeIf(
                         receipt -> group.equals(receipt.groupId()));
+                recoveries.remove(group);
+            }
+            case "disconnect_release" -> {
+                DisconnectClaimRecovery recovery = parseDisconnectRecovery(json);
+                if (!group.equals(recovery.groupId())) {
+                    throw new IllegalArgumentException("断连恢复凭证组身份不一致");
+                }
+                state.entrySet().removeIf(
+                        entry -> group.equals(entry.getValue()));
+                receipts.values().removeIf(
+                        receipt -> group.equals(receipt.groupId()));
+                recoveries.put(group, recovery);
+            }
+            case "consume_disconnect_recovery" -> {
+                UUID recoveryId = UUID.fromString(
+                        requiredString(json, "recoveryId"));
+                recoveries.computeIfPresent(group,
+                        (ignored, current) -> current.recoveryId().equals(recoveryId)
+                                ? null : current);
             }
             case "remove_keys" -> {
                 parseChunks(json).forEach(key -> state.remove(key, group));
@@ -397,11 +499,15 @@ public final class RegistryMutationJournal {
                 // 旧释放重试，连同该组遗留回执一起收敛，避免异常退出造成泄漏。
                 receipts.values().removeIf(
                         receipt -> group.equals(receipt.groupId()));
+                recoveries.remove(group);
             }
             case "replace_group" -> {
                 Set<ChunkKey> replacement = parseChunks(json);
                 state.entrySet().removeIf(entry -> group.equals(entry.getValue()));
                 replacement.forEach(key -> state.put(key, group));
+                // pending EXIT_BEGIN 已在退出 ledger 中耐久后才追加本记录；从这里起
+                // manifest 自身成为恢复证据，旧断连 tombstone 必须原子失效。
+                recoveries.remove(group);
             }
             case "migrate_group" -> {
                 UUID to = UUID.fromString(requiredString(json, "to"));
@@ -432,6 +538,19 @@ public final class RegistryMutationJournal {
         json.addProperty("payloadBytes", receipt.payloadBytes());
         json.addProperty("payloadSha256", receipt.payloadSha256());
         json.addProperty("finalDataWritten", receipt.finalDataWritten());
+        return json;
+    }
+
+    private static JsonObject disconnectRecoveryJson(
+            DisconnectClaimRecovery recovery) {
+        JsonObject json = new JsonObject();
+        json.addProperty("group", recovery.groupId().toString());
+        json.addProperty("recoveryId", recovery.recoveryId().toString());
+        json.addProperty("createdAtMillis", recovery.createdAtMillis());
+        json.add("chunks", chunks(recovery.chunks()));
+        JsonArray members = new JsonArray();
+        recovery.members().stream().map(UUID::toString).sorted().forEach(members::add);
+        json.add("members", members);
         return json;
     }
 
@@ -554,6 +673,30 @@ public final class RegistryMutationJournal {
         boolean finalDataWritten = json.get("finalDataWritten").getAsBoolean();
         return new ChunkReleaseReceipt(releaseId, key, group, payloadBytes,
                 payloadSha256, finalDataWritten);
+    }
+
+    private static DisconnectClaimRecovery parseDisconnectRecovery(
+            JsonObject json) {
+        UUID group = UUID.fromString(requiredString(json, "group"));
+        UUID recoveryId = UUID.fromString(requiredString(json, "recoveryId"));
+        JsonElement rawCreated = json.get("createdAtMillis");
+        if (rawCreated == null || !rawCreated.isJsonPrimitive()) {
+            throw new IllegalArgumentException("断连恢复凭证缺少 createdAtMillis");
+        }
+        return new DisconnectClaimRecovery(recoveryId, group,
+                parseChunks(json), parseMembers(json), rawCreated.getAsLong());
+    }
+
+    private static Set<UUID> parseMembers(JsonObject json) {
+        JsonElement element = json.get("members");
+        if (element == null || !element.isJsonArray()) {
+            throw new IllegalArgumentException("断连恢复凭证缺少 members");
+        }
+        java.util.HashSet<UUID> result = new java.util.HashSet<>();
+        for (JsonElement item : element.getAsJsonArray()) {
+            result.add(UUID.fromString(item.getAsString()));
+        }
+        return result;
     }
 
     private static Set<ChunkKey> parseChunks(JsonObject json) {

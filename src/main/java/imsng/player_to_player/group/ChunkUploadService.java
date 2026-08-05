@@ -7,16 +7,22 @@ import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.netproto.Protocol;
 import imsng.player_to_player.registry.ChunkKey;
 import imsng.player_to_player.util.ThreadPools;
+import imsng.player_to_player.util.Sha256;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtIo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -52,6 +58,9 @@ public final class ChunkUploadService {
 
     /** 实时单帧大小上限；超限快照保留到正常退出时经分片事务提交。 */
     private static final int MAX_COMPRESSED_BYTES = Protocol.MAX_FRAME_BYTES - 64 * 1024;
+    /** 实时批次的记录预算；留出批次头和控制协议 JSON。 */
+    private static final int BATCH_RECORD_BYTES = 4 * 1024 * 1024;
+    private static final int MAX_BATCH_DELTAS = 256;
 
     private final ControlConnection conn;
     private final UUID groupId;
@@ -60,6 +69,8 @@ public final class ChunkUploadService {
     private final Predicate<ChunkKey> claimedPredicate;
     /** 实时写入正 ACK 后更新 ChunkClaimClient 的服务端数据基线。 */
     private final Consumer<ChunkKey> serverDataKnownCallback;
+    /** 本次客户端会话的批次事务 ID；sequence 单调递增，断线重放仍幂等。 */
+    private final UUID runtimeBatchId = UUID.randomUUID();
 
     /** 待上行：key → 最新 NBT（LinkedHashMap 保序 + 同键覆盖；以自身为锁）。 */
     private final LinkedHashMap<ChunkKey, CompoundTag> queue = new LinkedHashMap<>();
@@ -72,6 +83,23 @@ public final class ChunkUploadService {
      */
     private final Map<ChunkKey, CompoundTag> unacknowledgedSnapshots =
             new java.util.HashMap<>();
+
+    /**
+     * 服务端最近一次正确认的压缩内容摘要。停服强制保存可能再次产生同一份 NBT，
+     * 发送前用摘要去重，避免把已经耐久化的数据重新放入退出事务。
+     */
+    private final Map<ChunkKey, String> durableHashes = new java.util.HashMap<>();
+    /** 本地快照版本，仅用于批内去重与诊断，不作为服务端安全边界。 */
+    private final Map<ChunkKey, Long> snapshotVersions = new java.util.HashMap<>();
+    private long nextSnapshotVersion;
+    private int nextBatchSequence;
+    /**
+     * 尚未获得 durable ACK 的唯一批次。ACK 丢失后必须重放这里保存的原始字节；
+     * 期间产生的新快照继续留在 queue，待本批确认后使用下一 sequence 发送。
+     */
+    private InFlightBatch inFlightBatch;
+    /** 与 inFlightBatch 对应的本地等待；forget 可取消它以立即重组剩余区块。 */
+    private CompletableFuture<ControlMessage> inFlightBatchRequest;
 
     /** 工作线程是否在跑（enqueue 只在队列从空变非空时投递一次任务）。 */
     private boolean workerRunning;
@@ -146,6 +174,7 @@ public final class ChunkUploadService {
             CompoundTag snapshot = tag.copy();
             queue.put(key, snapshot);
             unacknowledgedSnapshots.put(key, snapshot);
+            snapshotVersions.put(key, ++nextSnapshotVersion);
             if (queue.size() > MAX_PENDING_CHUNKS) {
                 // 丢最旧：该区块数据仍在本地存档，下次存盘会重新入队
                 Map.Entry<ChunkKey, CompoundTag> oldest = queue.entrySet().iterator().next();
@@ -160,97 +189,294 @@ public final class ChunkUploadService {
         }
     }
 
-    /** 工作线程：串行取队首 → gzip → CHUNK_DATA_UPLOAD，直到队空。 */
+    /**
+     * 工作线程：尽可能把同一轮排队的多个区块合并为一个批次；只有单区块时保留
+     * CHUNK_DATA_UPLOAD 兼容路径。批次 ACK 在服务端 WAL force 后返回。
+     */
     private void drainLoop() {
         while (true) {
-            ChunkKey key;
-            CompoundTag tag;
-            synchronized (queue) {
-                Map.Entry<ChunkKey, CompoundTag> head =
-                        queue.isEmpty() ? null : queue.entrySet().iterator().next();
-                if (head == null || shutdown || exitFrozen) {
-                    workerRunning = false;
-                    return;
+            List<Candidate> candidates;
+            try {
+                candidates = collectCandidates();
+            } catch (RuntimeException e) {
+                scheduleRetry(null, e);
+                return;
+            }
+            if (candidates.isEmpty()) {
+                synchronized (queue) {
+                    if (queue.isEmpty() || shutdown || exitFrozen) {
+                        workerRunning = false;
+                        return;
+                    }
                 }
-                key = head.getKey();
-                tag = head.getValue();
+                continue;
             }
             try {
-                // 释放后迟到的存盘：最终数据已随 CHUNK_RELEASE 上行，这里直接丢弃
+                if (candidates.size() == 1) {
+                    sendSingle(candidates.get(0));
+                } else {
+                    sendBatches(candidates);
+                }
+            } catch (Exception e) {
+                scheduleRetry(candidates.get(0).key(), e);
+                return;
+            }
+        }
+    }
+
+    private record Candidate(ChunkKey key, CompoundTag tag, byte[] gzip, long version) {
+    }
+
+    private record InFlightBatch(ChunkDeltaBatch batch, byte[] encoded,
+                                 List<Candidate> candidates) {
+        private InFlightBatch {
+            encoded = encoded.clone();
+            candidates = List.copyOf(candidates);
+        }
+    }
+
+    /** 在锁外压缩，锁内只做快照身份检查和队列摘取。 */
+    private List<Candidate> collectCandidates() {
+        List<Map.Entry<ChunkKey, CompoundTag>> snapshot = new ArrayList<>();
+        synchronized (queue) {
+            if (shutdown || exitFrozen || queue.isEmpty()) {
+                return List.of();
+            }
+            for (Map.Entry<ChunkKey, CompoundTag> entry : queue.entrySet()) {
+                snapshot.add(Map.entry(entry.getKey(), entry.getValue()));
+                if (snapshot.size() >= MAX_BATCH_DELTAS) {
+                    break;
+                }
+            }
+        }
+        List<Candidate> result = new ArrayList<>(snapshot.size());
+        for (Map.Entry<ChunkKey, CompoundTag> entry : snapshot) {
+            ChunkKey key = entry.getKey();
+            CompoundTag tag = entry.getValue();
+            try {
                 if (!claimedPredicate.test(key)) {
                     removeStateIfCurrent(key, tag);
                     continue;
                 }
                 byte[] gzip = compress(tag);
                 if (gzip == null || gzip.length > MAX_COMPRESSED_BYTES) {
-                    // 保留 unacknowledgedSnapshots 供退出事务分片提交，但移除当前实时队首，
-                    // 否则 while 循环会反复处理同一不可发送项形成 100% CPU 死循环。
                     LOGGER.warn("区块 NBT 压缩后超过实时帧长上限，留待退出分片提交: {}",
                             key.asString());
                     removeIfCurrent(key, tag);
                     continue;
                 }
-                JsonObject json = new JsonObject();
-                json.addProperty("dimension", key.dimension());
-                json.addProperty("x", key.x());
-                json.addProperty("z", key.z());
-                json.addProperty("groupId", groupId.toString());
-                java.util.concurrent.CompletableFuture<ControlMessage> responseFuture;
+                if (removeIfAlreadyDurable(key, tag, gzip)) {
+                    continue;
+                }
                 synchronized (queue) {
-                    /*
-                     * 请求开始、退出冻结及 forget 使用同一把锁线性化：
-                     * - 冻结先拿到锁时，本版本不会再发普通请求；
-                     * - 请求先拿到锁时，freezeForExit 返回前请求已经成为合法的在途请求；
-                     * - 快照已被替换或 forget 时，跳过这个尚未真正发出的旧版本。
-                     */
-                    if (shutdown || exitFrozen) {
-                        workerRunning = false;
-                        return;
-                    }
-                    if (queue.get(key) != tag) {
+                    if (shutdown || exitFrozen || queue.get(key) != tag) {
                         continue;
                     }
-                    responseFuture = conn.request(ControlMessage.of(
-                            MessageType.CHUNK_DATA_UPLOAD, json, gzip));
+                    result.add(new Candidate(key, tag, gzip,
+                            snapshotVersions.getOrDefault(key, 0L)));
                 }
-                ControlMessage response = responseFuture
-                        .get(Protocol.REQUEST_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
-                if (response.type() != MessageType.CHUNK_DATA_UPLOAD
-                        || !imsng.player_to_player.util.JsonUtil.getBoolean(
-                        response.json(), "written", false)) {
-                    throw new IllegalStateException("区块上行未获写入确认");
-                }
-                // 只有服务端明确 written=true 才能建立 SERVER_DATA_KNOWN 基线。若区块在
-                // 请求途中已被迁移/释放，当前组已不再拥有它，跳过回调避免迟到 ACK 复活状态。
-                if (claimedPredicate.test(key)) {
-                    try {
-                        serverDataKnownCallback.accept(key);
-                    } catch (RuntimeException callbackError) {
-                        // 回调只维护本地内存状态；即使外部观察器异常，也不能把已经落盘的
-                        // 服务端正 ACK 变成失败并触发重复上传。
-                        LOGGER.warn("区块上行已写入但更新服务端数据基线失败: {}",
-                                key.asString(), callbackError);
-                    }
-                }
-                removeStateIfCurrent(key, tag);
-                LOGGER.debug("区块上行: {} ({} 字节压缩)", key.asString(), gzip.length);
-            } catch (Exception e) {
-                LOGGER.warn("区块上行失败，保留最新状态等待重试: {}", key.asString(), e);
-                synchronized (queue) {
-                    workerRunning = false;
-                }
-                retryScheduler.accept(() -> {
-                    synchronized (queue) {
-                        if (!workerRunning && !queue.isEmpty()
-                                && !shutdown && !exitFrozen) {
-                            workerRunning = true;
-                            executor.execute(this::drainLoop);
-                        }
-                    }
-                });
-                return;
+            } catch (RuntimeException e) {
+                throw new IllegalStateException(
+                        "区块快照准备失败: " + key.asString(), e);
             }
         }
+        return result;
+    }
+
+    private void scheduleRetry(ChunkKey key, Exception error) {
+        if (key != null) {
+            LOGGER.warn("区块上行失败，保留最新状态等待重试: {}",
+                    key.asString(), error);
+        } else {
+            LOGGER.warn("区块上行批次准备失败，保留队列等待重试", error);
+        }
+        synchronized (queue) {
+            workerRunning = false;
+        }
+        retryScheduler.accept(() -> {
+            synchronized (queue) {
+                if (!workerRunning && !queue.isEmpty()
+                        && !shutdown && !exitFrozen) {
+                    workerRunning = true;
+                    executor.execute(this::drainLoop);
+                }
+            }
+        });
+    }
+
+    private void sendSingle(Candidate candidate) throws Exception {
+        JsonObject json = new JsonObject();
+        json.addProperty("dimension", candidate.key().dimension());
+        json.addProperty("x", candidate.key().x());
+        json.addProperty("z", candidate.key().z());
+        json.addProperty("groupId", groupId.toString());
+        // 同一未确认快照重试时 uploadId 保持稳定；同内容的后续新版本仍有不同 ID，
+        // 从而同时满足 ACK 丢失幂等和 A→B→A 的事件顺序。
+        UUID uploadId = UUID.nameUUIDFromBytes(
+                (runtimeBatchId + ":single:" + candidate.version())
+                        .getBytes(StandardCharsets.UTF_8));
+        json.addProperty("uploadId", uploadId.toString());
+        java.util.concurrent.CompletableFuture<ControlMessage> responseFuture;
+        synchronized (queue) {
+            if (shutdown || exitFrozen || queue.get(candidate.key()) != candidate.tag()) {
+                return;
+            }
+            responseFuture = conn.request(ControlMessage.of(
+                    MessageType.CHUNK_DATA_UPLOAD, json, candidate.gzip()));
+        }
+        ControlMessage response = responseFuture
+                .get(Protocol.REQUEST_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        if (response.type() != MessageType.CHUNK_DATA_UPLOAD
+                || !imsng.player_to_player.util.JsonUtil.getBoolean(
+                response.json(), "written", false)) {
+            throw new IllegalStateException("区块上行未获写入确认");
+        }
+        markDurable(candidate);
+    }
+
+    private void sendBatches(List<Candidate> candidates) throws Exception {
+        InFlightBatch replay;
+        synchronized (queue) {
+            replay = inFlightBatch;
+        }
+        if (replay != null) {
+            sendBatch(replay);
+            return;
+        }
+
+        List<ChunkDelta> deltas = new ArrayList<>(candidates.size());
+        for (Candidate candidate : candidates) {
+            deltas.add(ChunkDelta.of(candidate.key(), candidate.version(), candidate.gzip()));
+        }
+        List<ChunkDeltaBatch> batches;
+        try {
+            batches = ChunkDeltaBatch.split(runtimeBatchId, 0, deltas,
+                    BATCH_RECORD_BYTES);
+        } catch (IllegalArgumentException tooLarge) {
+            // 单个极大区块已经由 collectCandidates 过滤；理论上只可能是整数溢出，
+            // 退回逐项路径让现有分片退出流程接管。
+            for (Candidate candidate : candidates) {
+                sendSingle(candidate);
+            }
+            return;
+        }
+        for (ChunkDeltaBatch batch : batches) {
+            int sequence;
+            synchronized (queue) {
+                sequence = nextBatchSequence;
+            }
+            ChunkDeltaBatch outbound = new ChunkDeltaBatch(runtimeBatchId, 0,
+                    sequence, batch.deltas());
+            byte[] encoded = outbound.encode();
+            List<Candidate> batchCandidates = new ArrayList<>(outbound.deltas().size());
+            for (ChunkDelta delta : outbound.deltas()) {
+                Candidate candidate = findCandidate(candidates, delta.key());
+                if (candidate == null) {
+                    return;
+                }
+                batchCandidates.add(candidate);
+            }
+            InFlightBatch pending = new InFlightBatch(
+                    outbound, encoded, batchCandidates);
+            synchronized (queue) {
+                if (shutdown || exitFrozen) {
+                    return;
+                }
+                boolean allCurrent = true;
+                for (Candidate candidate : batchCandidates) {
+                    if (queue.get(candidate.key()) != candidate.tag()) {
+                        allCurrent = false;
+                        break;
+                    }
+                }
+                if (!allCurrent) {
+                    return; // 下一轮会以最新版本重新合并
+                }
+                inFlightBatch = pending;
+            }
+            sendBatch(pending);
+        }
+    }
+
+    /** 发送或逐字节重放一个已冻结的在途批次。 */
+    private void sendBatch(InFlightBatch pending) throws Exception {
+        JsonObject json = new JsonObject();
+        json.addProperty("batchId", pending.batch().batchId().toString());
+        json.addProperty("sequence", pending.batch().sequence());
+        json.addProperty("deltaCount", pending.batch().deltas().size());
+        json.addProperty("sha256", Sha256.hex(pending.encoded()));
+        CompletableFuture<ControlMessage> responseFuture;
+        synchronized (queue) {
+            if (shutdown || exitFrozen || inFlightBatch != pending) {
+                return;
+            }
+            responseFuture = conn.request(ControlMessage.of(
+                    MessageType.CHUNK_DATA_BATCH, json, pending.encoded()));
+            inFlightBatchRequest = responseFuture;
+        }
+        ControlMessage response;
+        try {
+            response = responseFuture
+                    .get(Protocol.REQUEST_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (CancellationException cancelled) {
+            synchronized (queue) {
+                if (inFlightBatch != pending) {
+                    // forget 已经推进 sequence 并移除被释放区块；直接回到 drainLoop
+                    // 重组剩余队列，不能把本地取消误当成网络失败进入退避。
+                    return;
+                }
+            }
+            throw cancelled;
+        } finally {
+            synchronized (queue) {
+                if (inFlightBatchRequest == responseFuture) {
+                    inFlightBatchRequest = null;
+                }
+            }
+        }
+        if (response.type() != MessageType.CHUNK_DATA_BATCH
+                || !imsng.player_to_player.util.JsonUtil.getBoolean(
+                response.json(), "written", false)) {
+            throw new IllegalStateException("区块增量批次未获 durable ACK");
+        }
+        synchronized (queue) {
+            if (inFlightBatch != pending) {
+                return;
+            }
+            nextBatchSequence = pending.batch().sequence() + 1;
+            inFlightBatch = null;
+        }
+        for (Candidate candidate : pending.candidates()) {
+            markDurable(candidate);
+        }
+    }
+
+    private static Candidate findCandidate(List<Candidate> candidates, ChunkKey key) {
+        for (Candidate candidate : candidates) {
+            if (candidate.key().equals(key)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private void markDurable(Candidate candidate) {
+        String digest = Sha256.hex(candidate.gzip());
+        synchronized (queue) {
+            // 先记录 durable 基线，再按对象身份清理，避免旧 ACK 覆盖新版本状态。
+            durableHashes.put(candidate.key(), digest);
+        }
+        if (claimedPredicate.test(candidate.key())) {
+            try {
+                serverDataKnownCallback.accept(candidate.key());
+            } catch (RuntimeException callbackError) {
+                LOGGER.warn("区块上行已写入但更新服务端数据基线失败: {}",
+                        candidate.key().asString(), callbackError);
+            }
+        }
+        removeStateIfCurrent(candidate.key(), candidate.tag());
+        LOGGER.debug("区块上行: {} ({} 字节压缩)",
+                candidate.key().asString(), candidate.gzip().length);
     }
 
     /**
@@ -265,6 +491,7 @@ public final class ChunkUploadService {
             }
             if (unacknowledgedSnapshots.get(key) == tag) {
                 unacknowledgedSnapshots.remove(key);
+                snapshotVersions.remove(key);
             }
         }
     }
@@ -274,6 +501,47 @@ public final class ChunkUploadService {
             if (queue.get(key) == tag) {
                 queue.remove(key);
             }
+        }
+    }
+
+    /**
+     * 删除已经被服务端确认的同内容快照。
+     *
+     * @return true 表示当前快照已是 durable 基线，不应再发网络请求
+     */
+    private boolean removeIfAlreadyDurable(ChunkKey key, CompoundTag tag,
+                                           byte[] gzip) {
+        String digest = Sha256.hex(gzip);
+        synchronized (queue) {
+            if (!digest.equals(durableHashes.get(key))) {
+                return false;
+            }
+            if (queue.get(key) == tag) {
+                queue.remove(key);
+            }
+            if (unacknowledgedSnapshots.get(key) == tag) {
+                unacknowledgedSnapshots.remove(key);
+                snapshotVersions.remove(key);
+            }
+            return true;
+        }
+    }
+
+    /**
+     * 退出冻结后压缩并清理停服阶段捕获的重复快照。普通实时 worker 已停止，
+     * 因此退出 bundle 构建前必须显式调用本方法完成最后一次去重。
+     */
+    public void compactForExit() {
+        Map<ChunkKey, CompoundTag> candidates;
+        synchronized (queue) {
+            candidates = new java.util.HashMap<>(unacknowledgedSnapshots);
+        }
+        for (Map.Entry<ChunkKey, CompoundTag> entry : candidates.entrySet()) {
+            byte[] gzip = compress(entry.getValue());
+            if (gzip == null) {
+                continue;
+            }
+            removeIfAlreadyDurable(entry.getKey(), entry.getValue(), gzip);
         }
     }
 
@@ -308,9 +576,25 @@ public final class ChunkUploadService {
      * 已经在途，其迟到 ACK 也会因对象已不再是当前项而成为无害操作。
      */
     public void forget(ChunkKey key) {
+        CompletableFuture<ControlMessage> requestToCancel = null;
         synchronized (queue) {
+            if (inFlightBatch != null && inFlightBatch.candidates().stream()
+                    .anyMatch(candidate -> candidate.key().equals(key))) {
+                // 服务端可能已经 force 了旧批次，只是 ACK 丢失。载荷发生变化后
+                // 绝不能复用原 sequence；留下空洞比把新内容绑定到旧幂等键安全。
+                nextBatchSequence = Math.max(nextBatchSequence,
+                        Math.addExact(inFlightBatch.batch().sequence(), 1));
+                inFlightBatch = null;
+                requestToCancel = inFlightBatchRequest;
+                inFlightBatchRequest = null;
+            }
             queue.remove(key);
             unacknowledgedSnapshots.remove(key);
+            durableHashes.remove(key);
+            snapshotVersions.remove(key);
+        }
+        if (requestToCancel != null) {
+            requestToCancel.cancel(false);
         }
     }
 
@@ -346,8 +630,11 @@ public final class ChunkUploadService {
     public void shutdown() {
         shutdown = true;
         synchronized (queue) {
+            inFlightBatch = null;
             queue.clear();
             unacknowledgedSnapshots.clear();
+            durableHashes.clear();
+            snapshotVersions.clear();
         }
     }
 }

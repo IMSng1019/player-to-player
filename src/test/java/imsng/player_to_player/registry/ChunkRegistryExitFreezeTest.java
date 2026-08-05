@@ -1,7 +1,10 @@
 package imsng.player_to_player.registry;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
@@ -26,6 +29,11 @@ class ChunkRegistryExitFreezeTest {
             new ChunkKey("minecraft:overworld", 30, 30);
     private static final UUID OTHER_GROUP =
             UUID.fromString("30c88a44-b992-4a3a-9f5b-6b64f176f501");
+    private static final UUID SECONDARY =
+            UUID.fromString("3f67ff74-a3c3-43b0-a743-702dc7eb0bf2");
+
+    @TempDir
+    Path temporary;
 
     @Test
     void frozenGroupCannotClaimOrReleaseUntilExitCompletes() {
@@ -60,26 +68,139 @@ class ChunkRegistryExitFreezeTest {
         assertTrue(registry.isExitFrozen(GROUP));
         assertEquals(GROUP, registry.ownerOf(FIRST));
         assertEquals(null, registry.ownerOf(STALE));
+        // EXIT_BEGIN 的 ACK 只依赖先行 WAL；全量后端快照由周期 checkpoint 收敛。
+        assertEquals(Map.of(STALE, GROUP), store.data);
+        registry.persist();
         assertEquals(Map.of(FIRST, GROUP), store.data);
     }
 
     @Test
-    void orphanRecoveryUsesOnlyDurableServerClaims() {
+    void orphanRecoveryRestoresRequestedClaimsAfterDisconnectCleanup() {
+        MemoryStore store = new MemoryStore();
+        ChunkRegistry registry = new ChunkRegistry(store, null);
+        assertTrue(registry.tryClaim(FIRST, GROUP).granted());
+        assertTrue(registry.tryClaim(SECOND, GROUP).granted());
+        assertEquals(2, registry.releaseAllDurably(GROUP));
+
+        Set<ChunkKey> recovered = registry.freezeOrRecoverForExit(
+                GROUP, Set.of(FIRST, SECOND), true);
+
+        assertEquals(Set.of(FIRST, SECOND), recovered);
+        assertEquals(null, registry.ownerOf(FIRST));
+        assertEquals(null, registry.ownerOf(SECOND));
+
+        registry.restoreExitProtection(GROUP, recovered);
+
+        assertEquals(GROUP, registry.ownerOf(FIRST));
+        assertEquals(GROUP, registry.ownerOf(SECOND));
+        assertTrue(registry.isExitFrozen(GROUP));
+    }
+
+    @Test
+    void orphanRecoveryAcceptsDurableEmptyOwnershipProof() {
+        Path journalFile = temporary.resolve("empty-ownership.jsonl");
+        ChunkRegistry first = new ChunkRegistry(
+                new MemoryStore(), null, new RegistryMutationJournal(journalFile));
+
+        assertEquals(0, first.releaseAllDurably(GROUP, Set.of(GROUP, SECONDARY)));
+
+        ChunkRegistry recovered = new ChunkRegistry(
+                new MemoryStore(), null, new RegistryMutationJournal(journalFile));
+        recovered.load();
+        assertEquals(Set.of(), recovered.freezeOrRecoverForExit(
+                GROUP, Set.of(), Set.of(GROUP, SECONDARY), true));
+        recovered.restoreExitProtection(GROUP, Set.of());
+        assertTrue(recovered.isExitFrozen(GROUP));
+    }
+
+    @Test
+    void orphanRecoveryRejectsClaimsWithoutDurableDisconnectProof() {
+        ChunkRegistry registry = new ChunkRegistry(new MemoryStore(), null);
+
+        assertThrows(IllegalStateException.class, () ->
+                registry.freezeOrRecoverForExit(
+                        GROUP, Set.of(FIRST), true));
+
+        assertFalse(registry.isExitFrozen(GROUP));
+    }
+
+    @Test
+    void orphanRecoveryAcceptsExactPersistedSoloClaimsAfterServerRestart() {
         MemoryStore store = new MemoryStore();
         store.data.put(FIRST, GROUP);
         ChunkRegistry registry = new ChunkRegistry(store, null);
         registry.load();
 
         Set<ChunkKey> recovered = registry.freezeOrRecoverForExit(
-                GROUP, Set.of(FIRST, SECOND), true);
+                GROUP, Set.of(FIRST), Set.of(GROUP), true);
 
         assertEquals(Set.of(FIRST), recovered);
-        assertEquals(null, registry.ownerOf(SECOND));
-
-        registry.restoreExitProtection(GROUP, recovered);
-
-        assertEquals(null, registry.ownerOf(SECOND));
         assertTrue(registry.isExitFrozen(GROUP));
+        assertEquals(GROUP, registry.ownerOf(FIRST));
+    }
+
+    @Test
+    void orphanRecoveryRejectsManifestDifferentFromDisconnectProof() {
+        ChunkRegistry registry = new ChunkRegistry(new MemoryStore(), null);
+        assertTrue(registry.tryClaim(FIRST, GROUP).granted());
+        assertEquals(1, registry.releaseAllDurably(GROUP));
+
+        assertThrows(IllegalStateException.class, () ->
+                registry.freezeOrRecoverForExit(
+                        GROUP, Set.of(FIRST, SECOND), true));
+
+        assertFalse(registry.isExitFrozen(GROUP));
+    }
+
+    @Test
+    void orphanRecoveryRejectsPlayerMembersDifferentFromDisconnectProof() {
+        ChunkRegistry registry = new ChunkRegistry(new MemoryStore(), null);
+        assertTrue(registry.tryClaim(FIRST, GROUP).granted());
+        assertEquals(1, registry.releaseAllDurably(
+                GROUP, Set.of(GROUP, SECONDARY)));
+
+        assertThrows(IllegalStateException.class, () ->
+                registry.freezeOrRecoverForExit(
+                        GROUP, Set.of(FIRST), Set.of(GROUP), true));
+
+        assertFalse(registry.isExitFrozen(GROUP));
+    }
+
+    @Test
+    void disconnectRecoverySurvivesCheckpointAndRegistryRecreation() {
+        MemoryStore store = new MemoryStore();
+        Path journalFile = temporary.resolve("mutations.jsonl");
+        ChunkRegistry first = new ChunkRegistry(
+                store, null, new RegistryMutationJournal(journalFile));
+        assertTrue(first.tryClaim(FIRST, GROUP).granted());
+        assertEquals(1, first.releaseAllDurably(
+                GROUP, Set.of(GROUP, SECONDARY)));
+
+        ChunkRegistry recovered = new ChunkRegistry(
+                store, null, new RegistryMutationJournal(journalFile));
+        recovered.load();
+
+        assertEquals(Set.of(FIRST), recovered.freezeOrRecoverForExit(
+                GROUP, Set.of(FIRST), Set.of(GROUP, SECONDARY), true));
+    }
+
+    @Test
+    void normalRejoinConsumptionSurvivesRestartAndRejectsOldExitBundle() {
+        MemoryStore store = new MemoryStore();
+        Path journalFile = temporary.resolve("mutations.jsonl");
+        ChunkRegistry first = new ChunkRegistry(
+                store, null, new RegistryMutationJournal(journalFile));
+        assertTrue(first.tryClaim(FIRST, GROUP).granted());
+        assertEquals(1, first.releaseAllDurably(GROUP));
+        assertTrue(first.discardDisconnectRecoveryDurably(GROUP));
+
+        ChunkRegistry recovered = new ChunkRegistry(
+                store, null, new RegistryMutationJournal(journalFile));
+        recovered.load();
+
+        assertThrows(IllegalStateException.class, () ->
+                recovered.freezeOrRecoverForExit(
+                        GROUP, Set.of(FIRST), true));
     }
 
     @Test
@@ -91,6 +212,7 @@ class ChunkRegistryExitFreezeTest {
         store.data.put(neighbor, OTHER_GROUP);
         ChunkRegistry registry = new ChunkRegistry(store, null);
         registry.load();
+        assertEquals(1, registry.releaseAllDurably(GROUP));
 
         assertThrows(IllegalStateException.class, () ->
                 registry.freezeOrRecoverForExit(
@@ -100,11 +222,28 @@ class ChunkRegistryExitFreezeTest {
     }
 
     @Test
+    void orphanRecoveryRejectsRequestedFourNeighborConflictWhenClaimsWereReleased() {
+        ChunkKey neighbor = new ChunkKey(
+                FIRST.dimension(), FIRST.x() + 1, FIRST.z());
+        ChunkRegistry registry = new ChunkRegistry(new MemoryStore(), null);
+        assertTrue(registry.tryClaim(FIRST, GROUP).granted());
+        assertEquals(1, registry.releaseAllDurably(GROUP));
+        assertTrue(registry.tryClaim(neighbor, OTHER_GROUP).granted());
+
+        assertThrows(IllegalStateException.class, () ->
+                registry.freezeOrRecoverForExit(
+                        GROUP, Set.of(FIRST), true));
+
+        assertEquals(OTHER_GROUP, registry.ownerOf(neighbor));
+        assertFalse(registry.isExitFrozen(GROUP));
+    }
+
+    @Test
     void orphanRecoveryNeverStealsClaimFromAnotherGroup() {
-        MemoryStore store = new MemoryStore();
-        store.data.put(SECOND, OTHER_GROUP);
-        ChunkRegistry registry = new ChunkRegistry(store, null);
-        registry.load();
+        ChunkRegistry registry = new ChunkRegistry(new MemoryStore(), null);
+        assertTrue(registry.tryClaim(SECOND, GROUP).granted());
+        assertEquals(1, registry.releaseAllDurably(GROUP));
+        assertTrue(registry.tryClaim(SECOND, OTHER_GROUP).granted());
 
         assertThrows(IllegalStateException.class, () -> registry.freezeOrRecoverForExit(
                 GROUP, Set.of(SECOND), true));
@@ -114,12 +253,15 @@ class ChunkRegistryExitFreezeTest {
     }
 
     @Test
-    void failedDurableCleanupKeepsClaimsFrozenForRetry() {
+    void failedRegistryWalCleanupKeepsClaimsFrozenForRetry() throws Exception {
         MemoryStore store = new MemoryStore();
-        ChunkRegistry registry = new ChunkRegistry(store, null);
+        Path journalFile = temporary.resolve("cleanup-failure.jsonl");
+        ChunkRegistry registry = new ChunkRegistry(
+                store, null, new RegistryMutationJournal(journalFile));
         assertTrue(registry.tryClaim(FIRST, GROUP).granted());
         registry.freezeForExit(GROUP);
-        store.failNextSave = true;
+        Files.delete(journalFile);
+        Files.createDirectory(journalFile);
 
         assertThrows(IllegalStateException.class,
                 () -> registry.completeExitDurably(GROUP, Set.of(FIRST)));
@@ -144,12 +286,15 @@ class ChunkRegistryExitFreezeTest {
     }
 
     @Test
-    void failedAbnormalDisconnectReleaseRestoresClaimsAndFreeze() {
+    void failedDisconnectWalAppendKeepsClaimsAndFreeze() throws Exception {
         MemoryStore store = new MemoryStore();
-        ChunkRegistry registry = new ChunkRegistry(store, null);
+        Path journalFile = temporary.resolve("disconnect-failure.jsonl");
+        ChunkRegistry registry = new ChunkRegistry(
+                store, null, new RegistryMutationJournal(journalFile));
         assertTrue(registry.tryClaim(FIRST, GROUP).granted());
         registry.freezeForExit(GROUP);
-        store.failNextSave = true;
+        Files.delete(journalFile);
+        Files.createDirectory(journalFile);
 
         assertThrows(IllegalStateException.class,
                 () -> registry.releaseAllDurably(GROUP));
@@ -179,6 +324,9 @@ class ChunkRegistryExitFreezeTest {
 
         assertFalse(oldPersist.isAlive());
         assertFalse(recovery.isAlive());
+        assertEquals(GROUP, registry.ownerOf(FIRST));
+        assertEquals(null, registry.ownerOf(STALE));
+        registry.persist();
         assertEquals(Map.of(FIRST, GROUP), store.data);
     }
 

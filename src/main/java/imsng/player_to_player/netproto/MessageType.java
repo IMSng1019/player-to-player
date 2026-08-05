@@ -248,11 +248,21 @@ public enum MessageType {
      */
     EXIT_CHUNK_DATA(102),
     /**
-     * C→S 提交退出事务（json: shutdownId, writtenChunks[]）。服务端验证已收到的区块
-     * 与声明集合完全相等，先持久化 committed 计划，再只应用 written 数据、刷新存储并
-     * 释放完整 ownership 清单；完成后以同类型应答 json: committed。
+     * C→S 提交退出事务（json: shutdownId, writtenChunks[]）。服务端验证已收到集合，
+     * 将玩家数据、written 区块尾部和 ownership release 意图作为一个复合 WAL 事务
+     * （多条有界数据片 + 终结标记）一次 force 后立即应答 committed；正式玩家文件、
+     * MCA 与注册表 checkpoint 异步物化。
      */
-    EXIT_COMMIT(103);
+    EXIT_COMMIT(103),
+    /**
+     * C→S 运行期区块增量批次（binary: {@link imsng.player_to_player.group.ChunkDeltaBatch}）。
+     * 服务端先追加 WAL 并 force 一次，再异步物化 MCA；ACK 携带 durableEpoch。
+     */
+    CHUNK_DATA_BATCH(104),
+    /** C→S 退出尾部区块批次；阶段 ACK 只表示已暂存，最终耐久性由 EXIT_COMMIT 提供。 */
+    EXIT_CHUNK_BATCH(105),
+    /** C→S 断线重连查询退出事务状态（json: shutdownId）。 */
+    EXIT_STATUS(106);
 
     private final int id;
 

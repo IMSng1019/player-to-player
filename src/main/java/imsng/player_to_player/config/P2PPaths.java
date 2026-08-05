@@ -74,6 +74,11 @@ public final class P2PPaths {
         return root.resolve("exit-payloads");
     }
 
+    /** [服务端] 运行期区块批次的追加式耐久日志。 */
+    public Path durableChunkJournalDir() {
+        return root.resolve("chunk-journal");
+    }
+
     /** [服务端/中转端] 版本化不可变环境快照仓库。 */
     public Path environmentSnapshotsDir() {
         return root.resolve("environment-snapshots");

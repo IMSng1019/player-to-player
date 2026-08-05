@@ -63,20 +63,31 @@ final class ChunkWriteCoordinator {
             BooleanSupplier finalWriter,
             ChunkWriteback.ReleaseTransaction transaction) {
         Objects.requireNonNull(transaction, "transaction");
-        return withLock(key, () -> {
-            ChunkWriteback.ReleaseResult replayed = transaction.replay();
-            if (replayed != null) {
-                return replayed;
+        return withLock(key, () -> finalizeAndReleaseWithinChunkLock(
+                hasFinalData, finalWriter, transaction));
+    }
+
+    /**
+     * 调用方已经持有该区块的分片锁时执行释放状态机。服务端 WAL 路径需要在区块锁
+     * 内再取得批次线性化锁，并让“最终 WAL 写入 + ownership 提交”共同处于该锁内；
+     * 单独复用本方法可避免重复取得区块锁，同时保持全局锁序清晰。
+     */
+    ChunkWriteback.ReleaseResult finalizeAndReleaseWithinChunkLock(
+            boolean hasFinalData, BooleanSupplier finalWriter,
+            ChunkWriteback.ReleaseTransaction transaction) {
+        Objects.requireNonNull(transaction, "transaction");
+        ChunkWriteback.ReleaseResult replayed = transaction.replay();
+        if (replayed != null) {
+            return replayed;
+        }
+        boolean written = false;
+        if (hasFinalData) {
+            if (finalWriter == null || !finalWriter.getAsBoolean()) {
+                return new ChunkWriteback.ReleaseResult(false, false);
             }
-            boolean written = false;
-            if (hasFinalData) {
-                if (finalWriter == null || !finalWriter.getAsBoolean()) {
-                    return new ChunkWriteback.ReleaseResult(false, false);
-                }
-                written = true;
-            }
-            return transaction.commit(written);
-        });
+            written = true;
+        }
+        return transaction.commit(written);
     }
 
     private Object lockFor(ChunkKey key) {

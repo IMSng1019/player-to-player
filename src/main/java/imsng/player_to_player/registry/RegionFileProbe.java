@@ -3,6 +3,8 @@ package imsng.player_to_player.registry;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
+import java.util.Objects;
+import java.util.function.Predicate;
 
 /**
  * 世界 region 文件探测器：判断某区块在服务端存档中是否已有数据
@@ -27,13 +29,24 @@ public final class RegionFileProbe {
 
     /** 世界存档根目录（{@code MinecraftServer.getWorldPath(LevelResource.ROOT)}）。 */
     private final Path worldRoot;
+    /** WAL 中尚未物化到 region 的区块也应被视为已有服务端数据。 */
+    private final Predicate<ChunkKey> durableDataProbe;
 
     public RegionFileProbe(Path worldRoot) {
+        this(worldRoot, key -> false);
+    }
+
+    public RegionFileProbe(Path worldRoot, Predicate<ChunkKey> durableDataProbe) {
         this.worldRoot = worldRoot;
+        this.durableDataProbe = Objects.requireNonNull(durableDataProbe,
+                "durableDataProbe");
     }
 
     /** 该区块在服务端存档中是否已有数据（region 文件存在且非空）。 */
     public boolean hasServerData(ChunkKey key) {
+        if (key != null && durableDataProbe.test(key)) {
+            return true;
+        }
         Path regionDir = regionDirOf(key.dimension());
         if (regionDir == null) {
             return false;

@@ -106,6 +106,47 @@ class ExitTransactionClientTest {
     }
 
     @Test
+    void largeExitUsesOneChunkBatchInsteadOfPerChunkRoundTrips() {
+        ChunkKey a = new ChunkKey("minecraft:overworld", 1, 1);
+        ChunkKey b = new ChunkKey("minecraft:overworld", 2, 1);
+        ChunkKey c = new ChunkKey("minecraft:the_nether", 3, 1);
+        ExitManifest manifest = manifest(Set.of(a, b, c));
+        ExitBundle bundle = new ExitBundle(manifest,
+                Map.of(ID, new byte[]{9}),
+                Map.of(a, new byte[]{1}, b, new byte[]{2}, c, new byte[]{3}));
+        List<MessageType> sent = new ArrayList<>();
+        List<Integer> batchSizes = new ArrayList<>();
+        FakeFactory factory = new FakeFactory();
+        factory.connections.add(new ScriptedConnection(message -> {
+            sent.add(message.type());
+            return switch (message.type()) {
+                case EXIT_BEGIN -> CompletableFuture.completedFuture(
+                        beginAck(manifest, false));
+                case EXIT_PLAYER_DATA -> CompletableFuture.completedFuture(
+                        booleanAck(MessageType.EXIT_PLAYER_DATA, "written", true));
+                case EXIT_CHUNK_BATCH -> {
+                    batchSizes.add(ChunkDeltaBatch.decode(message.binary()).deltas().size());
+                    JsonObject ack = new JsonObject();
+                    ack.addProperty("accepted", true);
+                    ack.addProperty("written", true);
+                    yield CompletableFuture.completedFuture(
+                            ControlMessage.of(MessageType.EXIT_CHUNK_BATCH, ack));
+                }
+                case EXIT_COMMIT -> CompletableFuture.completedFuture(
+                        booleanAck(MessageType.EXIT_COMMIT, "committed", true));
+                default -> throw new AssertionError(message.type());
+            };
+        }));
+
+        new ExitTransactionClient(factory, ignored -> {
+        }).commitUntilAccepted(bundle);
+
+        assertEquals(List.of(MessageType.EXIT_BEGIN, MessageType.EXIT_PLAYER_DATA,
+                MessageType.EXIT_CHUNK_BATCH, MessageType.EXIT_COMMIT), sent);
+        assertEquals(List.of(3), batchSizes);
+    }
+
+    @Test
     void beginRetriesForeverPolicyUntilConnectionReturnsAcceptedManifest()
             throws Exception {
         ExitManifest requested = manifest(Set.of());

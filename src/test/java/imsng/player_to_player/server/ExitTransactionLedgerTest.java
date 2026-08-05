@@ -1,11 +1,13 @@
 package imsng.player_to_player.server;
 
 import imsng.player_to_player.group.ExitManifest;
+import imsng.player_to_player.group.ChunkDelta;
 import imsng.player_to_player.registry.ChunkKey;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
@@ -149,14 +151,14 @@ class ExitTransactionLedgerTest {
     }
 
     @Test
-    void writeThatBecomesVisibleBeforeThrowKeepsProtectionAndIsRetried() {
+    void uncertainBeginForceIsNotPublishedAndIsRetried() {
         UncertainPersistence persistence = new UncertainPersistence(1);
         ExitTransactionLedger ledger = new ExitTransactionLedger(persistence);
         ExitManifest manifest = manifest(SHUTDOWN_ID, CLIENT_ID, Set.of(CHUNK));
 
         assertThrows(IllegalStateException.class,
                 () -> ledger.begin(CLIENT_ID, manifest));
-        assertTrue(ledger.isProtected(CLIENT_ID));
+        assertFalse(ledger.isProtected(CLIENT_ID));
 
         ExitTransactionLedger.BeginResult retried = ledger.begin(CLIENT_ID, manifest);
 
@@ -166,7 +168,7 @@ class ExitTransactionLedgerTest {
     }
 
     @Test
-    void committedWriteVisibleBeforeThrowPublishesCommittedState() {
+    void uncertainCommittedForceMustBeRetriedBeforePublishingState() {
         UncertainPersistence persistence = new UncertainPersistence(2);
         ExitTransactionLedger ledger = new ExitTransactionLedger(persistence);
         ExitManifest manifest = manifest(SHUTDOWN_ID, CLIENT_ID, Set.of(CHUNK));
@@ -177,13 +179,14 @@ class ExitTransactionLedgerTest {
         assertThrows(IllegalStateException.class,
                 () -> ledger.commit(CLIENT_ID, SHUTDOWN_ID, Set.of(CHUNK)));
 
+        assertFalse(ledger.isCommitted(CLIENT_ID, SHUTDOWN_ID));
+        assertTrue(ledger.commit(CLIENT_ID, SHUTDOWN_ID, Set.of(CHUNK)));
         assertTrue(ledger.isCommitted(CLIENT_ID, SHUTDOWN_ID));
-        assertTrue(ledger.begin(CLIENT_ID, manifest).committed());
-        assertEquals(2, persistence.saves);
+        assertEquals(3, persistence.saves);
     }
 
     @Test
-    void abandonedWriteVisibleBeforeThrowPublishesAbandonedState() {
+    void uncertainAbandonForceMustBeRetriedBeforePublishingState() {
         UncertainPersistence persistence = new UncertainPersistence(2);
         ExitTransactionLedger ledger = new ExitTransactionLedger(persistence);
         ExitManifest manifest = manifest(SHUTDOWN_ID, CLIENT_ID, Set.of(CHUNK));
@@ -192,13 +195,15 @@ class ExitTransactionLedgerTest {
         assertThrows(IllegalStateException.class,
                 () -> ledger.abandon(CLIENT_ID, SHUTDOWN_ID));
 
-        assertTrue(ledger.isCommitted(CLIENT_ID, SHUTDOWN_ID));
+        assertFalse(ledger.isCommitted(CLIENT_ID, SHUTDOWN_ID));
+        assertFalse(ledger.isAbandoned(CLIENT_ID, SHUTDOWN_ID));
+        assertTrue(ledger.abandon(CLIENT_ID, SHUTDOWN_ID));
         assertTrue(ledger.isAbandoned(CLIENT_ID, SHUTDOWN_ID));
-        assertEquals(2, persistence.saves);
+        assertEquals(3, persistence.saves);
     }
 
     @Test
-    void cleanupWriteVisibleBeforeThrowPublishesCleanupState() {
+    void uncertainCleanupForceMustBeRetriedBeforeUnprotectingClient() {
         UncertainPersistence persistence = new UncertainPersistence(4);
         ExitTransactionLedger ledger = new ExitTransactionLedger(persistence);
         ExitManifest manifest = manifest(SHUTDOWN_ID, CLIENT_ID, Set.of());
@@ -210,9 +215,61 @@ class ExitTransactionLedgerTest {
         assertThrows(IllegalStateException.class,
                 () -> ledger.markCleanupComplete(CLIENT_ID, SHUTDOWN_ID));
 
-        assertTrue(ledger.isCleanupComplete(CLIENT_ID, SHUTDOWN_ID));
+        assertFalse(ledger.isCleanupComplete(CLIENT_ID, SHUTDOWN_ID));
+        assertTrue(ledger.isProtected(CLIENT_ID));
+        assertTrue(ledger.markCleanupComplete(CLIENT_ID, SHUTDOWN_ID));
         assertFalse(ledger.isProtected(CLIENT_ID));
-        assertEquals(4, persistence.saves);
+        assertEquals(5, persistence.saves);
+    }
+
+    @Test
+    void externallyDurableCommitPublishesWithoutSecondMetadataSave() {
+        CountingPersistence persistence = new CountingPersistence();
+        ExitTransactionLedger ledger = new ExitTransactionLedger(persistence);
+        ExitManifest manifest = manifest(SHUTDOWN_ID, CLIENT_ID, Set.of(CHUNK));
+        assertTrue(ledger.begin(CLIENT_ID, manifest).accepted());
+        assertTrue(ledger.markPlayerReceived(CLIENT_ID, SHUTDOWN_ID, CLIENT_ID));
+        assertTrue(ledger.markChunkReceived(CLIENT_ID, SHUTDOWN_ID, CHUNK));
+        java.util.concurrent.atomic.AtomicInteger durableWrites =
+                new java.util.concurrent.atomic.AtomicInteger();
+
+        assertTrue(ledger.commitAfterDurable(
+                CLIENT_ID, SHUTDOWN_ID, Set.of(CHUNK),
+                () -> {
+                    durableWrites.incrementAndGet();
+                    return true;
+                }));
+        assertTrue(ledger.commitAfterDurable(
+                CLIENT_ID, SHUTDOWN_ID, Set.of(CHUNK),
+                () -> {
+                    durableWrites.incrementAndGet();
+                    return true;
+                }));
+
+        assertEquals(1, durableWrites.get());
+        assertEquals(1, persistence.saves,
+                "BEGIN 元数据后不得再为最终 COMMIT 做第二次 force");
+        assertTrue(ledger.isCommitted(CLIENT_ID, SHUTDOWN_ID));
+    }
+
+    @Test
+    void durableWorldWalCommitOverridesPendingMetadataAfterRestart() {
+        InMemoryPersistence persistence = new InMemoryPersistence();
+        ExitManifest manifest = manifest(SHUTDOWN_ID, CLIENT_ID, Set.of(CHUNK));
+        ExitTransactionLedger first = new ExitTransactionLedger(persistence);
+        assertTrue(first.begin(CLIENT_ID, manifest).accepted());
+        ExitCommitPayload payload = new ExitCommitPayload(
+                manifest, Map.of(CLIENT_ID, new byte[]{1}),
+                List.of(ChunkDelta.of(CHUNK, 4, new byte[]{2})));
+        DurableChunkJournal.ExitCommitEntry entry =
+                new DurableChunkJournal.ExitCommitEntry(9, payload, "digest");
+
+        ExitTransactionLedger recovered = new ExitTransactionLedger(persistence);
+        recovered.restoreDurableCommits(Map.of(SHUTDOWN_ID, entry));
+
+        assertTrue(recovered.isCommitted(CLIENT_ID, SHUTDOWN_ID));
+        assertEquals(Set.of(CHUNK), recovered.chunkDisposition(
+                CLIENT_ID, SHUTDOWN_ID).writtenChunks());
     }
 
     private static ExitManifest manifest(UUID shutdownId, UUID clientId,
@@ -232,6 +289,23 @@ class ExitTransactionLedgerTest {
 
         @Override
         public void save(ExitTransactionRecord record) {
+            records.put(record.manifest().shutdownId(), record);
+        }
+    }
+
+    private static final class CountingPersistence
+            implements ExitTransactionPersistence {
+        private final Map<UUID, ExitTransactionRecord> records = new HashMap<>();
+        private int saves;
+
+        @Override
+        public Map<UUID, ExitTransactionRecord> load() {
+            return new HashMap<>(records);
+        }
+
+        @Override
+        public void save(ExitTransactionRecord record) {
+            saves++;
             records.put(record.manifest().shutdownId(), record);
         }
     }

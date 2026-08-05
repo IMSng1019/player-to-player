@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import java.net.SocketAddress;
 import java.util.ArrayDeque;
 import java.util.Queue;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -43,6 +44,207 @@ class ChunkUploadServiceTest {
 
         assertNull(service.latestSnapshot(KEY));
         assertEquals(1, connection.requests.get());
+    }
+
+    @Test
+    void queuedSnapshotsAreUploadedInOneDurableBatch() {
+        ChunkKey second = new ChunkKey("minecraft:overworld", -6, 0);
+        ChunkKey third = new ChunkKey("minecraft:the_nether", 2, 3);
+        FakeConnection connection = new FakeConnection();
+        connection.responses.add(batchSuccess());
+        Queue<Runnable> tasks = new ArrayDeque<>();
+        ChunkUploadService service = new ChunkUploadService(connection, GROUP_ID,
+                tasks::add, ignored -> {
+                }, key -> true);
+
+        service.enqueue(KEY, chunkAt(KEY, 1));
+        service.enqueue(second, chunkAt(second, 2));
+        service.enqueue(third, chunkAt(third, 3));
+        tasks.remove().run();
+
+        assertEquals(1, connection.requests.get());
+        ControlMessage request = connection.messages.remove();
+        assertEquals(MessageType.CHUNK_DATA_BATCH, request.type());
+        assertEquals(3, ChunkDeltaBatch.decode(request.binary()).deltas().size());
+        assertNull(service.latestUnacknowledged(KEY));
+        assertNull(service.latestUnacknowledged(second));
+        assertNull(service.latestUnacknowledged(third));
+    }
+
+    @Test
+    void lostBatchAcknowledgementRetriesTheSameIdempotencyKey() {
+        ChunkKey second = new ChunkKey("minecraft:overworld", -6, 0);
+        ChunkKey third = new ChunkKey("minecraft:overworld", -5, 0);
+        FakeConnection connection = new FakeConnection();
+        connection.responses.add(CompletableFuture.failedFuture(
+                new java.io.IOException("ack lost")));
+        connection.responses.add(batchSuccess());
+        Queue<Runnable> tasks = new ArrayDeque<>();
+        AtomicReference<Runnable> retry = new AtomicReference<>();
+        ChunkUploadService service = new ChunkUploadService(connection, GROUP_ID,
+                tasks::add, retry::set, key -> true);
+
+        service.enqueue(KEY, chunkAt(KEY, 1));
+        service.enqueue(second, chunkAt(second, 2));
+        service.enqueue(third, chunkAt(third, 3));
+        tasks.remove().run();
+        retry.get().run();
+        tasks.remove().run();
+
+        ControlMessage first = connection.messages.remove();
+        ControlMessage replay = connection.messages.remove();
+        assertEquals(first.json().get("batchId"), replay.json().get("batchId"));
+        assertEquals(first.json().get("sequence"), replay.json().get("sequence"));
+        assertTrue(java.util.Arrays.equals(first.binary(), replay.binary()));
+        assertEquals(2, connection.requests.get());
+    }
+
+    @Test
+    void lostBatchAcknowledgementReplaysFrozenBytesBeforeNewerSnapshots() {
+        ChunkKey second = new ChunkKey("minecraft:overworld", -6, 0);
+        ChunkKey third = new ChunkKey("minecraft:overworld", -5, 0);
+        FakeConnection connection = new FakeConnection();
+        connection.responses.add(CompletableFuture.failedFuture(
+                new java.io.IOException("ack lost")));
+        connection.responses.add(batchSuccess());
+        connection.responses.add(batchSuccess());
+        Queue<Runnable> tasks = new ArrayDeque<>();
+        AtomicReference<Runnable> retry = new AtomicReference<>();
+        ChunkUploadService service = new ChunkUploadService(connection, GROUP_ID,
+                tasks::add, retry::set, key -> true);
+
+        service.enqueue(KEY, chunkAt(KEY, 1));
+        service.enqueue(second, chunkAt(second, 2));
+        service.enqueue(third, chunkAt(third, 3));
+        tasks.remove().run();
+
+        // ACK 丢失期间产生的新版本必须排在旧批次之后，不能复用 sequence=0。
+        service.enqueue(KEY, chunkAt(KEY, 9));
+        service.enqueue(second, chunkAt(second, 8));
+        retry.get().run();
+        tasks.remove().run();
+
+        ControlMessage first = connection.messages.remove();
+        ControlMessage replay = connection.messages.remove();
+        ControlMessage replacement = connection.messages.remove();
+        assertEquals(first.json().get("batchId"), replay.json().get("batchId"));
+        assertEquals(first.json().get("sequence"), replay.json().get("sequence"));
+        assertTrue(java.util.Arrays.equals(first.binary(), replay.binary()),
+                "同一幂等键必须逐字节重放");
+        assertEquals(1, replacement.json().get("sequence").getAsInt());
+        assertTrue(!java.util.Arrays.equals(first.binary(), replacement.binary()));
+        assertEquals(3, connection.requests.get());
+        assertNull(service.latestUnacknowledged(KEY));
+        assertNull(service.latestUnacknowledged(second));
+        assertNull(service.latestUnacknowledged(third));
+    }
+
+    @Test
+    void forgettingOneInFlightChunkCancelsBatchAndResendsRemainingWithNewSequence() {
+        ChunkKey second = new ChunkKey("minecraft:overworld", -6, 0);
+        ChunkKey third = new ChunkKey("minecraft:overworld", -5, 0);
+        FakeConnection connection = new FakeConnection();
+        connection.responses.add(CompletableFuture.failedFuture(
+                new java.io.IOException("ack lost")));
+        connection.responses.add(batchSuccess());
+        Queue<Runnable> tasks = new ArrayDeque<>();
+        AtomicReference<Runnable> retry = new AtomicReference<>();
+        ChunkUploadService service = new ChunkUploadService(connection, GROUP_ID,
+                tasks::add, retry::set, key -> true);
+
+        service.enqueue(KEY, chunkAt(KEY, 1));
+        service.enqueue(second, chunkAt(second, 2));
+        service.enqueue(third, chunkAt(third, 3));
+        tasks.remove().run();
+        service.forget(KEY);
+        retry.get().run();
+        tasks.remove().run();
+
+        ControlMessage abandoned = connection.messages.remove();
+        ControlMessage replacement = connection.messages.remove();
+        ChunkDeltaBatch replacementBatch = ChunkDeltaBatch.decode(
+                replacement.binary());
+        assertEquals(0, abandoned.json().get("sequence").getAsInt());
+        assertEquals(1, replacement.json().get("sequence").getAsInt(),
+                "不同载荷不得复用 ACK 结果不确定的 sequence");
+        assertEquals(Set.of(second, third), replacementBatch.deltas().stream()
+                .map(ChunkDelta::key)
+                .collect(java.util.stream.Collectors.toUnmodifiableSet()));
+        assertNull(service.latestUnacknowledged(KEY));
+        assertNull(service.latestUnacknowledged(second));
+        assertNull(service.latestUnacknowledged(third));
+    }
+
+    @Test
+    void forgettingChunkCancelsHungBatchAckAndImmediatelyResendsRemaining()
+            throws Exception {
+        ChunkKey second = new ChunkKey("minecraft:overworld", -6, 0);
+        ChunkKey third = new ChunkKey("minecraft:overworld", -5, 0);
+        FakeConnection connection = new FakeConnection();
+        CompletableFuture<ControlMessage> hungAcknowledgement =
+                new CompletableFuture<>();
+        connection.responses.add(hungAcknowledgement);
+        connection.responses.add(batchSuccess());
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        AtomicInteger scheduledRetries = new AtomicInteger();
+        ChunkUploadService service = new ChunkUploadService(connection, GROUP_ID,
+                executor, ignored -> scheduledRetries.incrementAndGet(), key -> true);
+        try {
+            service.enqueue(KEY, chunkAt(KEY, 1));
+            service.enqueue(second, chunkAt(second, 2));
+            service.enqueue(third, chunkAt(third, 3));
+            assertTrue(connection.awaitRequests(1), "旧批次应已进入在途请求");
+
+            service.forget(KEY);
+            boolean replacementSent;
+            try {
+                replacementSent = connection.awaitRequests(
+                        2, 500, TimeUnit.MILLISECONDS);
+            } finally {
+                // 失败实现仍阻塞在旧 future；确保测试退出时工作线程可被回收。
+                hungAcknowledgement.completeExceptionally(
+                        new java.io.IOException("test cleanup"));
+            }
+
+            assertTrue(replacementSent,
+                    "forget 必须唤醒旧 ACK 等待，不能等待 15 秒请求超时");
+            assertTrue(hungAcknowledgement.isCancelled(),
+                    "被废弃批次的本地请求 future 应被取消");
+            assertEquals(0, scheduledRetries.get(),
+                    "批次内容变化属于立即重组，不应进入网络退避");
+
+            ControlMessage abandoned = connection.messages.remove();
+            ControlMessage replacement = connection.messages.remove();
+            ChunkDeltaBatch replacementBatch = ChunkDeltaBatch.decode(
+                    replacement.binary());
+            assertEquals(0, abandoned.json().get("sequence").getAsInt());
+            assertEquals(1, replacement.json().get("sequence").getAsInt());
+            assertEquals(Set.of(second, third), replacementBatch.deltas().stream()
+                    .map(ChunkDelta::key)
+                    .collect(java.util.stream.Collectors.toUnmodifiableSet()));
+        } finally {
+            service.shutdown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void identicalSnapshotAfterDurableAcknowledgementIsNotUploadedAgain() {
+        FakeConnection connection = new FakeConnection();
+        connection.responses.add(success());
+        ChunkUploadService service = new ChunkUploadService(connection, GROUP_ID,
+                Runnable::run, ignored -> {
+                }, key -> true);
+
+        // 运行期间已经获得服务端正 ACK。
+        service.enqueue(KEY, chunkAt(1));
+        // 停服强制保存会再次经过 ChunkStorage.write，但内容没有变化。
+        service.enqueue(KEY, chunkAt(1));
+
+        assertEquals(1, connection.requests.get(),
+                "相同内容不应在退出阶段再次上传");
+        assertTrue(!service.hasUnacknowledged(KEY));
     }
 
     @Test
@@ -121,6 +323,30 @@ class ChunkUploadServiceTest {
         service.enqueue(KEY, chunkAt(1));
 
         assertEquals(1, service.latestSnapshot(KEY).getInt("value"));
+    }
+
+    @Test
+    void lostSingleAcknowledgementKeepsTheSameUploadEventIdentity() {
+        FakeConnection connection = new FakeConnection();
+        connection.responses.add(CompletableFuture.failedFuture(
+                new java.io.IOException("ack lost")));
+        connection.responses.add(success());
+        Queue<Runnable> tasks = new ArrayDeque<>();
+        AtomicReference<Runnable> retry = new AtomicReference<>();
+        ChunkUploadService service = new ChunkUploadService(connection, GROUP_ID,
+                tasks::add, retry::set, key -> true);
+
+        service.enqueue(KEY, chunkAt(1));
+        tasks.remove().run();
+        retry.get().run();
+        tasks.remove().run();
+
+        ControlMessage first = connection.messages.remove();
+        ControlMessage replay = connection.messages.remove();
+        assertTrue(first.json().has("uploadId"));
+        assertEquals(first.json().get("uploadId"), replay.json().get("uploadId"));
+        assertTrue(java.util.Arrays.equals(first.binary(), replay.binary()));
+        assertEquals(2, connection.requests.get());
     }
 
     @Test
@@ -243,6 +469,25 @@ class ChunkUploadServiceTest {
     }
 
     @Test
+    void compactForExitRemovesDuplicateCapturedAfterFreeze() {
+        FakeConnection connection = new FakeConnection();
+        connection.responses.add(success());
+        ChunkUploadService service = new ChunkUploadService(connection, GROUP_ID,
+                Runnable::run, ignored -> {
+                }, key -> true);
+
+        service.enqueue(KEY, chunkAt(1));
+        service.freezeForExit();
+        service.enqueue(KEY, chunkAt(1));
+
+        service.compactForExit();
+
+        assertTrue(!service.hasUnacknowledged(KEY));
+        assertNull(service.latestUnacknowledged(KEY));
+        assertEquals(1, connection.requests.get());
+    }
+
+    @Test
     void inFlightAcknowledgementCannotSendReplacementAfterExitFreeze() throws Exception {
         FakeConnection connection = new FakeConnection();
         CompletableFuture<ControlMessage> oldAcknowledgement = new CompletableFuture<>();
@@ -283,10 +528,23 @@ class ChunkUploadServiceTest {
                 ControlMessage.of(MessageType.CHUNK_DATA_UPLOAD, json));
     }
 
+    private static CompletableFuture<ControlMessage> batchSuccess() {
+        JsonObject json = new JsonObject();
+        json.addProperty("accepted", true);
+        json.addProperty("written", true);
+        json.addProperty("durableEpoch", 1);
+        return CompletableFuture.completedFuture(
+                ControlMessage.of(MessageType.CHUNK_DATA_BATCH, json));
+    }
+
     private static CompoundTag chunkAt(int value) {
+        return chunkAt(KEY, value);
+    }
+
+    private static CompoundTag chunkAt(ChunkKey key, int value) {
         CompoundTag tag = new CompoundTag();
-        tag.putInt("xPos", KEY.x());
-        tag.putInt("zPos", KEY.z());
+        tag.putInt("xPos", key.x());
+        tag.putInt("zPos", key.z());
         tag.putInt("value", value);
         return tag;
     }
@@ -294,6 +552,7 @@ class ChunkUploadServiceTest {
     private static final class FakeConnection implements ControlConnection {
         private final Queue<CompletableFuture<ControlMessage>> responses =
                 new ArrayDeque<>();
+        private final Queue<ControlMessage> messages = new ArrayDeque<>();
         private final AtomicInteger requests = new AtomicInteger();
 
         @Override
@@ -304,13 +563,20 @@ class ChunkUploadServiceTest {
         public CompletableFuture<ControlMessage> request(ControlMessage message) {
             synchronized (this) {
                 requests.incrementAndGet();
+                messages.add(message);
                 notifyAll();
             }
             return responses.remove();
         }
 
         private synchronized boolean awaitRequests(int expected) throws InterruptedException {
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            return awaitRequests(expected, 5, TimeUnit.SECONDS);
+        }
+
+        private synchronized boolean awaitRequests(
+                int expected, long timeout, TimeUnit unit)
+                throws InterruptedException {
+            long deadline = System.nanoTime() + unit.toNanos(timeout);
             while (requests.get() < expected) {
                 long remaining = deadline - System.nanoTime();
                 if (remaining <= 0) {

@@ -31,9 +31,9 @@ public interface ChunkWriteback {
     }
 
     /**
-     * 在该区块与实时上行共用的锁内，校验并写回最终数据、阻塞至落盘，然后调用
-     * release 删除 ownership。实现必须保证回调返回前不释放区块写锁，防迟到实时
-     * 上行插入“最终落盘”和“所有权删除”之间。
+     * 在该区块与实时上行共用的锁内，校验并耐久写回最终数据（WAL force 或兼容
+     * IOWorker flush），然后调用 release 删除 ownership。实现必须保证回调返回前
+     * 不释放线性化锁，防迟到实时上行插入“最终耐久写入”和“所有权删除”之间。
      *
      * @param key      区块键
      * @param uploader 上传方 clientId（权威校验：必须等于注册表登记的占用组）
