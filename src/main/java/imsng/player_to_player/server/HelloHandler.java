@@ -12,6 +12,7 @@ import imsng.player_to_player.netproto.MessageHandler;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.netproto.Protocol;
 import imsng.player_to_player.p2p.NatInfo;
+import imsng.player_to_player.p2p.P2PKeyGate;
 import imsng.player_to_player.util.JsonUtil;
 import imsng.player_to_player.util.ThreadPools;
 import org.slf4j.Logger;
@@ -41,6 +42,11 @@ import java.util.function.BooleanSupplier;
  *       启动扫描未完成时 envReady=false，客户端应稍后重试环境比对）、世界名、
  *       中转地址与端口、主客户端内存门槛。</li>
  * </ol>
+ * <p>
+ * <b>P2P 公钥指纹的生命周期由本类锚定</b>（Phase 2 收口）：指纹表按 clientId 存放在
+ * {@link P2PKeyGate#SERVER}，但"何时可信"完全跟随 HELLO 会话 —— 新 HELLO（可能是新进程、
+ * 新密钥对）先清旧值、等客户端重新上报，客户端完全离线时再清一次；绝不把上一个会话的
+ * 指纹当成新会话的既成事实（否则会表现为"对端指纹校验失败"，把安全问题伪装成连通性问题）。
  * <p>
  * 线程模型：handle 运行在 Netty 事件循环上，只做轻量 JSON 解析与应答，无阻塞操作。
  */
@@ -120,6 +126,11 @@ public final class HelloHandler implements MessageHandler {
                 computeTable.report(clientId, score);
             }
             NAT_TABLE.put(clientId, nat);
+            // P2P 公钥指纹必须随新会话重新上报：同一个 clientId 可能来自重启后的新进程
+            // （密钥对已换），旧指纹若被当作"已就绪"，服务端会把过期指纹下发给对端，
+            // 对端校验必然失败 —— 那是可用性事故，且会被误读成中间人告警。
+            // 客户端在 HELLO_ACK 之后会主动重新上报（P2PSessions.register）。
+            P2PKeyGate.SERVER.forget(clientId);
             previous = ONLINE.put(clientId, connection);
         }
         if (previous != null && previous != connection && previous.isOpen()) {
@@ -254,8 +265,10 @@ public final class HelloHandler implements MessageHandler {
             }
             ONLINE.remove(clientId);
             if (!ONLINE.containsKey(clientId)) {
-                // 该客户端已完全离线才清 NAT 信息（重连会随新 HELLO 重新上报）
+                // 该客户端已完全离线才清 NAT 信息与 P2P 公钥指纹
+                //（重连会随新 HELLO + P2PSessions.register 重新上报）
                 NAT_TABLE.remove(clientId);
+                P2PKeyGate.SERVER.forget(clientId);
             }
             if (transition != null) {
                 transition.run();
@@ -268,6 +281,9 @@ public final class HelloHandler implements MessageHandler {
     static void clearAll() {
         ONLINE.clear();
         NAT_TABLE.clear();
+        // 撮合指纹表与待定撮合同属"按会话存活的静态身份数据"：服务停止一并清空，
+        // 避免重启后拿着上一个进程的指纹撮合（服务已停，超时定时器也不会再触发）。
+        P2PKeyGate.SERVER.clear();
     }
 
     private static Object sessionLock(UUID clientId) {

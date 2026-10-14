@@ -25,8 +25,8 @@ import java.util.Arrays;
  *   A ──"P2P1|PUNCH|sid"──→ B      收到 PUNCH 回 "P2P1|ACK|sid"
  *   任一方收到对方任意有效包（PUNCH/ACK/KEY）即确认打洞已通
  * 密钥交换阶段（由 initiator=true 的一方发起）：
- *   I ──"P2P1|KEY|sid|"+X.509公钥──→ R    R 收到后立即回自己的 KEY 包
- *   双方拿到对方公钥后各自 SessionCrypto.establish，进入加密通道
+ *   I ──"P2P1|KEY|sid|"+X.509公钥──→ R    R 校验指纹通过后立即回自己的 KEY 包
+ *   双方拿到对方公钥（且指纹校验通过）后各自 SessionCrypto.establish，进入加密通道
  * 丢包补偿：I 的 KEY 按退避重发直到收到 R 的 KEY；R 进入通道后由
  *   {@link P2PChannel} 对迟到的 KEY 重发包再次回应自己的 KEY（见 handshakeReply）
  * </pre>
@@ -34,9 +34,17 @@ import java.util.Arrays;
  * 有效包的来源地址为准更新（NAT 可能改写源端口，对称 NAT 下尤甚），
  * 通道最终锁定该观测地址。
  * <p>
- * <b>中间人风险（Phase 1 已知取舍）</b>：公钥经 UDP 明文交换、未做身份认证，
- * 路径攻击者理论上可 MITM。Phase 2 计划经服务端 TCP 控制信道（身份由 HELLO
- * 锚定）交换公钥指纹比对后再启用通道。
+ * <b>公钥认证（Phase 2 已收口）</b>：对端公钥指纹经服务端控制信道（TCP，身份由
+ * HELLO 握手锚定）随 {@code P2P_ENDPOINT_EXCHANGE.peerKeyFingerprint} 下发，
+ * 本类收到<b>首个</b> KEY 包后立即用 {@link KeyFingerprint} 比对 SHA-256：
+ * 不匹配即抛 {@link IOException}（握手失败 → 上层走既有中转降级），
+ * UDP 路径上的中间人无法再靠"替换双方公钥"窃听或篡改。
+ * 期望指纹缺失或非法时（旧服务端 / 服务端撮合超时降级）按向后兼容继续握手并记 warn。
+ * <p>
+ * <b>残留信任模型</b>：信任锚是游戏服控制信道本身（客户端↔游戏服的明文 TCP + HELLO
+ * 身份）。控制信道被攻陷、或玩家连到的本来就是冒充游戏服的服务器时，中间人依旧成立 ——
+ * 这是"服务器处于信任边界内"的固有前提，不属于 UDP 打洞能防护的范围。
+ * 指纹绑定的价值是把攻击面从"打洞路径上任意旁路者可 MITM"收窄到"游戏服自身"。
  * <p>
  * <b>线程模型</b>：{@link #punch} 全程阻塞收发（最长 5 秒），必须在
  * {@code ThreadPools.io()} 上调用（P2PSessions 负责调度）。
@@ -75,12 +83,33 @@ public final class HolePuncher {
      */
     public static P2PChannel punch(DatagramSocket socket, InetSocketAddress peerEndpoint,
                                    String sessionId, boolean initiator) throws IOException {
-        // 每会话新生成 X25519 临时密钥对（前向保密）
-        KeyPair keyPair;
+        // 兼容入口：不指定密钥对与期望指纹（等效于旧行为：自建密钥对 + 无认证握手）
+        return punch(socket, peerEndpoint, sessionId, initiator, null, null);
+    }
+
+    /**
+     * 带控制信道指纹绑定的打洞（Phase 2 收口；{@link #punch} 的完整形态）。
+     *
+     * @param keyPair                 本方会话密钥对：必须是"已上报给服务端指纹"的那一把
+     *                                （P2PSessions 持有），否则对端会校验失败；
+     *                                传 null 表示由本方法自行生成（仅用于无控制信道的旧场景）
+     * @param expectedPeerFingerprint 服务端下发的对端公钥指纹（64 位 hex，大小写不限）；
+     *                                null/空白/非法 = 无指纹降级：不认证但记 warn
+     */
+    public static P2PChannel punch(DatagramSocket socket, InetSocketAddress peerEndpoint,
+                                   String sessionId, boolean initiator,
+                                   KeyPair keyPair, String expectedPeerFingerprint)
+            throws IOException {
+        // 期望指纹先归一化：null = 未提供或非法 → 降级为"不认证"（向后兼容旧服务端）
+        final String expectedFingerprint = KeyFingerprint.normalize(expectedPeerFingerprint);
+        // 密钥对优先用调用方传入的（与上报给服务端的指纹同源），缺省时才自建
+        KeyPair ownKeyPair = keyPair;
         byte[] ownKeyPacket;
         try {
-            keyPair = SessionCrypto.generateKeyPair();
-            ownKeyPacket = keyPacket(sessionId, SessionCrypto.encodePublicKey(keyPair));
+            if (ownKeyPair == null) {
+                ownKeyPair = SessionCrypto.generateKeyPair();
+            }
+            ownKeyPacket = keyPacket(sessionId, SessionCrypto.encodePublicKey(ownKeyPair));
         } catch (GeneralSecurityException e) {
             throw new IOException("生成 X25519 密钥对失败", e);
         }
@@ -152,6 +181,25 @@ public final class HolePuncher {
                         if (der == null || der.length == 0 || der.length > MAX_KEY_BYTES) {
                             continue; // 畸形公钥字段
                         }
+                        // ---- 控制信道指纹绑定校验 ----
+                        // 只在"首次拿到对端公钥"时校验一次：对端密钥在本次会话内是固定的一把，
+                        // 后续重发（丢包补偿）无需重复比对；P2PChannel.handshakeReply 的补偿
+                        // 回包路径只重发本方公钥、不消费对端公钥，同样不受此处影响。
+                        // 校验失败 = 明确拒绝把通道交给未经服务端锚定的公钥（fail-closed），
+                        // 可用性由既有中转降级兜底。
+                        if (expectedFingerprint != null) {
+                            if (!KeyFingerprint.matches(expectedFingerprint, der)) {
+                                LOGGER.warn("会话 {} 对端公钥指纹不匹配: 期望 {}, 实际 {}, 对端 {}，握手失败",
+                                        sessionId, expectedFingerprint,
+                                        KeyFingerprint.ofEncoded(der), actualPeer);
+                                throw new IOException("对端公钥指纹不匹配（疑似 UDP 中间人）: 会话 "
+                                        + sessionId + ", 对端 " + actualPeer);
+                            }
+                        } else {
+                            // 旧服务端/降级：保持旧行为（明文公钥、无认证），但明确留下告警痕迹
+                            LOGGER.warn("会话 {} 无期望对端指纹（旧服务端/降级），跳过公钥认证: 对端 {}",
+                                    sessionId, actualPeer);
+                        }
                         peerKeyDer = der;
                         if (!initiator) {
                             // responder 收到 initiator 公钥后立即回自己的公钥
@@ -179,7 +227,7 @@ public final class HolePuncher {
         // 双方公钥齐备：协商会话密钥并启动加密通道
         SessionCrypto crypto;
         try {
-            crypto = SessionCrypto.establish(keyPair, peerKeyDer, sessionId, initiator);
+            crypto = SessionCrypto.establish(ownKeyPair, peerKeyDer, sessionId, initiator);
         } catch (GeneralSecurityException e) {
             throw new IOException("会话密钥协商失败: " + sessionId, e);
         }

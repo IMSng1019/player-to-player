@@ -16,11 +16,14 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.net.UnknownHostException;
+import java.security.GeneralSecurityException;
+import java.security.KeyPair;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * 客户端侧 P2P 会话管理（DESIGN.md 第 7 节"打洞流程"，规范"预连接"）。
@@ -41,6 +44,22 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * <b>中转降级（Phase 2）</b>：打洞失败时服务端撮合器向双方下发
  * {@link MessageType#P2P_USE_RELAY}，本类经 {@link RelayConnector} 建立
  * {@link RelayClient} 中转会话（同 sessionId）——上层拿到的传输对直连/中转透明。
+ * <p>
+ * <b>公钥指纹绑定（Phase 2 收口，消除 UDP 中间人）</b>：
+ * <ol>
+ *   <li>本类持有<b>本次控制会话唯一的</b> X25519 密钥对（惰性生成，见
+ *       {@link #sessionKeyPair()}），世界会话拆除时弃用；</li>
+ *   <li>会话建立（{@link #register}）后<b>主动上报</b>其公钥指纹，收到服务端
+ *       {@link MessageType#P2P_KEY_REQUEST} 时再报一次 —— 覆盖"撮合时对端指纹尚未
+ *       就绪"的竞态（服务端另有 3 秒超时降级兜底，不会卡住撮合）；</li>
+ *   <li>打洞复用<b>同一把</b>密钥对，因此"上报的指纹"与"UDP KEY 包里的公钥"必然同源；
+ *       服务端把对端指纹随 {@code P2P_ENDPOINT_EXCHANGE.peerKeyFingerprint} 下发，
+ *       {@link HolePuncher} 据此拒绝对端被替换的公钥。</li>
+ * </ol>
+ * <b>残留信任模型</b>：指纹经服务端控制信道（明文 TCP，身份由 HELLO 锚定）传递，
+ * 信任锚是游戏服本身 —— 游戏服被攻陷时中间人依旧可能（服务器在信任边界内的固有前提），
+ * 但 UDP 打洞路径上的旁路攻击者已被排除。字段缺失/非法（旧服务端、服务端降级）时
+ * 沿用旧行为并记 warn，保证向后兼容。
  */
 public final class P2PSessions {
 
@@ -57,6 +76,16 @@ public final class P2PSessions {
 
     /** 会话就绪监听器（主客户端组宿主、副客户端加入器挂接）。 */
     private static final List<SessionListener> LISTENERS = new CopyOnWriteArrayList<>();
+
+    /**
+     * 本次控制会话的 X25519 密钥对（惰性生成、会话内复用；世界会话拆除时弃用）。
+     * <p>
+     * 为什么必须由本类持有而不是让 {@link HolePuncher} 每次自建：上报给服务端的
+     * 指纹必须与打洞 KEY 包里发出的公钥严格同源，否则对端指纹校验必然失败
+     * （安全问题会被伪装成连通性问题）。服务端的指纹表按 clientId 只存一份，
+     * 与"一把密钥对 ↔ 一个控制会话"的粒度对齐（见类 Javadoc）。
+     */
+    private static final AtomicReference<KeyPair> SESSION_KEY_PAIR = new AtomicReference<>();
 
     /**
      * 会话就绪回调：直连打洞成功或中转会话建立时触发（io/Netty 线程，不得阻塞）。
@@ -76,14 +105,23 @@ public final class P2PSessions {
     }
 
     /**
-     * 注册 P2P 撮合相关处理器（P2P_ENDPOINT_EXCHANGE 与 P2P_USE_RELAY）。
+     * 注册 P2P 撮合相关处理器（P2P_ENDPOINT_EXCHANGE / P2P_USE_RELAY / P2P_KEY_REQUEST），
+     * 并<b>主动上报</b>本方公钥指纹。
+     * <p>
+     * 主动上报的时机与理由：本方法由 WorldSession 在 HELLO 收到 HELLO_ACK 之后调用，
+     * 此刻控制连接的身份已被服务端锚定，指纹上报不会被误挂到别的身份上；
+     * 早早上报可让服务端撮合时直接下发 endpoint，省掉一次"索要→等待"往返。
+     * 而 {@code P2P_KEY_REQUEST} 处理器用于兜底：撮合时若本端指纹仍未就绪
+     * （例如本类刚注册、上报恰在途），服务端会按需索要。
      *
      * @param reg        处理器注册表（ControlClient）
-     * @param serverConn 与服务端/中转端的控制连接（P2P_RESULT 从这里回报）
+     * @param serverConn 与服务端/中转端的控制连接（P2P_RESULT 与指纹上报从这里发出）
      */
     public static void register(HandlerRegistry reg, ControlConnection serverConn) {
         reg.on(MessageType.P2P_ENDPOINT_EXCHANGE, (conn, msg) -> handleEndpointExchange(serverConn, msg));
         reg.on(MessageType.P2P_USE_RELAY, (conn, msg) -> handleUseRelay(msg));
+        reg.on(MessageType.P2P_KEY_REQUEST, (conn, msg) -> reportOwnFingerprint(serverConn));
+        reportOwnFingerprint(serverConn);
     }
 
     /** 挂接会话就绪监听器（重复挂接自负；回调线程见 {@link SessionListener}）。 */
@@ -144,6 +182,11 @@ public final class P2PSessions {
         SESSIONS.clear();
         SESSION_PEERS.clear();
         LISTENERS.clear();
+        // 会话密钥对随世界会话弃用：重进世界换新密钥（register 时会重新上报指纹）。
+        // 服务端侧的同名指纹也会在新 HELLO 与断连清理路径被移除 —— 两侧生命周期一致，
+        // 不会出现"服务端留着旧指纹、客户端已换新密钥"的错配（那会把安全问题
+        // 伪装成对端指纹校验失败，白白降级到中转）。
+        SESSION_KEY_PAIR.set(null);
         if (count > 0) {
             LOGGER.info("已关闭全部 P2P 会话: {} 个", count);
         }
@@ -199,6 +242,16 @@ public final class P2PSessions {
         } catch (IllegalArgumentException e) {
             peerNat = NatType.UNKNOWN; // 容忍未知枚举（跨版本兼容）
         }
+        // 对端公钥指纹（Phase 2 收口）：服务端撮合时随本消息下发，打洞阶段据此拒绝
+        // 对端被替换的公钥。字段缺失 = 服务端降级或旧服务端（HolePuncher 会记 warn）；
+        // 字段存在但非法 = 入站数据不可信，明确记 warn 后同样按"无指纹"降级。
+        String rawPeerFingerprint = JsonUtil.getString(json, "peerKeyFingerprint", "");
+        String peerFingerprint = KeyFingerprint.normalize(rawPeerFingerprint);
+        if (peerFingerprint == null && !rawPeerFingerprint.isBlank()) {
+            // 只记长度、不回显对端可控的长串（防日志注入/刷屏）
+            LOGGER.warn("会话 {} 服务端下发的对端指纹非法（长度 {}），本次握手按无指纹降级",
+                    sessionId, rawPeerFingerprint.length());
+        }
 
         // NAT 预判：明显打不通就不浪费 5 秒，直接失败让服务端走中转
         NatInfo localNat = NodeContext.get().natInfo();
@@ -219,7 +272,9 @@ public final class P2PSessions {
                 InetSocketAddress peerEndpoint =
                         new InetSocketAddress(InetAddress.getByName(peerIp), peerPort);
                 socket = obtainSocket(localNat);
-                P2PChannel channel = HolePuncher.punch(socket, peerEndpoint, sessionId, initiator);
+                // 复用本会话密钥对：保证 KEY 包里发出的公钥与已上报给服务端的指纹同源
+                P2PChannel channel = HolePuncher.punch(socket, peerEndpoint, sessionId, initiator,
+                        sessionKeyPair(), peerFingerprint);
                 put(sessionId, channel); // 通道已接管 socket 所有权
                 success = true;
                 // 会话就绪通知：组宿主/加入器/合并端据此启动隧道或预同步（Phase 2/3）
@@ -299,6 +354,59 @@ public final class P2PSessions {
                 LOGGER.warn("会话 {} 中转降级失败: {}", sessionId, e.toString());
             }
         });
+    }
+
+    // ------------------------------------------------------------ 密钥对与指纹上报
+
+    /**
+     * 取本次控制会话的 X25519 密钥对（首次调用生成，之后复用同一个实例）。
+     * <p>
+     * 并发安全：CAS 竞争失败方返回已发布的那一把 —— 保证"上报指纹"与"打洞发包"
+     * 观察到的必定是同一份密钥，绝不出现两把密钥各自被当成会话密钥的情况。
+     * 包级可见：单测可直接验证"上报指纹与打洞公钥同源"。
+     *
+     * @throws GeneralSecurityException JDK 不支持 X25519（理论不可达）
+     */
+    static KeyPair sessionKeyPair() throws GeneralSecurityException {
+        KeyPair existing = SESSION_KEY_PAIR.get();
+        if (existing != null) {
+            return existing;
+        }
+        KeyPair fresh = SessionCrypto.generateKeyPair();
+        if (SESSION_KEY_PAIR.compareAndSet(null, fresh)) {
+            return fresh;
+        }
+        return SESSION_KEY_PAIR.get();
+    }
+
+    /**
+     * 上报本方公钥指纹（{@link MessageType#P2P_KEY_REPORT}）。幂等：会话建立时主动上报一次，
+     * 收到 {@link MessageType#P2P_KEY_REQUEST} 时可重复上报（服务端按 clientId 覆盖登记）。
+     * <p>
+     * json 里的 clientId 只作服务端日志对照：服务端身份一律以 HELLO 锚定的连接身份为准，
+     * 因此即便有人伪造本端的 clientId 上报，也改不了别人名下的指纹。
+     */
+    private static void reportOwnFingerprint(ControlConnection serverConn) {
+        if (serverConn == null) {
+            return;
+        }
+        String fingerprint;
+        try {
+            fingerprint = KeyFingerprint.of(sessionKeyPair());
+        } catch (GeneralSecurityException e) {
+            LOGGER.error("生成 P2P 会话密钥对失败，指纹无法上报（本会话打洞将退化为无认证握手）", e);
+            return;
+        }
+        JsonObject json = new JsonObject();
+        UUID selfId = NodeContext.get().clientId();
+        json.addProperty("clientId", selfId != null ? selfId.toString() : "");
+        json.addProperty("fingerprint", fingerprint);
+        try {
+            serverConn.send(ControlMessage.of(MessageType.P2P_KEY_REPORT, json));
+            LOGGER.info("已上报 P2P 公钥指纹: {}", fingerprint);
+        } catch (Exception e) {
+            LOGGER.warn("P2P 公钥指纹上报失败（服务端将按需索要）", e);
+        }
     }
 
     /** 防御性 UUID 解析：null / 格式非法返回 null 而非抛异常。 */

@@ -36,9 +36,17 @@ import java.util.function.Consumer;
  *       映射常见 30~60 秒超时）；</li>
  *   <li><b>握手收尾</b>：responder 侧对迟到的 KEY 重发包回应自己的 KEY
  *       （见 {@link HolePuncher} 丢包补偿说明）。</li>
+ *   <li><b>公钥认证（Phase 2 收口）</b>：通道建立前的 {@link HolePuncher} 握手已用
+ *       服务端控制信道（TCP，身份由 HELLO 锚定）下发的指纹校验过对端公钥，
+ *       本类只在已认证的密钥上收发。</li>
  * </ul>
  * 仅过滤"来源地址 == 锁定对端"的报文；伪造源地址的报文过不了 GCM 认证，
  * 该过滤只是省掉无谓解密。
+ * <p>
+ * <b>残留信任模型</b>：信任锚是游戏服控制信道本身（客户端↔游戏服的明文 TCP + HELLO
+ * 身份）—— 游戏服被攻陷时中间人依旧可能，这是服务器处于信任边界内的固有前提。
+ * UDP 路径上的旁路攻击者已被指纹绑定排除：替换公钥会在 {@link HolePuncher} 阶段
+ * 被拒（握手失败 → 中转降级），而伪造数据帧过不了由对端公钥派生的 AES-GCM 认证。
  */
 public final class P2PChannel implements P2PTransport {
 
@@ -76,7 +84,9 @@ public final class P2PChannel implements P2PTransport {
      * @param peer           打洞锁定的对端地址
      * @param crypto         已协商的会话加密
      * @param sessionId      会话 ID（日志用）
-     * @param handshakeReply responder 传入自己的 KEY 包用于握手丢包补偿；initiator 传 null
+     * @param handshakeReply responder 传入自己的 KEY 包用于握手丢包补偿；initiator 传 null。
+     *                       补偿回包只重发本方公钥、不消费对端公钥，因此与
+     *                       {@link HolePuncher} 的指纹校验（只在首次拿到对端公钥时做）互不干扰
      */
     P2PChannel(DatagramSocket socket, InetSocketAddress peer, SessionCrypto crypto,
                String sessionId, byte[] handshakeReply) {

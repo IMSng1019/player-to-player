@@ -114,6 +114,26 @@ public enum MessageType {
      * {@code RelayClient} 会话（同 sessionId），上层拿到的传输对直连/中转透明。
      */
     P2P_USE_RELAY(43),
+    /**
+     * C→S P2P 公钥指纹上报（json: clientId, fingerprint）。
+     * <p>
+     * 客户端把本次控制会话所用 X25519 公钥的 SHA-256 指纹（64 位小写十六进制）
+     * 报给服务端；服务端在撮合时把该指纹作为 {@link #P2P_ENDPOINT_EXCHANGE}
+     * 的 {@code peerKeyFingerprint} 下发给对端，双方在 UDP 明文 KEY 交换后
+     * 比对指纹 —— 路径攻击者无法再用"替换公钥"的方式做中间人。
+     * <p>
+     * <b>身份以 HELLO 锚定的连接身份为准</b>：json 里的 clientId 只作日志对照，
+     * 与连接身份不符的上报一律拒绝（防伪造他人指纹）。
+     */
+    P2P_KEY_REPORT(44),
+    /**
+     * S→C 要求客户端上报 P2P 公钥指纹（无字段）。
+     * <p>
+     * 撮合时若任一方指纹尚未就绪，服务端先发本消息按需索要，收到
+     * {@link #P2P_KEY_REPORT} 后再下发 endpoint；服务端有超时兜底
+     * （见 P2PBrokerHandlers），不会永久卡住撮合。
+     */
+    P2P_KEY_REQUEST(45),
 
     // -------------------------------------------------------------- 中转 50-59
     /** C→Relay 在中转端注册自己（json: clientId），建立可被寻址的中转会话。 */

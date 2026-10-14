@@ -35,9 +35,19 @@ import java.util.concurrent.atomic.AtomicLong;
  * 即乱序包按丢包处理，由上层可靠性协议（Phase 2）重传；换来实现简单且
  * 无需滑动窗口位图。
  * <p>
- * <b>中间人风险（Phase 1 已知取舍）</b>：公钥经打洞 UDP 明文交换、未经认证，
- * 理论上可被路径上的攻击者做 MITM。Phase 2 计划把双方公钥指纹经服务端
- * <b>控制信道</b>（TCP，身份由 HELLO 握手锚定）交换比对，即可消除。
+ * <b>中间人防护（Phase 2 已收口）</b>：公钥本身仍走打洞 UDP 明文交换，但双方公钥
+ * 指纹已先经服务端<b>控制信道</b>（TCP，身份由 HELLO 握手锚定）交换，
+ * {@link HolePuncher} 收到对端 KEY 包后用 SHA-256 比对（见 {@link KeyFingerprint}），
+ * 不匹配即握手失败 —— 路径攻击者无法再靠"替换双方公钥"窃听或篡改本类协商出的密钥。
+ * <p>
+ * <b>残留信任模型（必须明确）</b>：信任锚是游戏服控制信道自身（客户端↔游戏服的
+ * 明文 TCP + HELLO 身份）。控制信道被攻陷、或玩家连到的就是冒充游戏服的服务器时，
+ * 中间人依旧成立 —— 服务器本就在信任边界内，这不是 UDP 打洞层能解决的问题。
+ * <p>
+ * <b>前向保密的边界</b>：X25519 密钥对由 {@code P2PSessions} 按<b>控制会话</b>生成并
+ * 被该会话内所有打洞复用（这样"上报的指纹"与"打洞发出的公钥"必然同源，且服务端按
+ * clientId 维护一份指纹即可），因此前向保密的粒度是"控制会话"而非"单次打洞"：
+ * 会话结束（离开世界）即弃用旧密钥，但同一会话内的多次打洞共享同一把临时密钥。
  * <p>
  * <b>线程安全</b>：encrypt/decrypt 内部同步，可多线程调用；每方向的 Cipher
  * 实例每帧重新初始化（GCM 每次加密必须换 nonce）。
@@ -80,7 +90,10 @@ public final class SessionCrypto {
 
     // ------------------------------------------------------------ 握手
 
-    /** 生成本方 X25519 临时密钥对（每会话新生成，具备前向保密）。 */
+    /**
+     * 生成本方 X25519 临时密钥对（不落盘；由 {@code P2PSessions} 按控制会话持有并复用，
+     * 见类 Javadoc"前向保密的边界"）。
+     */
     public static KeyPair generateKeyPair() throws GeneralSecurityException {
         KeyPairGenerator kpg = KeyPairGenerator.getInstance("X25519");
         return kpg.generateKeyPair();
@@ -96,7 +109,9 @@ public final class SessionCrypto {
      *
      * @param ownKeyPair       本方密钥对
      * @param peerPublicKeyDer 对端公钥（X.509 编码，来自不可信网络 ——
-     *                         畸形输入由 KeyFactory 抛异常，调用方按握手失败处理）
+     *                         畸形输入由 KeyFactory 抛异常，调用方按握手失败处理。
+     *                         真实性由调用方负责：{@link HolePuncher} 已在收到 KEY 包时
+     *                         用控制信道下发的指纹完成校验）
      * @param sessionId        服务端分配的会话 ID（作 HKDF 盐，绑定会话上下文）
      * @param initiator        本方是否为发起方（决定方向密钥怎么分配）
      */
