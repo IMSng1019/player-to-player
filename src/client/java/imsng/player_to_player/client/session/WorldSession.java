@@ -128,7 +128,9 @@ public final class WorldSession {
             // "校验代数+发布连接"能与离开流程严格互斥
             myGeneration = ++generation;
         }
-        ThreadPools.io().execute(() -> openSession(myGeneration, rawAddress, playerId, playerName));
+        // 加入流程是一条长工作流（环境同步/角色申请/本地存档准备，含 .join() 等待 io 池上的
+        // 子任务）：走专用阻塞线程，避免"池内任务等池内任务"占用名额（见 ThreadPools#startBlocking）
+        ThreadPools.startBlocking("join-flow", () -> openSession(myGeneration, rawAddress, playerId, playerName));
     }
 
     /** 离开世界（客户端主线程回调）。 */
@@ -461,7 +463,7 @@ public final class WorldSession {
         } catch (IllegalArgumentException e) {
             return;
         }
-        ThreadPools.io().execute(() -> {
+        ThreadPools.startBlocking("split-promote", () -> {
             try {
                 LocalWorldLauncher.PreparedWorld prepared = prepareAuthoritativeWorld(
                         conn, worldFolder, worldName);

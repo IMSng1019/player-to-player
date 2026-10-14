@@ -170,7 +170,9 @@ public final class MergeClient {
         LOGGER.info("收到合并计划: mergeId={} 本端角色={}（对端主 {}）",
                 mergeId, merge.yielding ? "让出方A" : "接管方B", merge.peerPrimary);
         if (merge.yielding) {
-            ThreadPools.io().execute(() -> runYield(conn, merge));
+            // 让出流程（冻结 tick → 尾包 → 等 MERGE_COMMIT）可持续到服务端 300 秒超时，
+            // 且期间同组还要继续上行区块：专用阻塞线程，不占 io 池（见 ThreadPools#startBlocking）
+            ThreadPools.startBlocking("merge-yield", () -> runYield(conn, merge));
         } else {
             armReceiver(conn, merge);
         }
@@ -236,7 +238,7 @@ public final class MergeClient {
                     WorldSwitcher.markSwitching();
                     minecraft.disconnect();
                 }
-                ThreadPools.io().execute(() -> SecondaryJoiner.join(minecraft, conn, peer));
+                ThreadPools.startBlocking("merge-rejoin", () -> SecondaryJoiner.join(minecraft, conn, peer));
             });
         } catch (Exception e) {
             LOGGER.error("合并 {} 让出流程失败（A 继续运行，服务端将取消合并）",
@@ -280,7 +282,8 @@ public final class MergeClient {
                 channel.close();
                 return;
             }
-            ThreadPools.io().execute(() -> {
+            // 预同步接收是整包快照的长时阻塞读（可能数分钟），专用线程
+            ThreadPools.startBlocking("presync-receive", () -> {
                 try {
                     // 玩家数据写进 B 本地存档的 playerdata（A 组玩家重连后状态连续）
                     Path playerData = resolveLocalPlayerData();
@@ -379,7 +382,7 @@ public final class MergeClient {
                 WorldSwitcher.markSwitching(); // 编排性断开：会话保持
                 minecraft.disconnect();
             }
-            ThreadPools.io().execute(() -> SecondaryJoiner.join(minecraft, conn, primary));
+            ThreadPools.startBlocking("merge-join", () -> SecondaryJoiner.join(minecraft, conn, primary));
         });
     }
 

@@ -77,7 +77,9 @@ public final class TcpTunnel {
      * @param label   日志标签
      */
     public static void bridgeToLocalPort(ReliableChannel channel, int port, String label) {
-        ThreadPools.io().execute(() -> {
+        // 连接 + 两个方向的泵都是阻塞长驻任务，必须用专用线程（有界 io 池承载不了
+        // "整局游戏都占着"的任务，见 ThreadPools#startBlocking）
+        ThreadPools.startBlocking("tunnel-bridge", () -> {
             Socket socket = new Socket();
             try {
                 socket.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 10_000);
@@ -106,7 +108,7 @@ public final class TcpTunnel {
         ServerSocket server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
         server.setSoTimeout(ACCEPT_TIMEOUT_MILLIS);
         int port = server.getLocalPort();
-        ThreadPools.io().execute(() -> {
+        ThreadPools.startBlocking("tunnel-accept", () -> {
             Socket socket = null;
             try {
                 socket = server.accept();
@@ -141,9 +143,9 @@ public final class TcpTunnel {
         try {
             InputStream socketIn = socket.getInputStream();
             OutputStream socketOut = socket.getOutputStream();
-            ThreadPools.io().execute(() -> pump(socketIn, channel.outputStream(),
+            ThreadPools.startBlocking("tunnel-pump", () -> pump(socketIn, channel.outputStream(),
                     label + " tcp→p2p", teardown));
-            ThreadPools.io().execute(() -> pump(channel.inputStream(), socketOut,
+            ThreadPools.startBlocking("tunnel-pump", () -> pump(channel.inputStream(), socketOut,
                     label + " p2p→tcp", teardown));
             LOGGER.info("隧道 {} 已建立（{} ↔ 可靠通道）", label, socket.getRemoteSocketAddress());
         } catch (IOException e) {

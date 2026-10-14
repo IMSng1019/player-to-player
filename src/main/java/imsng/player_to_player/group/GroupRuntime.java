@@ -265,7 +265,9 @@ public final class GroupRuntime {
         }
         if (finishingExit != null) {
             Consumer<ExitBundle> listener = exitBundleListener;
-            imsng.player_to_player.util.ThreadPools.io().execute(() -> {
+            // 发布重试没有次数上界（直到服务端确认），属长驻阻塞任务：专用线程，
+            // 不占 io 池 —— 退出期间 io 池还要跑区块批次上行
+            imsng.player_to_player.util.ThreadPools.startBlocking("exit-publish", () -> {
                 ExitBundlePublication.publishUntilAccepted(
                         () -> buildExitBundle(server, finishingExit,
                                 playerFallback, finalPlayers, finalChunks),

@@ -167,10 +167,53 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
 ## 9. 线程模型
 
 - Netty 事件循环：boss 1 + worker N（`ThreadPools` 统一命名、守护线程）。
-- `ThreadPools.io()`：文件扫描/哈希/磁盘 IO；`ThreadPools.scheduler()`：心跳、注册表落盘等定时任务；
-  `ThreadPools.compute()`：跑分等 CPU 密集任务。
+- `ThreadPools.io()`：文件扫描/哈希/磁盘 IO，**固定线程数 + 无界队列**（有界）；
+  `ThreadPools.scheduler()`：心跳、注册表落盘等定时任务；
+  `ThreadPools.compute()`：跑分等 CPU 密集任务；
+  `ThreadPools.startBlocking(name, body)`：**长驻阻塞**任务（每通道接收循环、隧道泵、
+  无限重试的断连清理/退出发布/加入与合并工作流）专用单线程。
 - **铁律**：任何阻塞操作不得占用 MC 主线程 / Netty 事件循环线程；
   与 MC 世界状态交互一律回主线程（`server.execute` / `MinecraftClient.execute`）。
+
+### 9.1 io 池为什么有界（勿改回 cached pool）
+
+2026-10-14 实测：服务端一次会话内 `newCachedThreadPool` 累计创建 921 条 `p2p-io-*` 线程，
+随后在 Netty 事件循环上抛 `OutOfMemoryError: unable to create native thread`，玩家控制连接
+被掐断、组被解散。成因是"逐区块帧 → 每帧一个 io 任务"的洪峰：cached pool 在**提交线程内联**
+`new Thread().start()`，无空闲线程就新建，而每条线程 ~1 MB 栈 —— 线程数无上界就是 native OOM。
+
+现在：固定线程数（8~32，按核数）+ 无界队列（任务排队而非新建线程/拒绝）。
+不设拒绝策略是有意的：上游有预卸载屏障、释放重试等"必须最终送达"的语义，
+丢帧会变成无限重试风暴。队列持续偏深时由看门狗打 WARN 暴露（每秒 30 秒采样一次）。
+
+### 9.2 有界池下"池内任务等待池内任务"是唯一死锁风险（改动前必读）
+
+已核对成立、改动 io 池容量或新增"任务内等待"前必须重新核对的等待闭包：
+
+- `EXIT_BEGIN` 任务 join 前一个 BEGIN 屏障 —— 前序任务 **FIFO 先出队先执行**，
+  链头永不等待，故只要池内有 ≥1 条线程可推进即可；
+- claim/release/上行任务 join 自己客户端的 BEGIN 屏障 —— 屏障由 BEGIN 任务完成，
+  而 BEGIN 任务只取会话条带锁（等待方在进入业务锁**之前**等待，见
+  `ExitTransactionHandlers.writeRealtimeIfAllowed` 的调用位置约定）；
+- 磁盘等待（IOWorker、Journal `force(true)`）与网络等待都落在**其他**执行器上，不消耗本池；
+- 断连清理、退出发布、加入/合并工作流等长驻任务一律走 `startBlocking`，**不进 io 池**。
+
+因此容量按"下游串行点"而不是"任务总数"选：fsync、批次 WAL 锁、区块分片锁都是串行的，
+线程再多也只排队。
+
+### 9.3 "逐区块一次 fsync"的现状与真正杠杆（2026-10-14 结论）
+
+运行期上行/释放三条路径（`CHUNK_DATA_UPLOAD`、`CHUNK_DATA_BATCH`、`CHUNK_RELEASE`）
+**都在 `ChunkDataHandlers.durableBatchLock` 内完成 append + force**，即彼此天然串行 ——
+所以在 `DurableChunkJournal` 内做 group commit（聚合多次 append 共用一次 force）
+**对逐区块热路径没有收益**（没有可合并的重叠窗口），只会在退出/`appendExitCommit`
+等本来已是整批的路径上增加风险。真正的杠杆是**减少临界区个数**：
+
+1. 已落地：客户端 `ChunkUploadService` 的单区块滞留窗口（队列里只剩 1 个区块时短等
+   `SINGLE_LINGER_MILLIS`），把同一次原版存盘/卸载的多个区块合成一个 `CHUNK_DATA_BATCH`
+   → 服务端一个 WAL 记录 + 一次 force 覆盖整批；
+2. 未落地：把服务端的逐区块帧改成"队列 + 成批工作线程"，一次临界区内处理 K 个区块
+   （含 `RegistryMutationJournal` 的第二条逐条 force 链，那需要真实的并发度量后再定）。
 
 ## 10. 兼容性原则
 

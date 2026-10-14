@@ -21,7 +21,7 @@
 
 | 优先级 | 事项 | 关键位置 | 验收 | 状态 |
 |--------|------|----------|------|------|
-| **P0** | **服务端 native 线程耗尽**：`ThreadPools.io()` 是无界 cached pool，服务端把**逐区块**任务丢进去（解压/校验/物化/释放），每条任务还要在全局锁与逐区块 `channel.force(true)` 上阻塞 → 本次会话创建 ≥921 个线程后 `OutOfMemoryError: unable to create native thread`，连接被掐断、组解散 | `util/ThreadPools.java:26-27`、`server/ChunkDataHandlers.java:208/224/304/396`、`server/ExitTransactionHandlers.java`（`executor.execute`）、`server/DurableChunkJournal.java:290-316` | 以 2000 个逐区块任务压测，线程数有上界、无 OOM；顺带把"逐区块一次 fsync"合并成批 | 未开始 |
+| **P0** | **服务端 native 线程耗尽**：`ThreadPools.io()` 是无界 cached pool，服务端把**逐区块**任务丢进去（解压/校验/物化/释放），每条任务还要在全局锁与逐区块 `channel.force(true)` 上阻塞 → 本次会话创建 ≥921 个线程后 `OutOfMemoryError: unable to create native thread`，连接被掐断、组解散 | `util/ThreadPools.java:26-27`、`server/ChunkDataHandlers.java:208/224/304/396`、`server/ExitTransactionHandlers.java`（`executor.execute`）、`server/DurableChunkJournal.java:290-316` | 以 2000 个逐区块任务压测，线程数有上界、无 OOM；顺带把"逐区块一次 fsync"合并成批 | **✅ 已实施**（2026-10-14 第二轮：io 池改固定线程数+无界队列、长驻任务迁 `startBlocking`、客户端单区块滞留窗口合并批次；`ThreadPoolsTest` 2000 任务压测断言上界。**journal 层 group commit 经论证对热路径无收益，见 DESIGN §9.3**） |
 | **P0** | **世界身份错配**：世界文件夹键只有 `IP+世界名`，客户端见到本地 `level.dat` 就"延续既有状态"，不比对种子 → 换世界后继续用旧本地世界，退出再覆盖服务端 MCA（双向污染，双向都要清） | `config/P2PPaths.java:115-116`、`client/group/LocalWorldLauncher.java:98-102`、`mixin/ChunkMapMixin.java:130-135`、`server/ChunkDataHandlers.java:265-281` | 身份不一致时隔离旧存档并从环境骨架重建；门控 `localRead` 回退加"身份已校验"前提 | **✅ 已实施**（2026-10-14 第二轮：`world.WorldIdentity` + `LocalWorldLauncher.prepareSave` + 门控 + 服务端 `quarantineStaleWorldState`；待你实测） |
 | P1 | 协议层 `worldId`：`HELLO_ACK` 下发世界身份，上行帧携带，服务端不匹配即拒写 MCA（加性字段，不升 `Protocol.VERSION`） | `netproto/HelloHandler.java`、`server/ChunkDataHandlers.java` | 伪造不匹配 worldId 的上行被拒且未调用 `chunkMap.write` | 未开始 |
 | P1 | 退出/运行期传输收敛：4 MiB 单帧挤 15 秒固定超时 + 失败整事务重放 → 512 KiB 分片 + 按载荷线性超时预算（`15000 + bytes/8KiB`）+ 重连先查 `EXIT_STATUS` 断点续传 | `group/ExitTransactionClient.java:34/82-130/162-201`、`netproto/NettyControlConnection.java:107-122`、`group/ChunkUploadService.java:62/327-328/419-420` | 60 KB/s 慢链路夹具下旧组合必超时、新组合单遍收敛；断线后只补缺失批 | 未开始（运行期已实测触发超时：`CHUNK_DATA_BATCH _rid=29606`） |
@@ -50,6 +50,14 @@
    `total_to_durable_ms=7106`、`teardown_ms=0`），无超时重放。
 4. **世界身份错配已被铁证确认**：环境目录里服务端 `level.dat` 的 `seed=7462156823368393586`，
    本地 `data/world/level.dat` 的 `seed=3614799650234757351`；本地 `region/*.mca` 是 7 月 16 日的旧世界。
+5. **`io-921` 不是"上限"**（第二轮复核）：OOM 发生在 19:48:43，而 `io-921` 首次出现在
+   19:48:51 —— 那 8 秒里线程还成功创建了。`p2p-io-N` 只是**创建序号**（`AtomicInteger` 递增、
+   不复用），OOM 是瞬态资源压力。不要把 921 当阈值写进压测判据。
+6. **日志编码各不相同**：客户端日志是 **GBK**，服务端日志是 **UTF-8**（上一版 HANDOFF 统称
+   GBK 是错的；按 GBK 强转服务端日志会得乱码）。
+7. **逐区块 fsync 的真正杠杆不是 journal group commit**：三条上行路径都在
+   `durableBatchLock` 内完成 append+force，彼此天然串行，没有可合并的重叠窗口（论证见
+   `DESIGN.md` §9.3）。要降就是"减少临界区个数"：客户端合并批次（已做）+ 服务端成批工作线程（未做）。
 
 ---
 
@@ -109,10 +117,17 @@ for p in ['primary/environment/world/level.dat','primary/data/world/level.dat']:
 
 ### 本轮已完成的提交
 
-- **世界身份错配 P0**：`world.WorldIdentity` / `world.WorldIdentityMarker` / `util.Quarantine`
-  + 客户端 `LocalWorldLauncher`（校验→隔离→重建）+ `ChunkMapMixin` 门控前提
-  + 服务端 `P2PServerService.quarantineStaleWorldState`；新增 15 个单测，全量 261 例通过。
-- 未实施（仍在队列）：线程上界、fsync 合并、协议 `worldId`、分离丢数据。
+1. **世界身份错配 P0**（`44ef8f4`）：`world.WorldIdentity` / `world.WorldIdentityMarker` /
+   `util.Quarantine` + 客户端 `LocalWorldLauncher`（校验→隔离→重建）+ `ChunkMapMixin`
+   门控前提 + 服务端 `P2PServerService.quarantineStaleWorldState`；新增 15 个单测。
+2. **服务端线程上界 P0**：`ThreadPools.io()` 改固定线程数（8~32）+ 无界队列；
+   长驻阻塞任务迁到 `ThreadPools.startBlocking`（P2PChannel 接收循环、TcpTunnel 泵与
+   监听/连接、断连清理、退出发布、客户端退出/加入/合并工作流）；客户端
+   `ChunkUploadService` 单区块滞留窗口把同批区块合成一个批次帧；`ThreadPoolsTest`
+   以 2000 个逐区块任务断言"线程数有上界 + 长驻线程不占 io 池"。全量 264 例通过。
+
+未实施（仍在队列）：协议 `worldId`（P1）、退出传输收敛（P1）、分离丢数据（P1）、
+降字节/降 CPU（P2）、环境快照抖动（P3）。
 
 ### 服务端现存部署的一次性止血（重要）
 

@@ -369,7 +369,9 @@ public final class P2PServerService {
             }
             // 合并会话清理（Phase 3）：当事方掉线 → 中止其卷入的合并（A 继续运行）
             merges.abortInvolving(peerId);
-            imsng.player_to_player.util.ThreadPools.io().execute(() -> {
+            // 断连清理是"失败即 1 秒后重试"的无限循环，可能长期占用一条线程：
+            // 走专用阻塞线程，避免有界 io 池被它占住（见 ThreadPools#startBlocking）
+            imsng.player_to_player.util.ThreadPools.startBlocking("disconnect-cleanup", () -> {
                 int attempt = 0;
                 while (true) {
                     if (!running) {

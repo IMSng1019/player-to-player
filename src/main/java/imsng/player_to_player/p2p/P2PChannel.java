@@ -76,7 +76,7 @@ public final class P2PChannel implements P2PTransport {
     /** 最近一次成功发送的时间戳（keepalive 判据）。 */
     private final AtomicLong lastSendAt = new AtomicLong(System.currentTimeMillis());
 
-    private volatile Future<?> receiveLoop;
+    private volatile Thread receiveLoop;
     private volatile ScheduledFuture<?> keepaliveTask;
 
     /**
@@ -104,7 +104,7 @@ public final class P2PChannel implements P2PTransport {
         } catch (IOException e) {
             LOGGER.warn("会话 {} 设置 socket 超时失败", sessionId, e);
         }
-        receiveLoop = ThreadPools.io().submit(this::receiveLoop);
+        receiveLoop = ThreadPools.startBlocking("p2p-receive", this::receiveLoop);
         // 定时器只做轻量判断与一次 UDP 发送，符合 scheduler() 短任务约束
         keepaliveTask = ThreadPools.scheduler().scheduleWithFixedDelay(
                 this::maybeKeepalive, KEEPALIVE_INTERVAL_SECONDS, 1, TimeUnit.SECONDS);
@@ -148,7 +148,7 @@ public final class P2PChannel implements P2PTransport {
         }
         socket.close(); // 令阻塞中的 receive 以 SocketException 退出
         if (receiveLoop != null) {
-            receiveLoop.cancel(true);
+            receiveLoop.interrupt(); // 兜底（socket 已关，正常路径下 receive 早已以异常退出）
         }
         LOGGER.info("P2P 通道关闭: 会话 {}, 对端 {}", sessionId, peer);
     }

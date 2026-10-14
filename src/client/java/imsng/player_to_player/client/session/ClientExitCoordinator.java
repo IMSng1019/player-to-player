@@ -126,7 +126,10 @@ public final class ClientExitCoordinator {
         bundleFuture = finalBundle;
         long workflowStartedNanos = System.nanoTime();
 
-        ThreadPools.io().execute(() -> runWorkflow(
+        // 退出流程内是 "无限重试直到服务端接受"（EXIT_BEGIN/EXIT_COMMIT），
+        // 且同一条线程上还要等区块批次 ACK 上行完成 —— 属长驻阻塞任务，必须走专用线程：
+        // 若它占住有界 io 池的名额，等待的批次上传任务反而排不上队，自我死锁。
+        ThreadPools.startBlocking("client-exit", () -> runWorkflow(
                 minecraft, sourceScreen, progress, kind, finalBundle,
                 workflowStartedNanos));
     }
