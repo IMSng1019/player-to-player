@@ -44,6 +44,20 @@ public final class GroupHost {
     private static final long HEADER_TIMEOUT_MILLIS = 15_000;
 
     /**
+     * 同时在册的入站会话上限（含接待中与已建立隧道）。
+     * <p>
+     * 为什么需要硬上限：入站会话是<b>对端网络帧</b>驱动的（对端循环发 P2P_CONNECT_REQUEST
+     * 即可让本端不断建立会话），而每条会话要占 2~5 条线程（接待 + 读会话头 + 隧道泵）。
+     * 没有上限就等于把刚修掉的"线程无界 → native OOM"重新暴露给对端。
+     * 组规模远小于此值；超过即拒绝并告警，属异常/攻击形态。
+     */
+    private static final int MAX_HOST_SESSIONS = 16;
+
+    /** 入站会话名额（含隧道生命周期；隧道拆除时归还）。 */
+    private static final java.util.concurrent.Semaphore HOST_SESSION_SLOTS =
+            new java.util.concurrent.Semaphore(MAX_HOST_SESSIONS);
+
+    /**
      * 跨服务器线程与客户端主线程的一次性发布门控。服务器启动回调只负责 arm，
      * 真正的 LAN 发布由客户端 tick 在本地玩家完成登录后消费。
      */
@@ -59,12 +73,27 @@ public final class GroupHost {
                 if (initiator) {
                     return;
                 }
-                // 接待一条入站会话要阻塞等对端发会话头（最长 15 秒）并长期持有隧道，
-                // 属长驻阻塞任务：专用线程。放进有界 io 池时，多条会话的 accept 会把
-                // 池内线程全部占住，而它们各自等待的"读会话头"任务同样要排在这个池上，
-                // 结果是全部等到 15 秒超时、会话失败（无界 cached pool 时代掩盖了这一点）。
-                ThreadPools.startBlocking("host-accept",
-                        () -> accept(sessionId, String.valueOf(peerClientId), transport));
+                // 名额上限：接待与隧道都要占线程，而对端可以不断发起会话，必须拒绝超限会话
+                if (!HOST_SESSION_SLOTS.tryAcquire()) {
+                    LOGGER.warn("入站 P2P 会话数已达上限 {}，拒绝会话 {}（对端 {}）——"
+                                    + "防对端驱动的线程耗尽；组规模远小于该值，超过属实异常",
+                            MAX_HOST_SESSIONS, sessionId, peerClientId);
+                    transport.close();
+                    return;
+                }
+                // 接待走专用小池（不是 io 池：接待最长阻塞 15 秒，放共享池会占满名额饿死
+                // 区块上行；也不是每条会话一条线程：会话数由对端驱动）。
+                try {
+                    ThreadPools.hostSessionExecutor().execute(
+                            () -> accept(sessionId, String.valueOf(peerClientId), transport));
+                } catch (RuntimeException e) {
+                    // 投递失败（执行器已关停/资源不足）必须归还名额，否则名额会永久泄漏，
+                    // 泄漏满 MAX_HOST_SESSIONS 次后所有副客户端都再也进不来
+                    HOST_SESSION_SLOTS.release();
+                    transport.close();
+                    LOGGER.warn("接待会话 {} 的任务投递失败，已关闭会话并归还名额: {}",
+                            sessionId, e.toString());
+                }
             };
 
     /** 宿主监听器的成对注册槽；reset 会可靠地从 P2PSessions 摘除当前实例。 */
@@ -211,10 +240,13 @@ public final class GroupHost {
         HOST_LISTENER_REGISTRATION.clear();
     }
 
-    /** 接待一条新入站 P2P 会话（io 线程，可阻塞）。 */
+    /** 接待一条新入站 P2P 会话（专用接待池线程，可阻塞）。名额在入口处已取得。 */
     private static void accept(String sessionId, String peer,
                                imsng.player_to_player.p2p.P2PTransport transport) {
         ReliableChannel channel = new ReliableChannel(transport, "host:" + sessionId);
+        // 隧道路径把名额归还交给"隧道终止回调"（隧道还活着就继续占名额）；
+        // 其余路径在本方法返回时归还。二者只能有一个，否则上限形同虚设。
+        boolean tunnelHandedOff = false;
         try {
             String headerJson = readHeaderWithTimeout(channel);
             JsonObject header = JsonUtil.parseObject(headerJson);
@@ -230,7 +262,10 @@ public final class GroupHost {
                     }
                     LOGGER.info("副客户端 {} 经会话 {} 请求加入，桥接到 LAN 端口 {}",
                             JsonUtil.getString(header, "playerName", peer), sessionId, port);
-                    TcpTunnel.bridgeToLocalPort(channel, port, "host:" + sessionId);
+                    // 名额随隧道生命周期持有：隧道拆除时归还（见 TcpTunnel 的终止回调）
+                    TcpTunnel.bridgeToLocalPort(channel, port, "host:" + sessionId,
+                            HOST_SESSION_SLOTS::release);
+                    tunnelHandedOff = true;
                 }
                 case "presync" -> {
                     // Phase 3 合并：让出方 A 主动连到接管方 B 推送预同步流
@@ -241,6 +276,8 @@ public final class GroupHost {
                         return;
                     }
                     handler.accept(header, channel); // 通道所有权移交处理器
+                    // 预同步会话条数由服务端协调的合并数量决定（不受对端自由放大），
+                    // 故在 finally 里即时归还名额，只把"接待窗口"计入上限
                 }
                 default -> {
                     LOGGER.warn("会话 {} 的用途未知（op={}），关闭", sessionId, op);
@@ -250,6 +287,10 @@ public final class GroupHost {
         } catch (Exception e) {
             LOGGER.warn("接待会话 {} 失败: {}", sessionId, e.toString());
             channel.close();
+        } finally {
+            if (!tunnelHandedOff) {
+                HOST_SESSION_SLOTS.release();
+            }
         }
     }
 

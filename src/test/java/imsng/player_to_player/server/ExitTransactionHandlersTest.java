@@ -678,6 +678,108 @@ class ExitTransactionHandlersTest {
                 Set.of(CLIENT_ID), Set.of(CHUNK));
     }
 
+    /**
+     * BEGIN 的"发布屏障 + 入队任务"必须是一个原子步。
+     * <p>
+     * 反例（曾实测的死锁形态）：同一 clientId 的两条连接并发到达时，先发布屏障 B1 的线程
+     * 晚于第二个线程入队（T2 先入队），而任务体要 join 前序屏障 —— T2 等的是只能由排在它
+     * 后面的 T1 完成的 B1，屏障执行器线程数不足即永久死锁。
+     * <p>
+     * 本用例用一个"只阻塞第一次 execute"的执行器把该竞态窗口放大成确定性时序：若第二个
+     * BEGIN 能在第一个尚未入队时越过发布点，则说明两者仍可分离（缺陷回归）。
+     */
+    @Test
+    void beginPublishesBarrierAndEnqueuesAtomicallyUnderConcurrentConnections()
+            throws Exception {
+        List<Runnable> tasks = java.util.Collections.synchronizedList(new ArrayList<>());
+        CountDownLatch enqueueStarted = new CountDownLatch(1);
+        CountDownLatch allowEnqueue = new CountDownLatch(1);
+        AtomicInteger calls = new AtomicInteger();
+        java.util.concurrent.Executor barrierExecutor = task -> {
+            if (calls.incrementAndGet() == 1) {
+                enqueueStarted.countDown();
+                awaitQuietly(allowEnqueue);
+            }
+            tasks.add(task);
+        };
+        ExitTransactionHandlers handlers = new ExitTransactionHandlers(
+                new ExitTransactionLedger(new InMemoryPersistence()),
+                (peer, requested) -> requested,
+                ignored -> {
+                },
+                new ExitTransactionHandlers.PayloadStore() {
+                    @Override
+                    public boolean stagePlayer(ExitManifest manifest, UUID playerId,
+                                               byte[] gzipNbt) {
+                        return true;
+                    }
+
+                    @Override
+                    public boolean stageChunk(ExitManifest manifest, ChunkKey key,
+                                              byte[] gzipNbt, boolean preserveExisting) {
+                        return true;
+                    }
+
+                    @Override
+                    public void apply(
+                            ExitManifest manifest,
+                            ExitTransactionLedger.ChunkDisposition disposition) {
+                    }
+
+                    @Override
+                    public void discard(ExitManifest manifest) {
+                    }
+                },
+                () -> {
+                },
+                ignored -> {
+                },
+                Runnable::run,
+                barrierExecutor,
+                (connection, action) -> action.getAsBoolean(),
+                null);
+        FakeRegistry registry = new FakeRegistry();
+        handlers.register(registry);
+        FakeConnection first = new FakeConnection(CLIENT_ID);
+        FakeConnection second = new FakeConnection(CLIENT_ID);
+        ControlMessage begin = ControlMessage.of(MessageType.EXIT_BEGIN, manifest().toJson());
+
+        Thread firstThread = new Thread(() -> handleQuietly(registry, first, begin));
+        firstThread.start();
+        assertTrue(enqueueStarted.await(5, TimeUnit.SECONDS), "第一个 BEGIN 应已走到入队点");
+
+        Thread secondThread = new Thread(() -> handleQuietly(registry, second, begin));
+        secondThread.start();
+        Thread.sleep(300); // 给第二个 BEGIN 充分机会越过发布点
+        assertEquals(0, tasks.size(),
+                "第二个 BEGIN 不得在第一个尚未入队时完成入队："
+                        + "屏障发布与任务入队必须原子（否则屏障链会反序，执行器线程不足即死锁）");
+
+        allowEnqueue.countDown();
+        firstThread.join(5_000);
+        secondThread.join(5_000);
+        assertEquals(2, tasks.size(), "两次 BEGIN 都应完成入队");
+        assertEquals(1, handlers.pendingBeginBarrierCount(),
+                "同一 clientId 只保留最新屏障（先到的被替换），故在册数恒为 1");
+    }
+
+    private static void awaitQuietly(CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static void handleQuietly(FakeRegistry registry, ControlConnection connection,
+                                      ControlMessage message) {
+        try {
+            registry.handle(connection, message);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     private static JsonObject idJson() {
         JsonObject json = new JsonObject();
         json.addProperty("shutdownId", SHUTDOWN_ID.toString());

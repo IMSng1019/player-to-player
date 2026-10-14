@@ -507,6 +507,17 @@ public final class P2PServerService {
         } else if (!WorldIdentity.FORMAT_VERSION.equals(previous.formatVersion)) {
             LOGGER.warn("世界身份标记口径为 {}（当前 {}），无法比较：保留运行期状态不动",
                     previous.formatVersion, WorldIdentity.FORMAT_VERSION);
+        } else if (current.known() && WorldIdentity.relaxedBySeed(previous.snapshot(), current)) {
+            // 哈希不同但种子相同：升级重写 level.dat，或"同种子的另一份世界存档替换了本世界"。
+            // 两者都按同一世界处理（服务端误隔离会丢未物化到 MCA 的耐久区块），但必须留痕：
+            // 后者需要人工隔离运行期状态，且身份机制永远看不出来。
+            LOGGER.warn("世界身份哈希与标记不同但世界种子相同（种子={}）：按同一世界处理，"
+                            + "不隔离运行期状态。若你确实用**同种子的另一份存档**替换过世界，"
+                            + "请手工把 player-to-player/ 下的 chunk-journal、registry、"
+                            + "exit-transactions、exit-payloads 改名隔离，否则旧世界的区块/占用"
+                            + "会继续生效: 标记={} 当前={}",
+                    current.seed().orElse(null),
+                    WorldIdentity.shortId(previous.identityHash), current.shortId());
         } else if (current.known() && !WorldIdentity.sameWorld(previous.snapshot(), current)) {
             WorldIdentity.Snapshot recorded = previous.snapshot();
             LOGGER.warn("世界身份已变化（标记={} 种子={} / 当前={} 种子={}），"
@@ -542,7 +553,8 @@ public final class P2PServerService {
         WorldIdentityMarker marker = new WorldIdentityMarker();
         marker.formatVersion = WorldIdentity.FORMAT_VERSION;
         marker.identityHash = current.identityHash();
-        marker.worldSeed = current.seed().orElse(WorldIdentityMarker.NO_SEED);
+        marker.hasWorldSeed = current.seed().isPresent();
+        marker.worldSeed = current.seed().orElse(0L);
         marker.worldName = worldName == null ? "" : worldName;
         marker.recordedAtEpochMillis = now;
         try {

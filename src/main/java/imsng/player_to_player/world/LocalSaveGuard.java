@@ -67,17 +67,23 @@ public final class LocalSaveGuard {
                 ? WorldIdentity.snapshot(localLevelDat)
                 : WorldIdentity.Snapshot.unknown();
 
-        if (Files.isRegularFile(localLevelDat) && WorldIdentity.sameWorld(server, local)) {
-            if (!local.identityHash().equals(server.identityHash())) {
-                // 同种子但生成设置结构不同：典型于 level.dat 被原版 DataFixer 跨版本重写。
-                // 判为同一世界（本地 region 仍属这个世界），但不静默 —— 让日志留痕。
-                LOGGER.warn("本地存档身份哈希与服务端骨架不同但世界种子相同，判为同一世界"
-                                + "（疑为版本升级重写生成设置）: 服务端={} 本地={} 种子={}",
-                        server.shortId(), local.shortId(), local.seed().orElse(null));
-            }
+        // 客户端用**严格**判据（只用身份哈希）：误隔离的代价是"本地缓存重建"（非破坏性），
+        // 误复用的代价是"旧世界区块被读入并上行覆盖服务端 MCA"。判错代价不对称，故取严。
+        if (Files.isRegularFile(localLevelDat)
+                && WorldIdentity.sameWorldStrict(server, local)) {
             LOGGER.info("本地存档世界身份校验通过，延续既有状态: {} (identity={})",
                     saveDir, server.shortId());
             return server.identityHash();
+        }
+        if (Files.isRegularFile(localLevelDat)
+                && WorldIdentity.relaxedBySeed(server, local)) {
+            // 种子相同、生成设置结构不同：多是 level.dat 被原版 DataFixer 跨版本重写。
+            // 仍然隔离重建（本地缓存从服务端取回），只是明确告知这是"升级/同种子替换"，
+            // 而不是"服务端换了世界"——两者的人工处置不同。
+            LOGGER.warn("本地存档身份哈希与服务端骨架不同但世界种子相同: {} "
+                            + "（升级重写的 level.dat，或同种子的另一份世界存档）—— "
+                            + "仍按不一致处理并重建本地缓存: 服务端={} 本地={} 种子={}",
+                    saveDir, server.shortId(), local.shortId(), local.seed().orElse(null));
         }
 
         if (Files.exists(saveDir)) {

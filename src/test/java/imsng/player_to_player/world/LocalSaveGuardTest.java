@@ -94,9 +94,10 @@ class LocalSaveGuardTest {
     }
 
     @Test
-    void dataFixerRewriteOfSameWorldIsNotTreatedAsWorldChange() throws Exception {
-        // 跨版本升级时原版会把旧形态的 level.dat 迁移成新形态：生成设置的结构哈希变了，
-        // 但种子没变 —— 世界没换。误隔离会丢掉未物化到 MCA 的耐久区块，故必须判为同世界。
+    void dataFixerRewriteRebuildsLocalCacheInsteadOfReusingOldRegion() throws Exception {
+        // 跨版本升级时原版会把旧形态的 level.dat 迁移成新形态：结构哈希变了、种子没变。
+        // 客户端取**严格**判据：判错的代价不对称 —— 误隔离只是本地缓存从服务端重建，
+        // 误复用却会把旧世界 region 读入并上行覆盖服务端 MCA。故这里仍隔离重建。
         Path env = writeLevel(skeleton(42L));                 // 迁移后的新形态
         Path save = temporary.resolve("data/world");
         writeLevelFile(save, legacyLevelData(42L));           // 迁移前的旧形态（RandomSeed）
@@ -106,8 +107,33 @@ class LocalSaveGuardTest {
 
         LocalSaveGuard.prepareSave(env, save, 1_700_000_000_000L);
 
-        assertTrue(Files.exists(oldRegion), "同种子（仅 level.dat 结构被升级重写）必须复用本地存档");
-        assertNoQuarantine(temporary.resolve("data"));
+        assertFalse(Files.exists(save.resolve("region")),
+                "客户端不复用旧 region（严格判据）：旧世界内容绝不能经本地回退读再上行");
+        Path stale = onlyQuarantine(temporary.resolve("data"));
+        assertEquals("升级前的区块", Files.readString(stale.resolve("region/r.0.0.mca")),
+                "隔离是改名保留，不是删除");
+        assertEquals(42L,
+                WorldIdentity.seedOf(WorldIdentityTestSupport.read(save.resolve("level.dat")))
+                        .orElseThrow(),
+                "重建后按服务端骨架的种子");
+    }
+
+    @Test
+    void firstStartWithoutSaveDirQuarantinesNothing() throws Exception {
+        Path env = writeLevel(skeleton(7L));
+        Path save = temporary.resolve("data/world"); // 不存在
+
+        String identity = LocalSaveGuard.prepareSave(env, save, 1_700_000_000_000L);
+
+        assertFalse(identity.isEmpty());
+        assertTrue(Files.isRegularFile(save.resolve("level.dat")),
+                "首次启动必须从骨架建出可用存档");
+        assertFalse(Files.exists(save.resolve("session.lock")),
+                "骨架里的 session.lock 不能被带过来（会让引导误判存档被占用）");
+        Path dataDir = temporary.resolve("data");
+        try (Stream<Path> list = Files.list(dataDir)) {
+            assertEquals(1, list.count(), "首次启动不得产生任何隔离目录");
+        }
     }
 
     @Test

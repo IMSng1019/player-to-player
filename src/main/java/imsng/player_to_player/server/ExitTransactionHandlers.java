@@ -129,6 +129,8 @@ public final class ExitTransactionHandlers {
     private final DurableChunkJournal durableJournal;
     private final ConcurrentHashMap<UUID, CompletableFuture<Void>> beginBarriers =
             new ConcurrentHashMap<>();
+    /** 让"发布屏障 + 入队 BEGIN 任务"成为一个原子步（见 handleBegin 注释的死锁说明）。 */
+    private final Object beginSubmitLock = new Object();
     private final ConcurrentHashMap<UUID, Boolean> cleanupTasks =
             new ConcurrentHashMap<>();
     /**
@@ -241,6 +243,17 @@ public final class ExitTransactionHandlers {
     }
 
     /**
+     * 已发布但尚未完成的 BEGIN 屏障数（诊断与回归测试用）。
+     * <p>
+     * 存在的意义：{@link #handleBegin} 的"发布屏障 + 入队任务必须原子"这条不变量无法从
+     * 外部行为观测（任务体不执行就看不到效果），只能靠这个计数在并发时序下断言 —— 见
+     * {@code ExitTransactionHandlersTest} 的原子性用例。
+     */
+    int pendingBeginBarrierCount() {
+        return beginBarriers.size();
+    }
+
+    /**
      * 等待当前已经发布的 BEGIN 屏障全部结束。调用方不得在 HELLO 会话锁内等待，
      * 因为 BEGIN 任务本身需要进入同一把锁校验连接是否仍为当前会话。
      */
@@ -329,12 +342,6 @@ public final class ExitTransactionHandlers {
         CompletableFuture<Void> barrier = new CompletableFuture<>();
         java.util.concurrent.atomic.AtomicReference<CompletableFuture<Void>> previousRef =
                 new java.util.concurrent.atomic.AtomicReference<>();
-        if (peerId != null) {
-            beginBarriers.compute(peerId, (ignored, previous) -> {
-                previousRef.set(previous);
-                return barrier;
-            });
-        }
         Runnable task = () -> {
             CompletableFuture<Void> previous = previousRef.get();
             if (previous != null) {
@@ -409,14 +416,28 @@ public final class ExitTransactionHandlers {
                 }
             }
         };
-        try {
-            barrierExecutor.execute(task);
-        } catch (RuntimeException e) {
-            barrier.completeExceptionally(e);
+        // 屏障发布（compute）与任务入队（execute）必须是**一个原子步**：
+        // 两者分属不同步时，同一 clientId 的两条连接并发到达会让"发布顺序"与"入队顺序"
+        // 相反（B1 先发布、T2 先入队）；任务体要 join 前序屏障，于是 T2 等待只能由排在它
+        // 后面的 T1 完成的 B1 —— 屏障执行器一旦线程数不足就是永久死锁
+        // （多线程池只是掩盖，单线程执行器会立刻暴露；实测复查已定为 blocker）。
+        // 临界区只有一次 map 操作与一次非阻塞入队，不会阻塞调用方（Netty 线程）。
+        synchronized (beginSubmitLock) {
             if (peerId != null) {
-                beginBarriers.remove(peerId, barrier);
+                beginBarriers.compute(peerId, (ignored, previous) -> {
+                    previousRef.set(previous);
+                    return barrier;
+                });
             }
-            throw e;
+            try {
+                barrierExecutor.execute(task);
+            } catch (RuntimeException e) {
+                barrier.completeExceptionally(e);
+                if (peerId != null) {
+                    beginBarriers.remove(peerId, barrier);
+                }
+                throw e;
+            }
         }
     }
 

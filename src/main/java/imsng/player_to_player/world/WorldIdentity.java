@@ -108,25 +108,41 @@ public final class WorldIdentity {
     }
 
     /**
-     * 两份身份视图是否属于同一个世界。
+     * 严格判据：只有身份哈希确实相等才算同一个世界。
      * <p>
-     * 判定顺序：① 身份哈希相等 → 同世界；② 否则两侧种子都已知且相等 → 同世界
-     * （版本升级重写生成设置结构但世界未换）；③ 其余（含任一侧无法确定）→ <b>不是</b>同世界。
+     * <b>客户端必须用这一条</b>（见 {@code world.LocalSaveGuard}）：判错的代价不对称 ——
+     * 误隔离只让本地缓存从服务端重建（非破坏性），误复用却会把旧世界的 {@code region}
+     * 当作有效缓存读入并上行覆盖服务端 MCA（正是本机制要防的数据损坏）。
+     */
+    public static boolean sameWorldStrict(Snapshot first, Snapshot second) {
+        return first != null && second != null
+                && first.known() && second.known()
+                && first.identityHash().equals(second.identityHash());
+    }
+
+    /**
+     * 放宽判据：身份哈希相等，<b>或</b>两侧种子都已知且相等 —— 版本升级时原版 DataFixer 会
+     * 重写 {@code level.dat} 的生成设置结构，结构哈希变化但世界没换。
      * <p>
-     * <b>已知边界</b>：同种子不同生成器配置（如 amplification）会被判为同世界 —— 这是
-     * 为了让"跨版本升级"不误判而付出的代价；"同种子重建世界"同理识别不了（那需要世界实例
-     * UUID，属计划中的 P1）。
+     * <b>只用于服务端</b>判断"自己的运行期状态（WAL/注册表/退出事务）是否属于当前世界"：
+     * 那里判错的代价同样不对称 —— 误隔离会丢掉尚未物化到 MCA 的耐久区块（客户端收到
+     * durable ACK 后已删除本地副本），代价比"同种子换世界时漏隔离"更高，故取放宽。
+     * <p>
+     * <b>已知边界</b>：同种子不同生成器配置、或同种子重建世界，本判据识别不了；调用方必须
+     * 在命中放宽分支时打出可操作的 WARN（见 {@code P2PServerService}）。
      */
     public static boolean sameWorld(Snapshot first, Snapshot second) {
-        if (first == null || second == null) {
-            return false;
-        }
-        if (first.known() && second.known()
-                && first.identityHash().equals(second.identityHash())) {
+        if (sameWorldStrict(first, second)) {
             return true;
         }
-        return first.seed().isPresent() && second.seed().isPresent()
+        return first != null && second != null
+                && first.seed().isPresent() && second.seed().isPresent()
                 && first.seed().get().equals(second.seed().get());
+    }
+
+    /** 是否命中"哈希不同但种子相同"的放宽分支（调用方据此打可操作的 WARN）。 */
+    public static boolean relaxedBySeed(Snapshot first, Snapshot second) {
+        return !sameWorldStrict(first, second) && sameWorld(first, second);
     }
 
     /** 读取 level.dat 文件并给出身份视图；文件缺失/损坏时给出 {@link Snapshot#unknown()}。 */

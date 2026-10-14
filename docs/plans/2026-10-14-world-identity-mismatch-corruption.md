@@ -131,8 +131,9 @@
 >   `util.Quarantine`；落点 `client/group/LocalWorldLauncher`、
 >   `mixin/ChunkMapMixin.player_to_player$localReadOrEmpty`、`group/GroupRuntime.GroupPlan`；
 >   结果记入世界级 `config.json` 的 `worldIdentityHash`。测试：
->   `WorldIdentityTest`、`LocalSaveGuardTest`（覆盖 §8-1/§8-2/§8-3）、`QuarantineTest`、
->   `GroupRuntimeIdentityGateTest`。
+>   `WorldIdentityTest`（身份口径与严格/放宽两套判据）、`LocalSaveGuardTest`
+>   （§8-1 隔离分支与重建、§8-2 同世界不隔离、`level.dat` 缺失/损坏、首次启动）、
+>   `QuarantineTest`、`GroupRuntimeIdentityGateTest`（§8-3 门控前提的镜像语义）。
 > - **额外补的一项（原报告未列，但属同一缺陷闭环）**：服务端侧。运行期状态目录
 >   （`chunk-journal/`、`registry/`、`exit-transactions/`、`exit-payloads/`）不随世界名
 >   分割，换世界后旧 WAL 会被 `RegionFileProbe` 当作"服务端已有数据"，把**旧世界区块
@@ -144,9 +145,12 @@
 > - 身份口径偏离原建议两处（都有反证支撑，见 `DESIGN.md` 与 `WorldIdentity` 注释）：
 >   ① **不把 `Data.DataVersion` 算进身份** —— 它随版本升级变化，而升级后本地 region
 >   仍属同一世界（DataFixer 会升级），算进去会造成无谓隔离；
->   ② **同种子即判同世界**（`WorldIdentity.sameWorld`）—— 跨版本升级时原版会重写
->   `level.dat` 的生成设置结构，只比结构哈希会把升级误判成换世界、隔离掉未物化到 MCA
->   的耐久区块。代价是"同种子重建世界"识别不了，已在 HANDOFF §3 记为需手工止血的情形。
+>   ② **两套判据，按判错代价不对称取舍**：`WorldIdentity.sameWorldStrict`（只认哈希）用于
+>   **客户端**——误隔离只是本地缓存从服务端重建，误复用却会让旧世界 region 经回退读上行；
+>   `WorldIdentity.sameWorld`（哈希或同种子）用于**服务端**判断运行期状态归属——误隔离会丢掉
+>   未物化到 MCA 的耐久区块，代价更高。跨版本升级时原版会重写 `level.dat` 的生成设置结构，
+>   服务端据此不隔离；客户端仍会重建本地缓存（非破坏性）。代价是"同种子重建世界"在服务端
+>   识别不了，已在 HANDOFF §3 记为需手工止血的情形，并在命中放宽分支时打 WARN。
 
 
 

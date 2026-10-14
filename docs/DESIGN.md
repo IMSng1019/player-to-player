@@ -171,7 +171,9 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
   `ThreadPools.scheduler()`：心跳、注册表落盘等定时任务；
   `ThreadPools.compute()`：跑分等 CPU 密集任务；
   `ThreadPools.startBlocking(name, body)`：**长驻阻塞**任务（每通道接收循环、隧道泵、
-  无限重试的断连清理/退出发布/加入与合并工作流）专用单线程。
+  无限重试的断连清理/退出发布/加入与合并工作流）专用单线程；
+  `ThreadPools.exitBarrierExecutor()`：EXIT_BEGIN 屏障任务（4 线程，与 io 池隔离）；
+  `ThreadPools.hostSessionExecutor()`：主客户端接待入站 P2P 会话（4 线程，与 io 池隔离）。
 - **铁律**：任何阻塞操作不得占用 MC 主线程 / Netty 事件循环线程；
   与 MC 世界状态交互一律回主线程（`server.execute` / `MinecraftClient.execute`）。
 
@@ -190,23 +192,31 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
 
 已核对成立、改动 io 池容量或新增"任务内等待"前必须重新核对的等待闭包：
 
-- `EXIT_BEGIN` 的**屏障任务**必须跑在 `startBlocking` 专用线程上，**不得**与业务帧共用 io 池。
-  原因：屏障在 BEGIN 任务入队**之前**就对 `writeRealtimeIfAllowed` 可见，任何"在 EXIT_BEGIN
-  之前到达、却排在它之后出队"的 claim/上行/释放帧都会 join 这个屏障；一旦这些等待者占满
-  池内线程，排在队尾的 BEGIN 任务永远拿不到线程去 `complete` 屏障 —— 固定线程池下是
-  **永久死锁**（无界 cached pool 时代每条任务都新建线程，掩盖了这个结构问题）。
-  装配点：`P2PServerService` 向 `ExitTransactionHandlers` 注入
-  `ThreadPools.exitBarrierExecutor()`（恒定单线程，与 io 池隔离；不用"每帧一条专用线程"
-  是因为这条帧由网络触发，会重新引入建线程风险）。
-  *残留*：disconnect 路径在 Netty 线程上 `awaitPendingBegins`，等待有上界（BEGIN 任务不再
-  受池容量影响）但仍可能阻塞事件循环数十毫秒 —— 属既有设计，改造需连同断连状态机一起动。
+- `EXIT_BEGIN` 的**屏障任务**必须与业务帧分池，**且"发布屏障 + 入队任务"必须是原子步**
+  （`ExitTransactionHandlers.beginSubmitLock`）。两条都是实测/blocker 级教训：
+  ① 屏障在 BEGIN 任务入队**之前**就对 `writeRealtimeIfAllowed` 可见，任何"在 EXIT_BEGIN
+  之前到达、却排在它之后出队"的 claim/上行/释放帧都会 join 这个屏障；这些等待者一旦占满
+  io 池，排在队尾的 BEGIN 任务永远拿不到线程去 `complete` 屏障 —— 固定线程池下是**永久
+  死锁**（无界 cached pool 时代每条任务都新建线程，掩盖了这个结构问题）；
+  ② 若发布与入队可分（同一 clientId 两条连接并发到达），屏障链会**反序**：T2 等的是只能由
+  排在它后面的 T1 完成的 B1 —— 屏障执行器线程数不足即死锁，单线程执行器会立刻暴露。
+  装配点：`P2PServerService` 注入 `ThreadPools.exitBarrierExecutor()`（4 线程固定、FIFO，
+  既不是单线程（一条卡住的登记会冻结所有客户端的退出登记），也不是"每帧一条专用线程"
+  （EXIT_BEGIN 是网络帧触发的））。
+  *残留*：BEGIN 任务内有对断连清理等外部条件的无界等待（`disconnectCleanups.await`），
+  极端情况下可占住若干屏障线程；disconnect 路径还会在 Netty 线程上 `awaitPendingBegins`，
+  等待有上界但可能阻塞事件循环数十毫秒 —— 属既有设计，改造需连同断连状态机一起动。
 - `EXIT_BEGIN` 任务自身 join 前一个 BEGIN 屏障 —— 前序任务 **FIFO 先出队先执行**，
   链头永不等待，故只要池内有 ≥1 条线程可推进即可；
 - claim/release/上行任务 join 自己客户端的 BEGIN 屏障 —— 屏障由 BEGIN 任务完成，
   而 BEGIN 任务只取会话条带锁（等待方在进入业务锁**之前**等待，见
   `ExitTransactionHandlers.writeRealtimeIfAllowed` 的调用位置约定）；
-- 接待入站会话（`GroupHost.accept` → 读会话头）与上游环境同步循环都曾用"池内任务等池内
-  任务"的写法，已一并迁到 `startBlocking`；
+- 接待入站会话（`GroupHost.accept` → 读会话头）走 `hostSessionExecutor()`（4 线程）：接待要
+  阻塞等对端发会话头（最长 15 秒），放共享 io 池会占满名额饿死区块上行，而"每会话一条
+  专用线程"又会被对端反复请求放大成线程无界 —— 故用小池 + 队列，并以
+  `MAX_HOST_SESSIONS` 名额（含隧道生命周期，隧道终止回调归还）硬顶；
+- 上游环境同步循环（首轮与定期轮次）都曾用"池内任务等池内任务"的写法，已迁到
+  `startBlocking`；
 - **磁盘等待仍占用本池线程**：IOWorker 队列、`flushWorker()`、Journal `force(true)` 都是
   在池内线程上同步阻塞的调用 —— 它们不依赖别的池任务才能完成（不构成死锁），但确实把
   线程占住，这正是"容量按下游串行点选"的原因；

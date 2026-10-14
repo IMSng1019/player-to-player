@@ -93,17 +93,40 @@ public final class ThreadPools {
     private static final AtomicInteger BLOCKING_SEQ = new AtomicInteger();
 
     /**
-     * EXIT_BEGIN 屏障任务专用执行器：**恒定一条**线程，与 io 池完全隔离。
+     * EXIT_BEGIN 屏障任务专用执行器：与 io 池完全隔离，线程数上下界都受控。
      * <p>
      * 用途见 {@code ExitTransactionHandlers} 完整构造器的死锁说明：BEGIN 任务排在业务帧
      * 同一个池里时，等待该屏障的业务帧会把池内线程占满，BEGIN 任务永远排不上 → 永久死锁。
      * <p>
-     * 为什么是单线程而不是"每帧一条专用线程"：EXIT_BEGIN 是<b>网络帧</b>触发的，每帧建一条
-     * 线程等于把刚修掉的 native 线程耗尽风险重新引入（同一 clientId 的 BEGIN 本来就被屏障链
-     * 串行化，跨客户端也只是一次退出事务的登记，单线程足够且线程数恒定）。
+     * 为什么是"少数几条线程"而不是单线程、也不是"每帧一条专用线程"：
+     * <ul>
+     *   <li>单线程（曾短暂采用，复查定为 blocker）：BEGIN 任务体内有对断连清理等外部条件的
+     *       无界等待，一条卡住的登记会冻结所有客户端的退出登记；</li>
+     *   <li>每帧一条专用线程：EXIT_BEGIN 是网络帧触发的，等于把刚修掉的 native 线程耗尽
+     *       风险重新引入。</li>
+     * </ul>
+     * 线程数固定为 {@value #EXIT_BARRIER_THREADS}，任务是 FIFO 排队（入队顺序与屏障发布顺序
+     * 由 {@code ExitTransactionHandlers.beginSubmitLock} 保证一致）。
      */
-    private static final ExecutorService EXIT_BARRIER =
-            Executors.newSingleThreadExecutor(namedFactory("p2p-exit-begin"));
+    private static final int EXIT_BARRIER_THREADS = 4;
+
+    private static final ExecutorService EXIT_BARRIER = new ThreadPoolExecutor(
+            EXIT_BARRIER_THREADS, EXIT_BARRIER_THREADS, 0L, TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<>(), namedFactory("p2p-exit-begin"));
+
+    /**
+     * 主客户端接待入站 P2P 会话（accept + 读会话头）专用执行器：固定少数线程 + 队列。
+     * <p>
+     * 会话是<b>对端网络帧</b>驱动的，因此既不能用无界缓存池（对端可循环请求 → 线程无界），
+     * 也不能放回共享 io 池（每条接待最长阻塞 15 秒，会占满池名额饿死区块上行）。
+     * 排队超过容量的会话会依次处理，超时的会按 {@code HEADER_TIMEOUT_MILLIS} 正常关闭。
+     */
+    private static final int HOST_SESSION_THREADS = 4;
+
+    private static final ExecutorService HOST_SESSION = new ThreadPoolExecutor(
+            HOST_SESSION_THREADS, HOST_SESSION_THREADS, 0L, TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<>(), namedFactory("p2p-host-session"));
+
 
     static {
         // 队列深度看门狗：低频采样，偏深时告警（区分"线程不够"与"下游串行点堵住"）
@@ -188,11 +211,16 @@ public final class ThreadPools {
     }
 
     /**
-     * EXIT_BEGIN 屏障任务专用执行器（恒定单线程，与 io 池隔离）。
-     * <b>不要</b>把普通业务帧丢进来：它是串行的，会把所有客户端的退出登记排队。
+     * EXIT_BEGIN 屏障任务专用执行器（与 io 池隔离）。
+     * <b>不要</b>把普通业务帧丢进来：容量只为退出登记准备。
      */
     public static ExecutorService exitBarrierExecutor() {
         return EXIT_BARRIER;
+    }
+
+    /** 主客户端接待入站 P2P 会话专用执行器（accept 与读会话头，与 io 池隔离）。 */
+    public static ExecutorService hostSessionExecutor() {
+        return HOST_SESSION;
     }
 
     /** 定时调度线程池（心跳、周期落盘、超时检查）。注意任务体要短，重活丢给 io()/compute()。 */
@@ -228,6 +256,7 @@ public final class ThreadPools {
         COMPUTE.shutdown();
         SCHEDULER.shutdown();
         EXIT_BARRIER.shutdown();
+        HOST_SESSION.shutdown();
         try {
             //noinspection ResultOfMethodCallIgnored
             IO.awaitTermination(2, TimeUnit.SECONDS);

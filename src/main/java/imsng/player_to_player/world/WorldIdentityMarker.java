@@ -23,17 +23,21 @@ public final class WorldIdentityMarker {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("player_to_player/world-identity");
 
-    /** 未记录种子时的哨兵值（用哨兵而不是 Long 装箱：避免 JSON 显式 null 引发的拆箱 NPE）。 */
-    public static final long NO_SEED = Long.MIN_VALUE;
-
     /** 身份口径版本（取自 {@link WorldIdentity#FORMAT_VERSION}）。 */
     public String formatVersion = "";
 
     /** 标记写入时的世界身份哈希；空串 = 当时无法确定身份。 */
     public String identityHash = "";
 
-    /** 标记写入时的世界种子；{@link #NO_SEED} = 当时无法确定。 */
-    public long worldSeed = NO_SEED;
+    /**
+     * 标记写入时是否取到了世界种子。
+     * 用独立的布尔位而不是给 {@code worldSeed} 设哨兵：任何 long 取值都可能是真实种子
+     * （含 {@code Long.MIN_VALUE}），哨兵会把"巧合等于哨兵的种子"误判成"没有种子"。
+     */
+    public boolean hasWorldSeed = false;
+
+    /** 标记写入时的世界种子；仅在 {@link #hasWorldSeed} 为 true 时有效。 */
+    public long worldSeed = 0L;
 
     /** 当时的世界名（诊断用；世界名可变，不作为判定依据）。 */
     public String worldName = "";
@@ -45,8 +49,7 @@ public final class WorldIdentityMarker {
     public WorldIdentity.Snapshot snapshot() {
         return new WorldIdentity.Snapshot(
                 identityHash == null ? "" : identityHash,
-                worldSeed == NO_SEED ? java.util.Optional.empty()
-                        : java.util.Optional.of(worldSeed));
+                hasWorldSeed ? java.util.Optional.of(worldSeed) : java.util.Optional.empty());
     }
 
     /** 读取标记；文件不存在或损坏返回 {@code null}（按"无标记"处理）。 */

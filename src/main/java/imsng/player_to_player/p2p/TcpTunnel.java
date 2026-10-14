@@ -41,6 +41,24 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class TcpTunnel {
 
+    /** 终止回调的兜底执行：回调异常不得影响隧道拆除本身。 */
+    static final class Terminations {
+        private Terminations() {
+        }
+
+        static void run(Runnable onTerminated) {
+            if (onTerminated == null) {
+                return;
+            }
+            try {
+                onTerminated.run();
+            } catch (RuntimeException e) {
+                LOGGER.warn("隧道终止回调异常（忽略）", e);
+            }
+        }
+    }
+
+
     private static final Logger LOGGER = LoggerFactory.getLogger("player_to_player/tunnel");
 
     /** 泵缓冲大小。 */
@@ -77,6 +95,20 @@ public final class TcpTunnel {
      * @param label   日志标签
      */
     public static void bridgeToLocalPort(ReliableChannel channel, int port, String label) {
+        bridgeToLocalPort(channel, port, label, null);
+    }
+
+    /**
+     * 同 {@link #bridgeToLocalPort(ReliableChannel, int, String)}，另外在隧道<b>终止时
+     * 恰好调用一次</b> {@code onTerminated}（无论连接失败还是任一方向泵结束）。
+     * <p>
+     * 调用方（{@code GroupHost}）用它把"在册会话名额"与隧道的真实生命周期绑定：
+     * 名额若在接待方法返回时就归还，对端只要不断发起会话就能无界地堆起隧道线程。
+     *
+     * @param onTerminated 终止回调（可为 null）；必须是幂等且不阻塞的小动作
+     */
+    public static void bridgeToLocalPort(ReliableChannel channel, int port, String label,
+                                         Runnable onTerminated) {
         // 连接 + 两个方向的泵都是阻塞长驻任务，必须用专用线程（有界 io 池承载不了
         // "整局游戏都占着"的任务，见 ThreadPools#startBlocking）
         ThreadPools.startBlocking("tunnel-bridge", () -> {
@@ -84,10 +116,11 @@ public final class TcpTunnel {
             try {
                 socket.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 10_000);
                 socket.setTcpNoDelay(true);
-                startPumps(channel, socket, label);
+                startPumps(channel, socket, label, onTerminated);
             } catch (IOException e) {
                 LOGGER.warn("隧道 {} 连接本机端口 {} 失败: {}", label, port, e.toString());
                 closeQuietly(channel, socket);
+                Terminations.run(onTerminated);
             }
         });
     }
@@ -133,11 +166,17 @@ public final class TcpTunnel {
 
     /** 启动两个方向的泵；任一方向终止即整体拆除。 */
     private static void startPumps(ReliableChannel channel, Socket socket, String label) {
+        startPumps(channel, socket, label, null);
+    }
+
+    private static void startPumps(ReliableChannel channel, Socket socket, String label,
+                                   Runnable onTerminated) {
         AtomicBoolean closed = new AtomicBoolean(false);
         Runnable teardown = () -> {
             if (closed.compareAndSet(false, true)) {
                 closeQuietly(channel, socket);
                 LOGGER.info("隧道 {} 已拆除", label);
+                Terminations.run(onTerminated);
             }
         };
         try {
@@ -154,7 +193,7 @@ public final class TcpTunnel {
         }
     }
 
-    /** 单向字节泵（io 线程，阻塞）：EOF/异常触发整体拆除。 */
+    /** 单向字节泵（专用阻塞线程）：EOF/异常触发整体拆除。 */
     private static void pump(InputStream in, OutputStream out, String label, Runnable teardown) {
         byte[] buffer = new byte[PUMP_BUFFER_BYTES];
         try {

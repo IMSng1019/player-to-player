@@ -102,8 +102,11 @@ public final class ProxyEnvService {
             if (syncFromParent(parent)) {
                 // 定期校验：上游环境更新（服务端重启换清单）自动跟进
                 long minutes = Math.max(1, config.proxyEnvResyncMinutes);
+                // 定期轮次同样走专用线程：syncFromParent 内部 join 的是 io 池上的同步任务
+                // （EnvSyncClient.syncTo），放回 io 池就是"池内任务等池内任务"
                 resyncTask = ThreadPools.scheduler().scheduleWithFixedDelay(
-                        () -> ThreadPools.io().execute(() -> syncFromParent(parent)),
+                        () -> ThreadPools.startBlocking("proxy-env-resync",
+                                () -> syncFromParent(parent)),
                         minutes, minutes, TimeUnit.MINUTES);
                 return;
             }

@@ -148,21 +148,28 @@ class WorldIdentityTest {
     }
 
     @Test
-    void sameWorldByIdentityHashOrSeed() {
+    void strictAndRelaxedJudgementsAreDistinct() {
         CompoundTag server = levelData(13579L, true);
-        assertTrue(WorldIdentity.sameWorld(
-                        WorldIdentity.snapshot(server), WorldIdentity.snapshot(levelData(13579L, false))),
-                "内容等价的生成设置必须判为同一世界");
+        WorldIdentity.Snapshot same = WorldIdentity.snapshot(levelData(13579L, false));
+        assertTrue(WorldIdentity.sameWorldStrict(WorldIdentity.snapshot(server), same),
+                "内容等价的生成设置必须判为同一世界（严格判据）");
+        assertTrue(WorldIdentity.sameWorld(WorldIdentity.snapshot(server), same),
+                "严格成立时放宽判据必然成立");
+        assertFalse(WorldIdentity.relaxedBySeed(WorldIdentity.snapshot(server), same),
+                "严格成立时不算'命中放宽'");
 
         // 版本升级：原版 DataFixer 把旧形态迁移成新形态 —— 结构哈希必然不同，种子不变。
-        // 只比哈希会把这种升级误判成换世界并隔离掉未物化到 MCA 的耐久区块。
         CompoundTag legacy = new CompoundTag();
         CompoundTag legacyData = new CompoundTag();
         legacyData.putLong("RandomSeed", 13579L);
         legacy.put("Data", legacyData);
-        assertTrue(WorldIdentity.sameWorld(
-                        WorldIdentity.snapshot(server), WorldIdentity.snapshot(legacy)),
-                "同种子（仅 level.dat 结构被版本升级重写）必须判为同一世界");
+        WorldIdentity.Snapshot legacySnapshot = WorldIdentity.snapshot(legacy);
+        assertFalse(WorldIdentity.sameWorldStrict(WorldIdentity.snapshot(server), legacySnapshot),
+                "严格判据（客户端用）只看哈希：结构被重写即不复用旧存档");
+        assertTrue(WorldIdentity.sameWorld(WorldIdentity.snapshot(server), legacySnapshot),
+                "放宽判据（服务端用）认得同种子：避免把升级误判成换世界而隔离耐久数据");
+        assertTrue(WorldIdentity.relaxedBySeed(WorldIdentity.snapshot(server), legacySnapshot),
+                "调用方必须能识别'命中放宽'以便打可操作的 WARN");
 
         assertFalse(WorldIdentity.sameWorld(
                         WorldIdentity.snapshot(server), WorldIdentity.snapshot(levelData(24680L, true))),
@@ -172,6 +179,8 @@ class WorldIdentityTest {
                 "任一侧无法确定时不得判为同一世界（宁可隔离，不可放行旧数据）");
         assertFalse(WorldIdentity.sameWorld(null, WorldIdentity.snapshot(server)),
                 "null 视图不得判为同一世界");
+        assertFalse(WorldIdentity.sameWorldStrict(null, WorldIdentity.snapshot(server)),
+                "null 视图在严格判据下同样不成立");
     }
 
     @Test
