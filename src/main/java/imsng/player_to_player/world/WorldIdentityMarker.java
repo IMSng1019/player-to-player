@@ -23,17 +23,31 @@ public final class WorldIdentityMarker {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("player_to_player/world-identity");
 
+    /** 未记录种子时的哨兵值（用哨兵而不是 Long 装箱：避免 JSON 显式 null 引发的拆箱 NPE）。 */
+    public static final long NO_SEED = Long.MIN_VALUE;
+
     /** 身份口径版本（取自 {@link WorldIdentity#FORMAT_VERSION}）。 */
     public String formatVersion = "";
 
     /** 标记写入时的世界身份哈希；空串 = 当时无法确定身份。 */
     public String identityHash = "";
 
+    /** 标记写入时的世界种子；{@link #NO_SEED} = 当时无法确定。 */
+    public long worldSeed = NO_SEED;
+
     /** 当时的世界名（诊断用；世界名可变，不作为判定依据）。 */
     public String worldName = "";
 
     /** 标记写入时间（毫秒）。 */
     public long recordedAtEpochMillis = 0L;
+
+    /** 把标记还原成身份视图（供 {@link WorldIdentity#sameWorld} 判定）。 */
+    public WorldIdentity.Snapshot snapshot() {
+        return new WorldIdentity.Snapshot(
+                identityHash == null ? "" : identityHash,
+                worldSeed == NO_SEED ? java.util.Optional.empty()
+                        : java.util.Optional.of(worldSeed));
+    }
 
     /** 读取标记；文件不存在或损坏返回 {@code null}（按"无标记"处理）。 */
     public static WorldIdentityMarker read(Path path) {

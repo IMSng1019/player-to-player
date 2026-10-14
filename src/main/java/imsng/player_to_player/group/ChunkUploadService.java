@@ -62,20 +62,6 @@ public final class ChunkUploadService {
     private static final int BATCH_RECORD_BYTES = 4 * 1024 * 1024;
     private static final int MAX_BATCH_DELTAS = 256;
 
-    /**
-     * 单区块滞留窗口（毫秒）：上行队列里恰好只有 1 个待发区块时，先短等这一小段再决定
-     * 发单区块帧还是批次帧。
-     * <p>
-     * 为什么需要：原版存盘是<b>逐块入队</b>（存盘/卸载循环一次一个），工作线程在第一个
-     * 区块入队时就被唤醒，于是"一次卸载 100 个区块"会退化成 100 个单区块帧 ——
-     * 服务端每个帧都要 append 一次世界 WAL 并 {@code force(true)} 一次，
-     * 这就是"逐区块一次 fsync"的直接来源。短等一小段即可把这些同批区块合成一个
-     * {@code CHUNK_DATA_BATCH}：服务端一个 WAL 记录 + <b>一次</b> force 覆盖全部区块。
-     * <p>
-     * 代价：孤立区块的上行 ACK 晚 {@value} 毫秒左右（预卸载屏障随之晚完成同样时长）。
-     * 每次工作会话只滞留一次，不会持续拖延；退出流程有自己的整批打包，不受影响。
-     */
-    private static final long SINGLE_LINGER_MILLIS = 30;
 
     private final ControlConnection conn;
     private final UUID groupId;
@@ -209,16 +195,7 @@ public final class ChunkUploadService {
      * CHUNK_DATA_UPLOAD 兼容路径。批次 ACK 在服务端 WAL force 后返回。
      */
     private void drainLoop() {
-        boolean lingerUsed = false;
         while (true) {
-            if (!lingerUsed) {
-                lingerUsed = true;
-                // 只在"队列里恰好只有 1 个待发区块"时滞留：已有多个时立刻成批发送，
-                // 退出/风暴场景下不引入任何额外延迟。
-                if (hasSinglePending()) {
-                    sleepQuietly(SINGLE_LINGER_MILLIS);
-                }
-            }
             List<Candidate> candidates;
             try {
                 candidates = collectCandidates();
@@ -245,22 +222,6 @@ public final class ChunkUploadService {
                 scheduleRetry(candidates.get(0).key(), e);
                 return;
             }
-        }
-    }
-
-    /** 队列里是否恰好只有 1 个待发区块（滞留判据；不带任何副作用）。 */
-    private boolean hasSinglePending() {
-        synchronized (queue) {
-            return !shutdown && !exitFrozen && queue.size() == 1;
-        }
-    }
-
-    /** 可中断安全的短睡眠：被打断时立即返回（放弃本次滞留，不丢任务）。 */
-    private static void sleepQuietly(long millis) {
-        try {
-            Thread.sleep(millis);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
         }
     }
 

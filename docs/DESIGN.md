@@ -184,18 +184,32 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
 
 现在：固定线程数（8~32，按核数）+ 无界队列（任务排队而非新建线程/拒绝）。
 不设拒绝策略是有意的：上游有预卸载屏障、释放重试等"必须最终送达"的语义，
-丢帧会变成无限重试风暴。队列持续偏深时由看门狗打 WARN 暴露（每秒 30 秒采样一次）。
+丢帧会变成无限重试风暴。队列持续偏深时由看门狗每 30 秒采样一次、超阈值打 WARN 暴露。
 
 ### 9.2 有界池下"池内任务等待池内任务"是唯一死锁风险（改动前必读）
 
 已核对成立、改动 io 池容量或新增"任务内等待"前必须重新核对的等待闭包：
 
-- `EXIT_BEGIN` 任务 join 前一个 BEGIN 屏障 —— 前序任务 **FIFO 先出队先执行**，
+- `EXIT_BEGIN` 的**屏障任务**必须跑在 `startBlocking` 专用线程上，**不得**与业务帧共用 io 池。
+  原因：屏障在 BEGIN 任务入队**之前**就对 `writeRealtimeIfAllowed` 可见，任何"在 EXIT_BEGIN
+  之前到达、却排在它之后出队"的 claim/上行/释放帧都会 join 这个屏障；一旦这些等待者占满
+  池内线程，排在队尾的 BEGIN 任务永远拿不到线程去 `complete` 屏障 —— 固定线程池下是
+  **永久死锁**（无界 cached pool 时代每条任务都新建线程，掩盖了这个结构问题）。
+  装配点：`P2PServerService` 向 `ExitTransactionHandlers` 注入
+  `ThreadPools.exitBarrierExecutor()`（恒定单线程，与 io 池隔离；不用"每帧一条专用线程"
+  是因为这条帧由网络触发，会重新引入建线程风险）。
+  *残留*：disconnect 路径在 Netty 线程上 `awaitPendingBegins`，等待有上界（BEGIN 任务不再
+  受池容量影响）但仍可能阻塞事件循环数十毫秒 —— 属既有设计，改造需连同断连状态机一起动。
+- `EXIT_BEGIN` 任务自身 join 前一个 BEGIN 屏障 —— 前序任务 **FIFO 先出队先执行**，
   链头永不等待，故只要池内有 ≥1 条线程可推进即可；
 - claim/release/上行任务 join 自己客户端的 BEGIN 屏障 —— 屏障由 BEGIN 任务完成，
   而 BEGIN 任务只取会话条带锁（等待方在进入业务锁**之前**等待，见
   `ExitTransactionHandlers.writeRealtimeIfAllowed` 的调用位置约定）；
-- 磁盘等待（IOWorker、Journal `force(true)`）与网络等待都落在**其他**执行器上，不消耗本池；
+- 接待入站会话（`GroupHost.accept` → 读会话头）与上游环境同步循环都曾用"池内任务等池内
+  任务"的写法，已一并迁到 `startBlocking`；
+- **磁盘等待仍占用本池线程**：IOWorker 队列、`flushWorker()`、Journal `force(true)` 都是
+  在池内线程上同步阻塞的调用 —— 它们不依赖别的池任务才能完成（不构成死锁），但确实把
+  线程占住，这正是"容量按下游串行点选"的原因；
 - 断连清理、退出发布、加入/合并工作流等长驻任务一律走 `startBlocking`，**不进 io 池**。
 
 因此容量按"下游串行点"而不是"任务总数"选：fsync、批次 WAL 锁、区块分片锁都是串行的，
@@ -207,13 +221,21 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
 **都在 `ChunkDataHandlers.durableBatchLock` 内完成 append + force**，即彼此天然串行 ——
 所以在 `DurableChunkJournal` 内做 group commit（聚合多次 append 共用一次 force）
 **对逐区块热路径没有收益**（没有可合并的重叠窗口），只会在退出/`appendExitCommit`
-等本来已是整批的路径上增加风险。真正的杠杆是**减少临界区个数**：
+等本来已是整批的路径上增加风险。
 
-1. 已落地：客户端 `ChunkUploadService` 的单区块滞留窗口（队列里只剩 1 个区块时短等
-   `SINGLE_LINGER_MILLIS`），把同一次原版存盘/卸载的多个区块合成一个 `CHUNK_DATA_BATCH`
-   → 服务端一个 WAL 记录 + 一次 force 覆盖整批；
-2. 未落地：把服务端的逐区块帧改成"队列 + 成批工作线程"，一次临界区内处理 K 个区块
-   （含 `RegistryMutationJournal` 的第二条逐条 force 链，那需要真实的并发度量后再定）。
+两条逐区块 force 链的真实构成（`chunks.wal` 每区块一次 + `registry/mutations.jsonl`
+每次释放一次）在**同一把锁内**，靠"减少临界区个数"才能合并：
+
+1. **已否决的做法**：客户端 `ChunkUploadService` 的"单区块滞留窗口"（短等若干毫秒等更多
+   区块入队再发批次）曾短暂实现后<b>撤除</b>。原因：卸载存盘的 enqueue 会被
+   `claimedPredicate` 过滤（释放 ACK 已在同一临界区摘除 claim），而原版自动存盘是
+   <b>同一 tick 内同步入队</b>的，工作线程醒来时批次通常已经攒好 —— 滞留省下的基本只有
+   每个洪峰的首帧，却给孤立区块白加一次延迟。
+2. **未落地**：把服务端的逐区块帧改成"队列 + 成批工作线程"，一次临界区内处理 K 个区块
+   （含 `RegistryMutationJournal` 的第二条逐条 force 链）；需要先有并发度量（io 池队列
+   深度看门狗已就位）再决定。
+3. **顺带见效的一条**：世界身份修复后，干净区块的释放不再携带最终 NBT
+   （`requiresInitialWrite` 不再全场为真），释放路径的 force 次数自然减半。
 
 ## 10. 兼容性原则
 

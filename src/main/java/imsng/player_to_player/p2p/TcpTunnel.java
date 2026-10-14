@@ -32,7 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *       监听口（只回环、backlog=1，杜绝其他进程/主机搭车），等待本机 MC 客户端
  *       连入后双向泵送。</li>
  * </ul>
- * 泵线程跑在 {@link ThreadPools#io()}（无界缓存池，阻塞 IO 允许）；任一方向
+ * 泵线程跑在 {@link ThreadPools#startBlocking}（专用阻塞线程，不得进有界 io 池）；任一方向
  * EOF/异常即整体拆除（socket 与可靠通道一起关闭），与 TCP 连接语义一致。
  * <p>
  * 隧道建立前双方各写/读一条 {@code DataOutputStream.writeUTF} 的 JSON 头

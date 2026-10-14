@@ -124,23 +124,29 @@
 
 ## 5. 修复方案
 
-> **实施状态（2026-10-14 第二轮）**
+> **实施状态（2026-10-14 第二轮 + 第三轮复查修正）**
 > - §5 P0（客户端身份校验 + 旧存档隔离 + 门控前提）：**已实施**。新增
->   `world.WorldIdentity`（生成身份子集哈希）、`world.WorldIdentityMarker`、
->   `util.Quarantine`；落点 `client/group/LocalWorldLauncher.prepareSave`、
+>   `world.WorldIdentity`（生成身份子集哈希 + 种子视图）、`world.LocalSaveGuard`
+>   （判定/隔离/重建，放 main 源集以便 `src/test` 直接覆盖）、`world.WorldIdentityMarker`、
+>   `util.Quarantine`；落点 `client/group/LocalWorldLauncher`、
 >   `mixin/ChunkMapMixin.player_to_player$localReadOrEmpty`、`group/GroupRuntime.GroupPlan`；
 >   结果记入世界级 `config.json` 的 `worldIdentityHash`。测试：
->   `WorldIdentityTest`（10 例）、`QuarantineTest`（5 例）。
+>   `WorldIdentityTest`、`LocalSaveGuardTest`（覆盖 §8-1/§8-2/§8-3）、`QuarantineTest`、
+>   `GroupRuntimeIdentityGateTest`。
 > - **额外补的一项（原报告未列，但属同一缺陷闭环）**：服务端侧。运行期状态目录
 >   （`chunk-journal/`、`registry/`、`exit-transactions/`、`exit-payloads/`）不随世界名
 >   分割，换世界后旧 WAL 会被 `RegionFileProbe` 当作"服务端已有数据"，把**旧世界区块
 >   下发给新世界**——客户端修好了也白搭。现由 `P2PServerService.quarantineStaleWorldState`
->   在世界身份标记变化时整体隔离这些目录。
+>   在世界身份标记变化时整体隔离这些目录（MySQL 后端不在其列，启动日志会 WARN）。
 > - §5 P1（协议层 `worldId`）：**未实施**，仍在队列。已知缝隙：worldId 只加在帧 JSON
 >   时不进 WAL，重启恢复后旧 WAL 记录仍会物化写 MCA；要彻底闭环需进 `ChunkDeltaBatch`
 >   格式（会破坏既有 WAL 可重放性，需单独设计）。
-> - 身份口径偏离原建议一处：**不把 `Data.DataVersion` 算进身份**。它随版本升级变化，
->   而版本升级后本地 region 数据仍属同一世界（DataFixer 会升级），算进去会造成无谓隔离。
+> - 身份口径偏离原建议两处（都有反证支撑，见 `DESIGN.md` 与 `WorldIdentity` 注释）：
+>   ① **不把 `Data.DataVersion` 算进身份** —— 它随版本升级变化，而升级后本地 region
+>   仍属同一世界（DataFixer 会升级），算进去会造成无谓隔离；
+>   ② **同种子即判同世界**（`WorldIdentity.sameWorld`）—— 跨版本升级时原版会重写
+>   `level.dat` 的生成设置结构，只比结构哈希会把升级误判成换世界、隔离掉未物化到 MCA
+>   的耐久区块。代价是"同种子重建世界"识别不了，已在 HANDOFF §3 记为需手工止血的情形。
 
 
 

@@ -147,6 +147,57 @@ class WorldIdentityTest {
         assertFalse(WorldIdentity.shortId("abc").isEmpty());
     }
 
+    @Test
+    void sameWorldByIdentityHashOrSeed() {
+        CompoundTag server = levelData(13579L, true);
+        assertTrue(WorldIdentity.sameWorld(
+                        WorldIdentity.snapshot(server), WorldIdentity.snapshot(levelData(13579L, false))),
+                "内容等价的生成设置必须判为同一世界");
+
+        // 版本升级：原版 DataFixer 把旧形态迁移成新形态 —— 结构哈希必然不同，种子不变。
+        // 只比哈希会把这种升级误判成换世界并隔离掉未物化到 MCA 的耐久区块。
+        CompoundTag legacy = new CompoundTag();
+        CompoundTag legacyData = new CompoundTag();
+        legacyData.putLong("RandomSeed", 13579L);
+        legacy.put("Data", legacyData);
+        assertTrue(WorldIdentity.sameWorld(
+                        WorldIdentity.snapshot(server), WorldIdentity.snapshot(legacy)),
+                "同种子（仅 level.dat 结构被版本升级重写）必须判为同一世界");
+
+        assertFalse(WorldIdentity.sameWorld(
+                        WorldIdentity.snapshot(server), WorldIdentity.snapshot(levelData(24680L, true))),
+                "种子不同就是不同世界：这是识别'服务端换世界'的唯一依据");
+        assertFalse(WorldIdentity.sameWorld(
+                        WorldIdentity.snapshot(server), WorldIdentity.Snapshot.unknown()),
+                "任一侧无法确定时不得判为同一世界（宁可隔离，不可放行旧数据）");
+        assertFalse(WorldIdentity.sameWorld(null, WorldIdentity.snapshot(server)),
+                "null 视图不得判为同一世界");
+    }
+
+    @Test
+    void snapshotCarriesSeedFromEitherForm() {
+        assertEquals(java.util.Optional.of(13579L),
+                WorldIdentity.snapshot(levelData(13579L, true)).seed(),
+                "新形态从 WorldGenSettings.seed 取种子");
+        WorldIdentity.Snapshot snapshot = WorldIdentity.snapshot(levelData(13579L, true));
+        assertEquals(snapshot.identityHash().substring(0, 8), snapshot.shortId(),
+                "shortId 是身份哈希的前缀（不是种子）");
+        assertTrue(snapshot.known(), "有 WorldGenSettings 的存档必然给定身份");
+
+        CompoundTag legacy = new CompoundTag();
+        CompoundTag legacyData = new CompoundTag();
+        legacyData.putLong("DataVersion", 100);
+        CompoundTag root = new CompoundTag();
+        root.put("Data", legacyData);
+        assertTrue(WorldIdentity.snapshot(root).seed().isEmpty(),
+                "两种形态都没有种子时为空（调用方据此按无法比较处理）");
+
+        assertTrue(WorldIdentity.Snapshot.unknown().seed().isEmpty(),
+                "unknown 视图不带种子");
+        assertFalse(WorldIdentity.Snapshot.unknown().known(),
+                "unknown 视图必须报'未知'，调用方据此拒绝复用旧存档");
+    }
+
     /** 构造一份 level.dat 形态的根标签；{@code seedFirst} 控制键插入顺序。 */
     private static CompoundTag levelData(long seed, boolean seedFirst) {
         CompoundTag generator = new CompoundTag();

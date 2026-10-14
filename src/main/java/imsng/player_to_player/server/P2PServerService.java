@@ -276,6 +276,10 @@ public final class P2PServerService {
                     groups.removeClient(manifest.clientId());
                 },
                 imsng.player_to_player.util.ThreadPools.io(),
+                // BEGIN 屏障任务必须与业务帧分池：它排在 io 队列里时，池内等待该屏障的
+                // 业务帧会把线程占满，形成永久死锁（见 ExitTransactionHandlers 完整构造器）。
+                // 用恒定单线程执行器而不是"每帧一条专用线程"——这条帧是网络触发的。
+                imsng.player_to_player.util.ThreadPools.exitBarrierExecutor(),
                 HelloHandler::withCurrentSession,
                 durableJournal);
         exits.register(control);
@@ -463,84 +467,110 @@ public final class P2PServerService {
      * <p>
      * 背景：{@code chunk-journal/}、{@code registry/}、{@code exit-transactions/}、
      * {@code exit-payloads/} 都在 {@code player-to-player/} 根下、<b>不随世界名分割</b>。
-     * 服务端换世界/重置世界后（{@code level.dat} 的 {@code WorldGenSettings} 改变）：
+     * 服务端换世界后才能辨识出旧的运行期状态：
      * <ul>
      *   <li>旧 WAL 里的区块会被 {@code RegionFileProbe.hasServerData} 判为"服务端已有数据"，
      *       于是旧世界的区块被下发给新世界的客户端；</li>
      *   <li>旧注册表的占用/回执记录属于已不存在的组。</li>
      * </ul>
-     * 因此身份不一致时把这四个目录<b>整体隔离</b>（改名保留，绝不删除），并从空状态启动。
+     * 因此判为"换世界"时把这四个目录<b>整体隔离</b>（改名保留，绝不删除），并从空状态启动。
      * <p>
-     * 判定纪律（不做"猜测式清理"）：
+     * 判定纪律（不做"猜测式清理"，误清理会丢掉未物化到 MCA 的耐久数据 —— 客户端收到
+     * durable ACK 后已删除本地副本）：
      * <ul>
+     *   <li>同世界判定用 {@link WorldIdentity#sameWorld}：身份哈希相等，或两侧种子都已知且
+     *       相等（跨版本升级时原版 DataFixer 会重写 {@code level.dat} 的生成设置结构，
+     *       结构哈希变化但世界没换 —— 只比哈希会把这类升级误判成换世界）；</li>
      *   <li>标记缺失（本功能上线前的老部署）：<b>不隔离</b>，只 WARN —— 无标记时无法区分
-     *       "同一世界的既有状态"与"上一个世界的残留状态"，而误隔离会丢掉尚未物化到 MCA
-     *       的耐久数据（客户端收到 durable ACK 后已删除本地副本）；</li>
-     *   <li>标记口径版本不一致：只更新标记，不隔离（哈希不可比，不做结论）；</li>
-     *   <li>当前世界身份无法确定：保留标记与状态不动，只 WARN（宁可不清理，不可误清理）。</li>
+     *       "同一世界的既有状态"与"上一个世界的残留状态"；</li>
+     *   <li>标记口径版本不一致或当前世界身份无法确定：只 WARN，不隔离（不下结论）；
+     *       标记里的显式 {@code null} 字段同样按"无法比较"处理（不能让启动挂掉）；</li>
+     *   <li>反过来说，<b>同种子重建世界（删 region 保留 level.dat、从同世界备份还原）识别
+     *       不了</b>：这类操作要按文档手工隔离状态目录（见 HANDOFF §3 的一次性止血说明）。</li>
      * </ul>
      */
     private static void quarantineStaleWorldState(P2PPaths paths, Path worldRoot,
                                                   String worldName) {
         Path levelDat = worldRoot.resolve("level.dat");
-        java.util.Optional<String> current = WorldIdentity.ofLevelDatFile(levelDat);
+        WorldIdentity.Snapshot current = WorldIdentity.snapshot(levelDat);
         Path markerPath = paths.worldIdentityMarker();
         WorldIdentityMarker previous = WorldIdentityMarker.read(markerPath);
         long now = System.currentTimeMillis();
 
-        if (previous != null && previous.formatVersion.equals(WorldIdentity.FORMAT_VERSION)) {
-            if (current.isPresent() && !previous.identityHash.isBlank()
-                    && !previous.identityHash.equals(current.get())) {
-                String label = WorldIdentity.shortId(previous.identityHash);
-                LOGGER.warn("世界身份已变化（标记={} 当前={}），隔离旧世界遗留的 P2P 运行期状态 —— "
-                                + "旧 WAL 会把旧世界区块当作服务端已有数据下发，必须整体作废",
-                        WorldIdentity.shortId(previous.identityHash),
-                        WorldIdentity.shortId(current.get()));
-                for (Path state : List.of(
-                        paths.durableChunkJournalDir(), paths.registryDir(),
-                        paths.exitTransactionsDir(), paths.exitPayloadsDir())) {
-                    try {
-                        Path stale = Quarantine.quarantine(state, label, now);
-                        if (stale != null) {
-                            LOGGER.warn("已隔离: {} → {}", state, stale);
-                        }
-                    } catch (Exception e) {
-                        LOGGER.error("隔离陈旧状态目录失败（该目录可能仍影响新区块判定，请手工改名）: {}",
-                                state, e);
-                    }
-                }
-            }
-        } else if (previous == null) {
-            boolean anyState = Files.isDirectory(paths.durableChunkJournalDir())
-                    || Files.isDirectory(paths.registryDir())
-                    || Files.isDirectory(paths.exitTransactionsDir())
-                    || Files.isDirectory(paths.exitPayloadsDir());
-            if (anyState && current.isPresent()) {
+        if (previous == null) {
+            if (current.known() && hasAnyRuntimeState(paths)) {
                 LOGGER.warn("检测到 P2P 运行期状态但缺少世界身份标记（首次启用世界身份校验）。"
                         + "若世界刚被替换/重置过，请手工把 player-to-player/ 下的 chunk-journal、"
                         + "registry、exit-transactions、exit-payloads 改名隔离，否则旧世界的区块"
                         + "会被当作服务端已有数据下发");
             }
+        } else if (!WorldIdentity.FORMAT_VERSION.equals(previous.formatVersion)) {
+            LOGGER.warn("世界身份标记口径为 {}（当前 {}），无法比较：保留运行期状态不动",
+                    previous.formatVersion, WorldIdentity.FORMAT_VERSION);
+        } else if (current.known() && !WorldIdentity.sameWorld(previous.snapshot(), current)) {
+            WorldIdentity.Snapshot recorded = previous.snapshot();
+            LOGGER.warn("世界身份已变化（标记={} 种子={} / 当前={} 种子={}），"
+                            + "隔离旧世界遗留的 P2P 运行期状态 —— 旧 WAL 会把旧世界区块当作"
+                            + "服务端已有数据下发，必须整体作废",
+                    recorded.shortId(), recorded.seed().orElse(null),
+                    current.shortId(), current.seed().orElse(null));
+            for (Path state : List.of(
+                    paths.durableChunkJournalDir(), paths.registryDir(),
+                    paths.exitTransactionsDir(), paths.exitPayloadsDir())) {
+                try {
+                    Path stale = Quarantine.quarantine(state, recorded.shortId(), now);
+                    if (stale != null) {
+                        LOGGER.warn("已隔离: {} → {}", state, stale);
+                    }
+                } catch (Exception e) {
+                    LOGGER.error("隔离陈旧状态目录失败（该目录可能仍影响新区块判定，请手工改名）: {}",
+                            state, e);
+                }
+            }
+            if (mysqlBackendConfigured()) {
+                LOGGER.warn("注意：注册表后端配置为 MySQL，它的占用记录不在这四个目录里 —— "
+                        + "换世界后请自行清理 MySQL 中的旧占用记录，否则该世界的区块会一直"
+                        + "被判为'被其他组占用'而无法加载");
+            }
         }
 
-        if (current.isEmpty()) {
+        if (!current.known()) {
             LOGGER.warn("当前世界身份无法确定（{} 缺 WorldGenSettings/RandomSeed），"
                     + "保留既有身份标记与运行期状态不动", levelDat);
             return;
         }
         WorldIdentityMarker marker = new WorldIdentityMarker();
         marker.formatVersion = WorldIdentity.FORMAT_VERSION;
-        marker.identityHash = current.get();
+        marker.identityHash = current.identityHash();
+        marker.worldSeed = current.seed().orElse(WorldIdentityMarker.NO_SEED);
         marker.worldName = worldName == null ? "" : worldName;
         marker.recordedAtEpochMillis = now;
         try {
             marker.save(markerPath);
-            LOGGER.info("世界身份已记录: {} (identity={})", markerPath,
-                    WorldIdentity.shortId(current.get()));
+            LOGGER.info("世界身份已记录: {} (identity={} 种子={})", markerPath,
+                    current.shortId(), current.seed().orElse(null));
         } catch (Exception e) {
-            LOGGER.error("世界身份标记写入失败（不影响运行，但下次启动无法识别换世界）: {}",
-                    markerPath, e);
+            // 写不进去就意味着下次启动仍读旧标记：若这次刚判过"换世界"，下次会再隔离一遍
+            // 本次会话新建的状态目录（尚未物化到 MCA 的耐久区块会一起被改名）。
+            // 因此不能只说"不影响运行"——把后果写清楚，让管理员尽快修好权限/占用问题。
+            LOGGER.error("世界身份标记写入失败: {} —— 下次启动会按旧标记重新判定；"
+                    + "若本次刚判过换世界，本次会话新写入的运行期状态（含未物化到 MCA 的耐久区块）"
+                    + "会在下次启动时被再次隔离，请立即修复该文件的写入权限/占用", markerPath, e);
         }
+    }
+
+    /** 四个运行期状态目录里是否已有内容（用于"首次启用身份校验"的提示）。 */
+    private static boolean hasAnyRuntimeState(P2PPaths paths) {
+        return Files.isDirectory(paths.durableChunkJournalDir())
+                || Files.isDirectory(paths.registryDir())
+                || Files.isDirectory(paths.exitTransactionsDir())
+                || Files.isDirectory(paths.exitPayloadsDir());
+    }
+
+    /** 注册表后端是否配置为 MySQL（其占用记录不在本地状态目录里，换世界需另行清理）。 */
+    private static boolean mysqlBackendConfigured() {
+        GlobalConfig config = NodeContext.get().config();
+        return config != null && config.mysql != null && config.mysql.enabled;
     }
 
     private static void sleepUninterruptibly(long duration, TimeUnit unit) {

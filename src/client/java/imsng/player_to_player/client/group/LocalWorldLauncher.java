@@ -8,7 +8,7 @@ import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.group.GroupRuntime;
 import imsng.player_to_player.group.PlayerStateFiles;
 import imsng.player_to_player.netproto.ControlConnection;
-import imsng.player_to_player.util.Quarantine;
+import imsng.player_to_player.world.LocalSaveGuard;
 import imsng.player_to_player.world.WorldIdentity;
 import net.minecraft.client.Minecraft;
 import net.minecraft.nbt.CompoundTag;
@@ -16,12 +16,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.util.Optional;
 import java.util.UUID;
-import java.util.stream.Stream;
 
 /**
  * 本地组世界启动器（主客户端，Phase 2；规范"主客户端……作为它这个组客户端的服务端"）。
@@ -107,64 +103,13 @@ public final class LocalWorldLauncher {
     /**
      * 构建本地存档：身份一致的既有存档直接复用，否则隔离旧存档并从环境骨架重建。
      * <p>
-     * 环境目录里的世界骨架不含 region/poi/entities（服务端扫描排除），复制量
-     * 通常只有几 MB；已存在的世界元数据不整体覆盖，玩家状态由 prepare 单独刷新。
+     * 判定与隔离逻辑在 {@link LocalSaveGuard}（src/main，可被 src/test 直接覆盖）——
+     * 这里只负责把路径按 <b>P2PPaths</b> 口径解析出来。世界身份校验是数据完整性必需项，
+     * 详见该类的类注释。
      *
-     * <h2>世界身份校验（数据完整性必需，勿简化）</h2>
-     * 世界文件夹键只有 {@code IP+世界名}：服务端换世界/重置世界/从备份还原后，
-     * 客户端仍会走到这里。若不比对身份就直接"延续既有状态"，本地保存的旧世界
-     * {@code region/*.mca} 会成为集成服务端的区块来源（服务端说"无数据"时经
-     * 门控回退到本地磁盘读），玩家看到旧地形；退出时这些旧区块又被整体上行，
-     * 覆盖服务端 MCA —— 双向静默损坏。
-     *
-     * @return 已对齐的世界身份哈希；空串 = 服务端 level.dat 无法给出身份（此时
-     *         旧本地存档一律隔离，从骨架重建，故对齐关系仍成立）
+     * @return 已对齐的世界身份哈希；空串 = 服务端 level.dat 无法给出身份
      */
     private static String prepareSave(Path envWorldDir, Path saveDir) throws IOException {
-        Path envLevelDat = envWorldDir.resolve("level.dat");
-        if (!Files.isRegularFile(envLevelDat)) {
-            throw new IOException("环境目录缺少世界骨架（level.dat）: " + envWorldDir
-                    + " —— 环境同步未完成或服务端未把世界目录纳入环境清单");
-        }
-        Optional<String> serverIdentity = WorldIdentity.ofLevelDatFile(envLevelDat);
-        if (serverIdentity.isEmpty()) {
-            LOGGER.warn("环境骨架 level.dat 无法提取世界身份（缺 WorldGenSettings/RandomSeed），"
-                    + "本次不复用既有本地存档: {}", envLevelDat);
-        }
-        Path localLevelDat = saveDir.resolve("level.dat");
-        if (Files.isRegularFile(localLevelDat)) {
-            Optional<String> localIdentity = WorldIdentity.ofLevelDatFile(localLevelDat);
-            if (serverIdentity.isPresent() && localIdentity.isPresent()
-                    && serverIdentity.get().equals(localIdentity.get())) {
-                LOGGER.info("本地存档世界身份校验通过，延续既有状态: {} (identity={})",
-                        saveDir, WorldIdentity.shortId(serverIdentity.get()));
-                return serverIdentity.get();
-            }
-            // 不一致（或任一侧无法确定身份）：隔离而非删除 —— 旧存档可能还有人工价值，
-            // 但绝不能参与后续读写。必须整体改名：只删 level.dat 会让旧 region 残留，
-            // 重建式复制不会清理多余文件，旧区块仍会被本地磁盘回退读命中。
-            Path stale = Quarantine.quarantine(saveDir,
-                    localIdentity.map(WorldIdentity::shortId).orElse("unknown"),
-                    System.currentTimeMillis());
-            LOGGER.warn("服务端世界身份已变化，已隔离旧本地存档并重建：服务端={} 本地={} 旧存档 → {}",
-                    serverIdentity.map(WorldIdentity::shortId).orElse("unknown"),
-                    localIdentity.map(WorldIdentity::shortId).orElse("unknown"), stale);
-        }
-        LOGGER.info("从环境骨架构建本地存档: {} → {} (identity={})", envWorldDir, saveDir,
-                serverIdentity.map(WorldIdentity::shortId).orElse("unknown"));
-        try (Stream<Path> walk = Files.walk(envWorldDir)) {
-            for (Path source : (Iterable<Path>) walk::iterator) {
-                Path target = saveDir.resolve(envWorldDir.relativize(source).toString());
-                if (Files.isDirectory(source)) {
-                    Files.createDirectories(target);
-                } else {
-                    Files.createDirectories(target.getParent());
-                    Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING);
-                }
-            }
-        }
-        // session.lock 是运行期锁文件，跟着骨架复制过来会让引导误判"存档被占用"
-        Files.deleteIfExists(saveDir.resolve("session.lock"));
-        return serverIdentity.orElse("");
+        return LocalSaveGuard.prepareSave(envWorldDir, saveDir, System.currentTimeMillis());
     }
 }

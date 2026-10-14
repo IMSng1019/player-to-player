@@ -92,6 +92,19 @@ public final class ThreadPools {
     /** 长驻阻塞线程命名序号（p2p-blocking-<名字>-<序号>）。 */
     private static final AtomicInteger BLOCKING_SEQ = new AtomicInteger();
 
+    /**
+     * EXIT_BEGIN 屏障任务专用执行器：**恒定一条**线程，与 io 池完全隔离。
+     * <p>
+     * 用途见 {@code ExitTransactionHandlers} 完整构造器的死锁说明：BEGIN 任务排在业务帧
+     * 同一个池里时，等待该屏障的业务帧会把池内线程占满，BEGIN 任务永远排不上 → 永久死锁。
+     * <p>
+     * 为什么是单线程而不是"每帧一条专用线程"：EXIT_BEGIN 是<b>网络帧</b>触发的，每帧建一条
+     * 线程等于把刚修掉的 native 线程耗尽风险重新引入（同一 clientId 的 BEGIN 本来就被屏障链
+     * 串行化，跨客户端也只是一次退出事务的登记，单线程足够且线程数恒定）。
+     */
+    private static final ExecutorService EXIT_BARRIER =
+            Executors.newSingleThreadExecutor(namedFactory("p2p-exit-begin"));
+
     static {
         // 队列深度看门狗：低频采样，偏深时告警（区分"线程不够"与"下游串行点堵住"）
         SCHEDULER.scheduleWithFixedDelay(() -> {
@@ -174,6 +187,14 @@ public final class ThreadPools {
         return COMPUTE;
     }
 
+    /**
+     * EXIT_BEGIN 屏障任务专用执行器（恒定单线程，与 io 池隔离）。
+     * <b>不要</b>把普通业务帧丢进来：它是串行的，会把所有客户端的退出登记排队。
+     */
+    public static ExecutorService exitBarrierExecutor() {
+        return EXIT_BARRIER;
+    }
+
     /** 定时调度线程池（心跳、周期落盘、超时检查）。注意任务体要短，重活丢给 io()/compute()。 */
     public static ScheduledExecutorService scheduler() {
         return SCHEDULER;
@@ -206,6 +227,7 @@ public final class ThreadPools {
         IO.shutdown();
         COMPUTE.shutdown();
         SCHEDULER.shutdown();
+        EXIT_BARRIER.shutdown();
         try {
             //noinspection ResultOfMethodCallIgnored
             IO.awaitTermination(2, TimeUnit.SECONDS);

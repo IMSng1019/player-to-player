@@ -78,6 +78,99 @@ public final class WorldIdentity {
     }
 
     /**
+     * 世界身份视图：身份哈希 + 世界种子。
+     * <p>
+     * 为什么要带种子：身份哈希的输入是 {@code WorldGenSettings} 的<b>结构</b>，而
+     * {@code level.dat} 是原版自己会在存盘时整体重写的文件 —— 跨版本升级时 DataFixer
+     * 会把旧形态（{@code RandomSeed}/{@code Generator}）迁移成新形态
+     * （{@code WorldGenSettings}），结构哈希必然变化而世界没换。种子是两侧都稳定的锚点，
+     * 用来把这类"结构变了、世界没变"的情形与"真的换世界"区分开。
+     *
+     * @param identityHash 身份哈希；空串 = 无法确定
+     * @param seed         世界种子；空 = 该存档没有可用的种子字段
+     */
+    public record Snapshot(String identityHash, java.util.Optional<Long> seed) {
+
+        /** 无法确定的身份视图（文件缺失/损坏/缺少身份字段）。 */
+        public static Snapshot unknown() {
+            return new Snapshot("", java.util.Optional.empty());
+        }
+
+        /** 是否给出了可用的身份哈希。 */
+        public boolean known() {
+            return identityHash != null && !identityHash.isEmpty();
+        }
+
+        /** 短标识（日志/隔离目录名用）。 */
+        public String shortId() {
+            return WorldIdentity.shortId(identityHash);
+        }
+    }
+
+    /**
+     * 两份身份视图是否属于同一个世界。
+     * <p>
+     * 判定顺序：① 身份哈希相等 → 同世界；② 否则两侧种子都已知且相等 → 同世界
+     * （版本升级重写生成设置结构但世界未换）；③ 其余（含任一侧无法确定）→ <b>不是</b>同世界。
+     * <p>
+     * <b>已知边界</b>：同种子不同生成器配置（如 amplification）会被判为同世界 —— 这是
+     * 为了让"跨版本升级"不误判而付出的代价；"同种子重建世界"同理识别不了（那需要世界实例
+     * UUID，属计划中的 P1）。
+     */
+    public static boolean sameWorld(Snapshot first, Snapshot second) {
+        if (first == null || second == null) {
+            return false;
+        }
+        if (first.known() && second.known()
+                && first.identityHash().equals(second.identityHash())) {
+            return true;
+        }
+        return first.seed().isPresent() && second.seed().isPresent()
+                && first.seed().get().equals(second.seed().get());
+    }
+
+    /** 读取 level.dat 文件并给出身份视图；文件缺失/损坏时给出 {@link Snapshot#unknown()}。 */
+    public static Snapshot snapshot(Path levelDat) {
+        if (levelDat == null || !Files.isRegularFile(levelDat)) {
+            return Snapshot.unknown();
+        }
+        try {
+            CompoundTag root = NbtIo.readCompressed(levelDat,
+                    NbtAccounter.create(MAX_LEVEL_DAT_BYTES));
+            return snapshot(root);
+        } catch (IOException | RuntimeException e) {
+            LOGGER.warn("读取 level.dat 提取世界身份失败（按无法确定处理）: {}", levelDat, e);
+            return Snapshot.unknown();
+        }
+    }
+
+    /** 从一个已解析的 level.dat 根标签给出身份视图。 */
+    public static Snapshot snapshot(CompoundTag root) {
+        return new Snapshot(ofLevelData(root).orElse(""), seedOf(root));
+    }
+
+    /**
+     * 提取世界种子：优先 {@code Data.WorldGenSettings.seed}，回退 {@code Data.RandomSeed}。
+     *
+     * @return 种子；两个字段都不存在时为空
+     */
+    public static java.util.Optional<Long> seedOf(CompoundTag root) {
+        if (root == null || !root.contains(DATA, Tag.TAG_COMPOUND)) {
+            return java.util.Optional.empty();
+        }
+        CompoundTag data = root.getCompound(DATA);
+        if (data.contains(WORLD_GEN_SETTINGS, Tag.TAG_COMPOUND)
+                && data.getCompound(WORLD_GEN_SETTINGS).contains("seed", Tag.TAG_LONG)) {
+            return java.util.Optional.of(
+                    data.getCompound(WORLD_GEN_SETTINGS).getLong("seed"));
+        }
+        if (data.contains(RANDOM_SEED, Tag.TAG_LONG)) {
+            return java.util.Optional.of(data.getLong(RANDOM_SEED));
+        }
+        return java.util.Optional.empty();
+    }
+
+    /**
      * 从一个已解析的 level.dat 根标签提取世界身份哈希。
      *
      * @return 身份哈希（小写十六进制 SHA-256）；无法确定身份时返回 {@link Optional#empty()}

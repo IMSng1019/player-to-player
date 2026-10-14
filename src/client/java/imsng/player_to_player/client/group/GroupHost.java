@@ -59,8 +59,12 @@ public final class GroupHost {
                 if (initiator) {
                     return;
                 }
-                ThreadPools.io().execute(() ->
-                        accept(sessionId, String.valueOf(peerClientId), transport));
+                // 接待一条入站会话要阻塞等对端发会话头（最长 15 秒）并长期持有隧道，
+                // 属长驻阻塞任务：专用线程。放进有界 io 池时，多条会话的 accept 会把
+                // 池内线程全部占住，而它们各自等待的"读会话头"任务同样要排在这个池上，
+                // 结果是全部等到 15 秒超时、会话失败（无界 cached pool 时代掩盖了这一点）。
+                ThreadPools.startBlocking("host-accept",
+                        () -> accept(sessionId, String.valueOf(peerClientId), transport));
             };
 
     /** 宿主监听器的成对注册槽；reset 会可靠地从 P2PSessions 摘除当前实例。 */
@@ -252,9 +256,11 @@ public final class GroupHost {
     /** 读会话头（带总超时：inputStream 无数据时最多阻塞到超时）。 */
     private static String readHeaderWithTimeout(ReliableChannel channel) throws Exception {
         // TcpTunnel.readHeader 阻塞在可靠通道输入流上；用 future 限时兜底 ——
-        // 死会话（对端建完连接即消失）不该占住 io 线程与通道资源
+        // 死会话（对端建完连接即消失）不该占住线程与通道资源。
+        // 读取任务走专用线程而不是 io 池：超时兜底依赖"这个任务真的被调度到"，
+        // 排在有界池队列尾部会让 15 秒超时变成常态失败。
         var future = new java.util.concurrent.CompletableFuture<String>();
-        ThreadPools.io().execute(() -> {
+        ThreadPools.startBlocking("host-header", () -> {
             try {
                 future.complete(TcpTunnel.readHeader(channel));
             } catch (Exception e) {

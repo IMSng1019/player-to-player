@@ -90,8 +90,9 @@ public final class ProxyEnvService {
         relay.setExtraHandlers((ControlServer control) -> EnvSyncServerHandlers.register(
                 control, snapshots, config));
 
-        // 上游同步循环（io 线程）：首轮立即，失败退避重试；成功后转定期校验
-        ThreadPools.io().execute(() -> initialSyncLoop(parent));
+        // 上游同步循环：首轮立即，失败退避重试；成功后转定期校验。整条循环在成功前不会
+        // 返回（"直到成功或服务停止"），属长驻阻塞任务 —— 专用线程，不占有界 io 池。
+        ThreadPools.startBlocking("proxy-env-sync", () -> initialSyncLoop(parent));
         return true;
     }
 

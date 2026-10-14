@@ -28,7 +28,8 @@ import java.util.function.Consumer;
  *       SessionCrypto 加密发出；载荷上限 {@value #MAX_PAYLOAD_BYTES} 字节，
  *       超限抛 IllegalArgumentException —— UDP 单报文受 IP 分片与 MTU 制约，
  *       更大数据的<b>应用层分片重组留 Phase 2</b>（预同步大块数据需要）；</li>
- *   <li><b>接收</b>：专属循环跑在 {@code ThreadPools.io()} 上阻塞 receive，
+ *   <li><b>接收</b>：专属循环跑在 {@link ThreadPools#startBlocking}（每通道一条常驻
+ *       阻塞线程，不得占用有界 io 池）上阻塞 receive，
  *       {@link #close()} 关 socket 使其以异常退出；解密失败/重放/畸形包
  *       静默丢弃（入站按不可信处理）；</li>
  *   <li><b>keepalive</b>：{@value #KEEPALIVE_INTERVAL_SECONDS} 秒无业务发送则
@@ -188,7 +189,7 @@ public final class P2PChannel implements P2PTransport {
         }
     }
 
-    /** 接收循环（IO 线程）：阻塞收包 → 过滤来源 → 解密 → 分发。 */
+    /** 接收循环（本通道专属阻塞线程）：阻塞收包 → 过滤来源 → 解密 → 分发。 */
     private void receiveLoop() {
         byte[] buf = new byte[RECV_BUF_BYTES];
         DatagramPacket packet = new DatagramPacket(buf, buf.length);

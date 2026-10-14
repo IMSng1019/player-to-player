@@ -21,8 +21,8 @@
 
 | 优先级 | 事项 | 关键位置 | 验收 | 状态 |
 |--------|------|----------|------|------|
-| **P0** | **服务端 native 线程耗尽**：`ThreadPools.io()` 是无界 cached pool，服务端把**逐区块**任务丢进去（解压/校验/物化/释放），每条任务还要在全局锁与逐区块 `channel.force(true)` 上阻塞 → 本次会话创建 ≥921 个线程后 `OutOfMemoryError: unable to create native thread`，连接被掐断、组解散 | `util/ThreadPools.java:26-27`、`server/ChunkDataHandlers.java:208/224/304/396`、`server/ExitTransactionHandlers.java`（`executor.execute`）、`server/DurableChunkJournal.java:290-316` | 以 2000 个逐区块任务压测，线程数有上界、无 OOM；顺带把"逐区块一次 fsync"合并成批 | **✅ 已实施**（2026-10-14 第二轮：io 池改固定线程数+无界队列、长驻任务迁 `startBlocking`、客户端单区块滞留窗口合并批次；`ThreadPoolsTest` 2000 任务压测断言上界。**journal 层 group commit 经论证对热路径无收益，见 DESIGN §9.3**） |
-| **P0** | **世界身份错配**：世界文件夹键只有 `IP+世界名`，客户端见到本地 `level.dat` 就"延续既有状态"，不比对种子 → 换世界后继续用旧本地世界，退出再覆盖服务端 MCA（双向污染，双向都要清） | `config/P2PPaths.java:115-116`、`client/group/LocalWorldLauncher.java:98-102`、`mixin/ChunkMapMixin.java:130-135`、`server/ChunkDataHandlers.java:265-281` | 身份不一致时隔离旧存档并从环境骨架重建；门控 `localRead` 回退加"身份已校验"前提 | **✅ 已实施**（2026-10-14 第二轮：`world.WorldIdentity` + `LocalWorldLauncher.prepareSave` + 门控 + 服务端 `quarantineStaleWorldState`；待你实测） |
+| **P0** | **服务端 native 线程耗尽**：`ThreadPools.io()` 是无界 cached pool，服务端把**逐区块**任务丢进去（解压/校验/物化/释放），每条任务还要在全局锁与逐区块 `channel.force(true)` 上阻塞 → 本次会话创建 ≥921 个线程后 `OutOfMemoryError: unable to create native thread`，连接被掐断、组解散 | `util/ThreadPools.java:26-27`、`server/ChunkDataHandlers.java:208/224/304/396`、`server/ExitTransactionHandlers.java`（`executor.execute`）、`server/DurableChunkJournal.java:290-316` | 以 2000 个逐区块任务压测，线程数有上界、无 OOM | **✅ 已实施**（io 池改固定线程数 8~32 + 无界队列；长驻任务迁 `ThreadPools.startBlocking`；`ThreadPoolsTest` 以 2000 任务断言上界**并**断言长驻线程不占池。§9.2/§9.3：BEGIN 屏障任务因死锁必须走专用线程；"fsync 合并"经论证后**未做**并撤回了无效的客户端滞留窗口，理由见 DESIGN §9.3） |
+| **P0** | **世界身份错配**：世界文件夹键只有 `IP+世界名`，客户端见到本地 `level.dat` 就"延续既有状态"，不比对种子 → 换世界后继续用旧本地世界，退出再覆盖服务端 MCA（双向污染，双向都要清） | `config/P2PPaths.java:115-116`、`client/group/LocalWorldLauncher.java:98-102`、`mixin/ChunkMapMixin.java:130-135`、`server/ChunkDataHandlers.java:265-281` | 身份不一致时隔离旧存档并从环境骨架重建；门控 `localRead` 回退加"身份已校验"前提 | **✅ 已实施**（`world.WorldIdentity` + `world.LocalSaveGuard`（可测）+ 门控 + 服务端 `quarantineStaleWorldState`；同一世界判定含"同种子"放宽以免版本升级误隔离。**残留**：同种子重建世界识别不了，见本文档 §3 止血说明；待你实测） |
 | P1 | 协议层 `worldId`：`HELLO_ACK` 下发世界身份，上行帧携带，服务端不匹配即拒写 MCA（加性字段，不升 `Protocol.VERSION`） | `netproto/HelloHandler.java`、`server/ChunkDataHandlers.java` | 伪造不匹配 worldId 的上行被拒且未调用 `chunkMap.write` | 未开始 |
 | P1 | 退出/运行期传输收敛：4 MiB 单帧挤 15 秒固定超时 + 失败整事务重放 → 512 KiB 分片 + 按载荷线性超时预算（`15000 + bytes/8KiB`）+ 重连先查 `EXIT_STATUS` 断点续传 | `group/ExitTransactionClient.java:34/82-130/162-201`、`netproto/NettyControlConnection.java:107-122`、`group/ChunkUploadService.java:62/327-328/419-420` | 60 KB/s 慢链路夹具下旧组合必超时、新组合单遍收敛；断线后只补缺失批 | 未开始（运行期已实测触发超时：`CHUNK_DATA_BATCH _rid=29606`） |
 | P1 | 分离丢数据：`forgetLocal` 前不落盘、不等未确认 ACK，放手后三条写回路径全拒（最多丢一个自动存盘周期） | `group/SplitMonitor.java:277/282-290`、`group/ChunkPreUnloadService.java:132-136`、`group/ChunkUploadService.java:257-260`、`group/GroupServerHooks.java:81-83` | 迁移集含未确认快照时，`forgetLocal` 前必须拿到正 ACK；ACK 不回则中止分离 | 未开始 |
@@ -57,7 +57,12 @@
    GBK 是错的；按 GBK 强转服务端日志会得乱码）。
 7. **逐区块 fsync 的真正杠杆不是 journal group commit**：三条上行路径都在
    `durableBatchLock` 内完成 append+force，彼此天然串行，没有可合并的重叠窗口（论证见
-   `DESIGN.md` §9.3）。要降就是"减少临界区个数"：客户端合并批次（已做）+ 服务端成批工作线程（未做）。
+   `DESIGN.md` §9.3）。客户端"单区块滞留窗口"曾实现后被<b>撤除</b>（卸载的 enqueue 会被
+   claim 过滤、自动存盘本就是同 tick 批量入队，滞留只省下每个洪峰的首帧却给孤立区块加延迟）。
+   要降只有"减少临界区个数"：服务端逐区块帧改成队列 + 成批工作线程（**未做**）。
+8. **线程池/日志排查口径变化**：io 线程仍是 `p2p-io-N`（N = 创建序号）但有上界；
+   长驻任务现在是 `p2p-blocking-<类别>-N`。判断"线程是否耗尽"要看**存活线程数**与
+   队列深度告警，不要再用"出现过 `p2p-io-921`"这类**累计创建序号**当阈值。
 
 ---
 
@@ -119,15 +124,32 @@ for p in ['primary/environment/world/level.dat','primary/data/world/level.dat']:
 
 1. **世界身份错配 P0**（`44ef8f4`）：`world.WorldIdentity` / `world.WorldIdentityMarker` /
    `util.Quarantine` + 客户端 `LocalWorldLauncher`（校验→隔离→重建）+ `ChunkMapMixin`
-   门控前提 + 服务端 `P2PServerService.quarantineStaleWorldState`；新增 15 个单测。
-2. **服务端线程上界 P0**：`ThreadPools.io()` 改固定线程数（8~32）+ 无界队列；
-   长驻阻塞任务迁到 `ThreadPools.startBlocking`（P2PChannel 接收循环、TcpTunnel 泵与
-   监听/连接、断连清理、退出发布、客户端退出/加入/合并工作流）；客户端
-   `ChunkUploadService` 单区块滞留窗口把同批区块合成一个批次帧；`ThreadPoolsTest`
-   以 2000 个逐区块任务断言"线程数有上界 + 长驻线程不占 io 池"。全量 264 例通过。
+   门控前提 + 服务端 `P2PServerService.quarantineStaleWorldState`。
+2. **服务端线程上界 P0**（`d823776`）：`ThreadPools.io()` 改固定线程数（8~32）+ 无界队列；
+   长驻阻塞任务迁到 `ThreadPools.startBlocking`；`ThreadPoolsTest` 以 2000 个逐区块任务
+   断言"线程数有上界 + 长驻线程不占 io 池"。
+3. **上两项的对抗式复查修正**（第三个提交）：见下"复查发现"，共修 1 个死锁 + 1 个身份
+   误判面 + 4 处线程模型遗漏 + 若干文档/测试缺口。
+4. 校验方式：`./gradlew test`（全量 275 例）+ `./gradlew build`。
 
 未实施（仍在队列）：协议 `worldId`（P1）、退出传输收敛（P1）、分离丢数据（P1）、
-降字节/降 CPU（P2）、环境快照抖动（P3）。
+降字节/降 CPU（P2）、环境快照抖动（P3）、服务端逐区块帧成批处理（P2，见 DESIGN §9.3）。
+
+### 复查发现（第三轮，勿重复踩）
+
+1. **BEGIN 屏障死锁（曾实测为 blocker）**：屏障在 BEGIN 任务入队**之前**就对
+   `writeRealtimeIfAllowed` 可见，因此"早于 EXIT_BEGIN 到达、晚于它出队"的业务帧会
+   join 屏障；有界池被这些等待者占满后，排在队尾的 BEGIN 任务永远拿不到线程 → 永久死锁。
+   修法：`ExitTransactionHandlers` 增加 `barrierExecutor`，生产注入
+   `ThreadPools::startBlocking`（测试仍用同一执行器按序驱动）。**不要把两者合并。**
+2. **同种子判同世界（放宽）**：跨版本升级时原版 DataFixer 会重写 `level.dat`，生成设置
+   *结构*变了、种子没变。只比结构哈希会把升级误判成换世界并隔离掉未物化到 MCA 的耐久区块。
+   现在 `WorldIdentity.sameWorld` = 哈希相等 **或** 两侧种子相等。
+3. **`level.dat` 缺失但目录仍有旧 region**：那种目录会被合并式重建"补上一个正确的
+   level.dat"，从此看起来已对齐、永久放行旧区块。判据必须是"目录是否存在"，不是
+   "level.dat 是否存在"。
+4. 其他线程模型遗漏：`GroupHost.accept`（读会话头 15 秒超时兜底依赖任务被调度到）、
+   `ProxyEnvService.initialSyncLoop`（成功前不返回的循环）——都已迁 `startBlocking`。
 
 ### 服务端现存部署的一次性止血（重要）
 
@@ -135,3 +157,10 @@ for p in ['primary/environment/world/level.dat','primary/data/world/level.dat']:
 世界换过之后，旧 WAL 会让 `RegionFileProbe` 判"服务端已有数据"，把旧世界区块下发给新世界。
 新版代码靠 `world-identity.json` 标记在**下一次**换世界时自动隔离；本次换世界发生在标记
 功能之前，需**手工**把这四个目录改名隔离一次（勿删）。见世界身份报告的 §4 第 3 步。
+
+两个**自动隔离覆盖不到**的情形，需要手工做：
+
+- **同种子重建/还原世界**（删 `region/` 保留 `level.dat`、固定 `level-seed` 重置、从同世界
+  备份还原）：身份看不出来，没有告警；
+- **注册表后端为 MySQL**（`config.mysql.enabled=true`）：占用记录在数据库里，不随目录隔离
+  （启动日志会 WARN 提示）。

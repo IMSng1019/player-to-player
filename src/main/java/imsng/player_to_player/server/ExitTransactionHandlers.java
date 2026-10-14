@@ -123,6 +123,8 @@ public final class ExitTransactionHandlers {
     private final SessionGuard sessionGuard;
     private final CommitCleanup cleanup;
     private final Executor executor;
+    /** BEGIN 屏障任务专用执行器（生产 = 专用阻塞线程；见完整构造器注释的死锁说明）。 */
+    private final Executor barrierExecutor;
     /** 非空表示启用 v5 复合世界 WAL，最终 ACK 不再等待正式物化。 */
     private final DurableChunkJournal durableJournal;
     private final ConcurrentHashMap<UUID, CompletableFuture<Void>> beginBarriers =
@@ -173,15 +175,8 @@ public final class ExitTransactionHandlers {
                                    CommitCleanup cleanup,
                                    Executor executor,
                                    SessionGuard sessionGuard) {
-        this.ledger = ledger;
-        this.authorizer = authorizer;
-        this.pendingProtection = pendingProtection;
-        this.payloadStore = payloadStore;
-        this.flushRealtime = flushRealtime;
-        this.cleanup = cleanup;
-        this.executor = executor;
-        this.sessionGuard = sessionGuard;
-        this.durableJournal = null;
+        this(ledger, authorizer, pendingProtection, payloadStore, flushRealtime, cleanup,
+                executor, executor, sessionGuard, null);
     }
 
     public ExitTransactionHandlers(ExitTransactionLedger ledger,
@@ -193,6 +188,32 @@ public final class ExitTransactionHandlers {
                                    Executor executor,
                                    SessionGuard sessionGuard,
                                    DurableChunkJournal durableJournal) {
+        this(ledger, authorizer, pendingProtection, payloadStore, flushRealtime, cleanup,
+                executor, executor, sessionGuard, durableJournal);
+    }
+
+    /**
+     * 完整构造器：{@code barrierExecutor} 专门跑 EXIT_BEGIN 的屏障任务。
+     * <p>
+     * 为什么 BEGIN 任务不能与业务帧共用有界 io 池（<b>曾实测为死锁，勿合并</b>）：
+     * 屏障在 BEGIN 任务<b>入队之前</b>就对 {@link #writeRealtimeIfAllowed} 可见，而任何
+     * "在 EXIT_BEGIN 之前到达、却排在它之后出队"的 claim/上行/释放帧都会 join 这个屏障。
+     * 于是当池内线程恰好被这些等待者占满时，排在队尾的 BEGIN 任务永远拿不到线程来
+     * {@code complete} 屏障 —— 固定线程池下就是永久死锁（无界 cached pool 时代每条任务都
+     * 新建线程，掩盖了这个结构问题）。生产装配传 {@code ThreadPools.exitBarrierExecutor()}
+     * （恒定单线程、与 io 池隔离，且不会因网络帧而不断建线程）；
+     * 测试传与业务帧相同的执行器以便按序驱动。
+     */
+    public ExitTransactionHandlers(ExitTransactionLedger ledger,
+                                   BeginAuthorizer authorizer,
+                                   PendingProtection pendingProtection,
+                                   PayloadStore payloadStore,
+                                   Runnable flushRealtime,
+                                   CommitCleanup cleanup,
+                                   Executor executor,
+                                   Executor barrierExecutor,
+                                   SessionGuard sessionGuard,
+                                   DurableChunkJournal durableJournal) {
         this.ledger = ledger;
         this.authorizer = authorizer;
         this.pendingProtection = pendingProtection;
@@ -200,6 +221,7 @@ public final class ExitTransactionHandlers {
         this.flushRealtime = flushRealtime;
         this.cleanup = cleanup;
         this.executor = executor;
+        this.barrierExecutor = barrierExecutor;
         this.sessionGuard = sessionGuard;
         this.durableJournal = durableJournal;
     }
@@ -388,7 +410,7 @@ public final class ExitTransactionHandlers {
             }
         };
         try {
-            executor.execute(task);
+            barrierExecutor.execute(task);
         } catch (RuntimeException e) {
             barrier.completeExceptionally(e);
             if (peerId != null) {

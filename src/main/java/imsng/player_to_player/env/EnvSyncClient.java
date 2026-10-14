@@ -45,7 +45,8 @@ import java.util.concurrent.TimeoutException;
  *
  * <h2>线程模型</h2>
  * {@link #syncTo} 立即返回，全流程在 {@link ThreadPools#io()} 上驱动
- * （io 池为无界缓存池，在其上阻塞等待请求应答是允许的）；
+ * （io 池现在是有界线程池 + 无界队列：在其上阻塞等待请求应答仍允许，但每个阻塞的
+ * 同步流程都占住一条池内线程，故 <b>不要</b>再新增"池内任务等池内任务"的写法）；
  * 严禁在 MC 主线程 / Netty 事件循环上 join 返回的 future。
  */
 public final class EnvSyncClient {

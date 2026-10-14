@@ -129,12 +129,14 @@ public final class GroupRuntime {
     /** 预置组计划（LocalWorldLauncher 在打开本地世界前调用）。 */
     public static void arm(GroupPlan plan) {
         armedPlan = plan;
+        // null 与空串一律按"未校验"处理：arm 是启动关键路径，不能因为缺字段就抛异常，
+        // 更不能把 null 误当成"已校验"（见 isLocalWorldIdentityVerified 的严格判据）
         localWorldIdentity = plan.localWorldIdentity();
+        String identity = plan.localWorldIdentity();
         LOGGER.info("组运行时已预置: groupId={} 本地存档世界身份={}",
-                plan.groupId(), plan.localWorldIdentity().isEmpty()
+                plan.groupId(), identity == null || identity.isEmpty()
                         ? "unknown（服务端骨架未提供身份）"
-                        : imsng.player_to_player.world.WorldIdentity
-                        .shortId(plan.localWorldIdentity()));
+                        : imsng.player_to_player.world.WorldIdentity.shortId(identity));
     }
 
     /** 撤销预置（启动流程失败回退时调用）。 */
