@@ -8,10 +8,27 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 /**
- * 服务端区块写入的分片互斥器。
+ * 服务端区块写入的分片互斥器（<b>逻辑</b>串行化，不是 MCA 文件级锁）。
  * <p>
  * 实时上行、退出事务写入和 CHUNK_RELEASE 最终写回必须使用同一组锁。特别是最终写回
  * 与 ownership 释放不能分成两个临界区，否则迟到实时上行可能在中间插入并覆盖最终快照。
+ *
+ * <h2>为什么不需要"每 region 文件一把锁"（重要，勿重复"修"）</h2>
+ * 分片锁保护的是<b>同一区块的写顺序</b>（上行/物化/最终写回/退出冻结之间的竞态），
+ * 而 <b>MCA 文件字节级并发写入由原版存储栈自己串行化</b>：所有落盘都走
+ * {@code level.getChunkSource().chunkMap.write(pos, tag)}（见
+ * {@code ChunkDataHandlers#materializeOne / #validateAndWriteLocked}），
+ * 而 {@code ChunkStorage.write} 只是把任务投进该 {@code ChunkMap} 自己的
+ * <b>IOWorker 串行队列</b>（1.20.4 中由 {@code ChunkStorage.getChunkIoWorker()} 返回的
+ * 那一个 worker 负责；一个维度一个 ChunkMap、一个 worker）。
+ * 因此 region 文件头（8KB 偏移表）与扇区分配由<b>同一个 worker 顺序处理</b> ——
+ * 两个区块即使落在同一 region 文件、被不同分片锁保护，实际写盘也是先后排队执行的，
+ * 不存在"两个写者同时扩展扇区、竞争文件头"的场景。
+ * <p>
+ * 因此：<b>不要</b>为了"MCA 并发写"再引入文件级锁或自研 region writer——那会绕开
+ * IOWorker 反而制造真正的双写句柄冲突（这也正是 DESIGN 选择复用原版存储栈的原因，
+ * 见 {@code ChunkDataHandlers} 类注释）。若将来有写入路径绕过 {@code ChunkStorage}
+ * 直接动 .mca 文件，必须回到这里补文件级串行化。
  */
 final class ChunkWriteCoordinator {
 

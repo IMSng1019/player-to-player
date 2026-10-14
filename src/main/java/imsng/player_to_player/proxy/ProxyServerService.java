@@ -14,7 +14,6 @@ import org.slf4j.LoggerFactory;
  * SERVER_STARTED → start()，SERVER_STOPPING → stop()），
  * 但不承担任何世界运算。
  * <p>
- * <b>分期口径（与 DESIGN.md 第 0 节路线图一致）</b>：Phase 1 只启动
  * <b>分期口径（与 DESIGN.md 第 0 节路线图一致）</b>：Phase 1 启动
  * {@link RelayCore}（打洞协助 + 中转）；Phase 2 增加环境文件分发
  * （{@link ProxyEnvService}：按 parentServerAddress 从上级服务端全量同步环境，

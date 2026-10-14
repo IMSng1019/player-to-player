@@ -30,9 +30,18 @@ import java.util.UUID;
  * 分离监视器（Phase 3 单端分离，Phase 4 扩展为组分离；主客户端集成服务端侧）。
  * <p>
  * 规范判据："两个加载区域的渲染区块的周围 4 个区块的周围 4 个区块无交集并且
- * 时长达到 10s 时则将其分为两个组客户端"。四邻域膨胀两次 = 曼哈顿距离 ≤ 2 的
- * 膨胀，因此"无交集"等价于两渲染矩形的<b>曼哈顿间隙 &gt; 2</b>（间隙 = X 轴
- * 区间距 + Z 轴区间距），矩形运算 O(1)。
+ * 时长达到 10s 时则将其分为两个组客户端"。
+ * <p>
+ * <b>缓冲层的几何（易错点，曾实现错）</b>：规范正文明确"
+ * <b>周围四个区块：指东西南北四个直接相邻区块</b>"，因此"周围 4 格"是
+ * <b>四邻十字形</b>扩张，其扩张两次 = <b>曼哈顿距离 ≤ 2</b> 的十字带
+ * （东西 ±2、南北 ±2 的十字，而非 5×5 方块）；两十字带无交集 ⟺ 两渲染矩形
+ * 的<b>曼哈顿间隙 &gt; 2</b>。{@link #BLOCKS_INTERSECT} 即该判据（O(1) 矩形运算）。
+ * <p>
+ * 注意：曼哈顿间隙 = 两轴区间距的<b>最大值</b>（等价于逐块取 min 后的间隙），
+ * 不是两轴之和。"取和"会把对角方向的分离也算作相交（把距离判据变成切比雪夫
+ * 方块，缓冲层最厚处多出 2 格），使该分离的组迟迟不分离 —— 与 DESIGN.md
+ * 第 12.5 节的"曼哈顿间隙"判据不符。
  * <p>
  * <b>组分离（Phase 4）</b>：把"间隙 ≤ 2 且同维度"视为连通边，对全组玩家做
  * <b>连通分量</b>划分 —— 不含主客户端本人的分量整体离组（规范"单端分离是特殊的
@@ -66,7 +75,7 @@ public final class SplitMonitor {
     /** 无交集须持续的时长（规范：10s）。 */
     private static final long SPLIT_HOLD_MILLIS = 10_000;
 
-    /** 膨胀边距（"周围4格的周围4格" = 曼哈顿距离 2）。 */
+    /** 膨胀边距（"周围4格的周围4格" = 四邻十字形扩张两次 = 曼哈顿距离 2）。 */
     private static final int MARGIN_CHUNKS = 2;
 
     /** 分离执行后的合并触发抑制窗口（毫秒）。 */
@@ -137,7 +146,7 @@ public final class SplitMonitor {
 
     // ------------------------------------------------------------ 判定
 
-    /** 以"同维度且曼哈顿间隙 ≤ 2"为连通边，划分玩家连通分量（并查集）。 */
+    /** 以"同维度且缓冲十字带相交（曼哈顿间隙 ≤ 2）"为连通边，划分玩家连通分量（并查集）。 */
     private static List<List<ServerPlayer>> computeComponents(List<ServerPlayer> players,
                                                               int viewDistance) {
         int n = players.size();
@@ -151,7 +160,8 @@ public final class SplitMonitor {
                 ServerPlayer b = players.get(j);
                 // 跨维度不算交集（规范语义：渲染区块是维度内概念）
                 if (a.serverLevel() == b.serverLevel()
-                        && manhattanGap(a, b, viewDistance) <= MARGIN_CHUNKS) {
+                        && blocksIntersect(a.chunkPosition().x, a.chunkPosition().z,
+                        b.chunkPosition().x, b.chunkPosition().z, viewDistance)) {
                     union(parent, i, j);
                 }
             }
@@ -186,16 +196,23 @@ public final class SplitMonitor {
         return joiner.toString();
     }
 
-    /** 两玩家渲染矩形（边长 2*vd+1）的曼哈顿间隙（区块数；重叠为 0）。 */
-    private static int manhattanGap(ServerPlayer a, ServerPlayer b, int viewDistance) {
-        int size = viewDistance; // 半边长
-        int ax = a.chunkPosition().x;
-        int az = a.chunkPosition().z;
-        int bx = b.chunkPosition().x;
-        int bz = b.chunkPosition().z;
+    /**
+     * 两渲染区域（以玩家所在区块为中心、半边长 viewDistance 的矩形）的
+     * "周围4格×2"缓冲十字带是否相交 —— 即{@link #MARGIN_CHUNKS}判据本身。
+     * <p>
+     * gapX/gapZ 分别为两矩形在 X / Z 轴上的区间距（重叠为 0）。逐块看：两矩形
+     * 在轴上的最近距离分别是 gapX / gapZ，故曼哈顿间隙 = gapX + gapZ（对角时
+     * 为两者之和）；而"两侧各扩张 2 格的十字带仍相交"⟺ gapX ≤ 2 <b>且</b>
+     * gapZ ≤ 2 ⟺ max(gapX, gapZ) ≤ 2。两种写法在轴对齐时等价，但后者直接表达
+     * "相交"、无需先算间隙再比大小，也更不容易被误写成切比雪夫方块判据。
+     * <p>
+     * 抽成纯静态方法是为了可单测：本包在单元测试环境无法构造 {@code ServerPlayer}。
+     */
+    static boolean blocksIntersect(int ax, int az, int bx, int bz, int viewDistance) {
+        int size = viewDistance; // 半边长（渲染矩形边长 = 2*size+1）
         int gapX = Math.max(0, Math.abs(ax - bx) - 2 * size);
         int gapZ = Math.max(0, Math.abs(az - bz) - 2 * size);
-        return gapX + gapZ;
+        return Math.max(gapX, gapZ) <= MARGIN_CHUNKS;
     }
 
     // ------------------------------------------------------------ 执行

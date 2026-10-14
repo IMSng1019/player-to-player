@@ -112,11 +112,22 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
 
 ## 6. 算力（compute 包）
 
-- `ComputeScore(cpuModel, singleCoreScore, source, freeMemoryBytes, totalMemoryBytes)`。
-- 评分来源：① Geekbench 非官方公开接口按 CPU 型号查询单核分（可配置关闭、失败降级）；
-  ② 本地单核微基准（确定性工作负载跑分，映射到 Geekbench 量级）。
-- 主客户端资格 = 算力最高 **且** 可用内存 ≥ 服务端配置阈值（默认 0.5 GB）。
-- 服务端 `ComputeTable` 汇总所有在线客户端评分，合并/加入世界时据此选主。
+- `ComputeScore(cpuModel, localSingleCoreScore, geekbenchSingleCoreScore, geekbenchVersion,
+  freeMemoryBytes, totalMemoryBytes)`。
+- **排序键 = `rankScore()` = 本地单核微基准分**（确定性工作负载，每台机器跑逐字节相同的
+  负载，是唯一可横向比较、且不依赖第三方页面的量）；**Geekbench 分只是参考值**
+  （非官方搜索页查询，可配置关闭、失败无影响），仅在本地分缺失（旧节点上报）时兜底。
+  *理由*：旧实现是"Geekbench 查得到就用 Geekbench、查不到才本地跑分"的二选一，
+  两种量纲被直接混排比较 —— 查得到 Geekbench 的机器会系统性压过查不到的机器，
+  选主结论与真实算力无关。`singleCoreScore()` 保留为 `rankScore()` 的兼容别名，
+  JSON 新旧字段并存，故新旧节点混连时按旧字段排序的结论也一致。
+- 主客户端资格 = 算力最高 **且** 可用内存 ≥ 服务端配置阈值（默认 0.5 GB，规范值）。
+  全员都不达门槛时 `ComputeTable.selectPrimaryOrRelaxed` **确定性降级**为"算力最高者"
+  （返回 `Selection.memoryRelaxed=true`，调用方记 warn）——宁可内存吃紧也不能让区块无人 tick。
+- 服务端 `ComputeTable` 汇总所有在线客户端评分。**算力分配的候选集是涉及组的全部成员
+  （含副客户端）**：规范"重新分配此区域中的玩家的客户端等级（主客户端和副客户端）"。
+  但**接管方（合并的 newPrimary）受能力边界约束，只能是当前主客户端** ——
+  副客户端没有集成服务端，接不了预同步；二者不等时退化执行并 WARN 归因（见第 12 节）。
 
 ## 7. P2P（p2p 包）
 
@@ -125,6 +136,17 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
 - **打洞流程**：A、B 均与中转端保持控制连接 → 中转端交换双方公网 endpoint（P2P_ENDPOINT_EXCHANGE）
   → 双方同时向对方 endpoint 发 UDP 探测（指数退避，约 5s 超时）→ 成功后进入加密会话。
 - **加密通道**：X25519 ECDH 握手（JDK XDH）派生 AES-256-GCM 会话密钥；帧内嵌递增 nonce 防重放。
+- **公钥指纹绑定（消除 UDP 中间人）**：公钥本身仍经打洞 UDP 明文交换，但**双方公钥的
+  SHA-256 指纹经服务端控制信道交换并校验**（身份锚点 = HELLO 写入连接的 clientId）——
+  路径攻击者替换任一侧公钥都会导致指纹不匹配，握手 fail-closed 并退回中转降级。
+  时序：客户端在 HELLO_ACK 后主动上报指纹（P2P_KEY_REPORT）；撮合时若某一方指纹
+  尚未就绪，服务端先按需索要（P2P_KEY_REQUEST），**3 秒内仍未就绪则降级为无指纹下发**
+  （向后兼容旧服务端/客户端，仅记 warn）。旧实现是"明文交换 + 无认证"的已知取舍，
+  此处即其收口。P2P 包格式（P2P1|）与 Protocol.VERSION 均未变。
+  **残留风险（既有，非本次引入）**：控制信道的 HELLO 不校验凭证，clientId 为自报 ——
+  能连上控制端口者可冒用他人身份。故本机制的保证是"公钥属于服务端认为的那个 clientId"，
+  而非"属于玩家本人"；彻底收口需控制信道身份认证（独立议题）。
+  另：双方指纹未参与 HKDF 派生（无转录绑定），因每次打洞都用新临时密钥对，实际影响可忽略。
 - **失败降级**：打洞失败 → 走中转端 RELAY_FORWARD 转发（若服务端配置允许中转）。
 
 ## 8. 服务端行为（server 包）
@@ -416,8 +438,9 @@ PEARL_LANDED(91)        珍珠落点回报（回程给抛出者所在组，落�
   玩家；不含主客户端的分量整体离组（单端分离=单人分量特例，同一条代码路径）。
   分量**成员构成**（UUID 排序签名）持续 10s 不变才触发，成员进出即计时归零。
 - 触发：逐人上传 NBT → SPLIT_REQUEST 携带 departingClientIds[] + 迁移区块并集
-  → 服务端在离组集合内 ComputeTable.selectPrimary（规范"每个组内进行算力分配"，
-  与合并选主同口径；无算力数据按 UUID 字典序兜底）→ splitGroup + migrate →
+  → 服务端在离组集合内 ComputeTable.selectPrimaryOrRelaxed（规范"每个组内进行算力分配"，
+  与合并选主同口径：内存门槛 + rankScore 排序 + UUID 决胜，全员不达门槛时确定性降级；
+  无一人上报算力才按 UUID 字典序兜底）→ splitGroup + migrate →
   新主直收 ROLE_ASSIGN(primary)。
 - **暂存重定向**：其余离组成员的 ROLE_ASSIGN(secondary) 不能立发（新主组世界
   未起，隧道必然扑空）——服务端暂存至新主 LAN 发布后上报 GROUP_WORLD_READY
