@@ -17,10 +17,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
@@ -49,6 +51,18 @@ import java.util.concurrent.TimeUnit;
  * <p>
  * 线程模型：handler 在 Netty 事件循环（纯内存查表 + 发消息）；超时由 scheduler
  * 驱动。合并状态的复合变更以会话对象内的锁串行化。
+ * <p>
+ * <b>选主的两个概念（切勿混淆，见 {@link #handleMergeRequest}）</b>：
+ * <ul>
+ *   <li><b>算力分配（应然）</b>：规范"算力分配：重新分配此区域中的玩家的客户端等级
+ *       （主客户端和副客户端） 通过算力表 算力最高的为主客户端" —— 候选集是
+ *       合并双方的<b>全部成员</b>（含副客户端），它回答"谁<u>应该</u>是主"；</li>
+ *   <li><b>接管方 newPrimary（实然 / 本版本能力边界）</b>：预同步的 B 侧必须
+ *       "当前就在跑集成服务端"（客户端 handlePlan 只认当事双方，B 经 GroupHost
+ *       把快照写进自己的组世界），故它只能是<b>当前主客户端</b> —— 它回答
+ *       "谁<u>能够</u>接管"。副客户端当选时无法接管（避免死组），按能力边界执行
+ *       并打 WARN 归因。</li>
+ * </ul>
  */
 public final class MergeCoordinator {
 
@@ -184,16 +198,58 @@ public final class MergeCoordinator {
             }
         }
 
-        // ---- 算力分配（规范：两个主客户端选出算力更强的作为新的主客户端）----
-        List<UUID> candidates = List.of(requester, targetPrimary);
-        UUID newPrimary = computes.selectPrimary(candidates, config.minFreeMemoryBytes);
-        if (newPrimary == null) {
-            // 均不达内存门槛/未上报：兜底取目标组主（"既有主不动摇"最小扰动），记告警
-            newPrimary = targetPrimary;
-            LOGGER.warn("合并选主无合格候选（内存门槛 {}MB），兜底沿用目标组主 {}",
-                    config.minFreeMemoryBytes / (1024 * 1024), targetPrimary);
+        // ---- 算力分配（规范："算力分配：重新分配此区域中的玩家的客户端等级（主客户端和副客户端）
+        //      通过算力表 算力最高的为主客户端"；"合并：……将两个组客户端合为一个组客户端"）----
+        // 【概念一 · 应然】谁应该当主：候选集必须是两组的**全部成员**（含副客户端）。
+        // 旧实现只比较两个主客户端，组里算力更高的副客户端永远无法当选，直接违反
+        // "算力最高的为主客户端"；而分离选主（handleSplitRequest）早就是"在离组集合内选"，
+        // 本处与它对齐。内存门槛的确定性降级兜底由 ComputeTable 内部统一负责。
+        List<UUID> candidates = mergeCandidates(
+                groups.membersOf(requesterGroup), groups.membersOf(targetGroup));
+        ComputeTable.Selection election =
+                computes.selectPrimaryOrRelaxed(candidates, config.minFreeMemoryBytes);
+        UUID elected = election != null ? election.clientId() : null;
+        if (election != null && election.memoryRelaxed()) {
+            // 全员都不达内存门槛：规范"算力最高的为主客户端"优先于内存门槛（确定性降级）
+            LOGGER.warn("合并选主：两组 {} 名候选均未达内存门槛 {}MB，按算力降级选出 {}（排序分 {}）",
+                    candidates.size(), config.minFreeMemoryBytes / (1024 * 1024),
+                    elected, computes.rankOf(elected));
         }
-        UUID oldPrimary = newPrimary.equals(requester) ? targetPrimary : requester;
+        // 【概念二 · 实然 / 本版本能力边界】谁能够**接管**：预同步 B 侧必须"当前就在跑
+        // 集成服务端" —— 客户端 MergeClient.handlePlan 只认 self==newPrimary/oldPrimary，
+        // 接管方要经 GroupHost 接收快照/增量并接进自己的组世界；副客户端没有组世界，
+        // 一旦把它定为 newPrimary：MERGE_PLAN 无人可收、A 组主永不冻结让出，
+        // 而 commit 仍把两组并到它名下 → 死组。故接管方只能从两个当前主客户端中产生。
+        UUID newPrimary;
+        if (elected != null && (elected.equals(requester) || elected.equals(targetPrimary))) {
+            newPrimary = elected; // 应然 = 实然：规范"算力最高的为主客户端"达成
+        } else {
+            // 应然 ≠ 实然（算力最高者是副客户端，或两组都没上报算力）：
+            // 退化为两个当前主客户端之间按同一套规则选强者接管 —— 不劣于旧实现，
+            // 绝不出现"选出来的主比落选者更弱"的回归。
+            ComputeTable.Selection takeover = computes.selectPrimaryOrRelaxed(
+                    mergeCandidates(List.of(requester), List.of(targetPrimary)),
+                    config.minFreeMemoryBytes);
+            newPrimary = takeover != null ? takeover.clientId() : targetPrimary;
+            if (elected != null) {
+                LOGGER.warn("合并选主：应当当选者 {}（排序分 {}）是副客户端，无法在本版本接管；"
+                        + "实际接管者 {}（排序分 {}）。下一步：需客户端侧实现“副→主就地晋升”"
+                        + "（服务端推送 ROLE_ASSIGN(primary) → 客户端 LocalWorldLauncher 拉起本地组世界"
+                        + " → 其余成员经 pendingRedirects 重定向）后，算力最高者才能真正当选",
+                        elected, computes.rankOf(elected), newPrimary, computes.rankOf(newPrimary));
+            } else {
+                LOGGER.warn("合并选主：两组共 {} 名候选均未上报算力，无法判定应当当选者；"
+                        + "实际接管者 {}（排序分 {}）",
+                        candidates.size(), newPrimary, computes.rankOf(newPrimary));
+            }
+        }
+        // 让出方 A = 不含接管方的那一组的当前主客户端 —— 两个角色因此恒为两个当前主客户端
+        MergeRoles roles = rolesForTaker(newPrimary, requester, targetPrimary);
+        if (roles == null) {
+            conn.send(error(msg, "no_taker", "无可用接管方（当前主客户端状态异常）"));
+            return;
+        }
+        UUID oldPrimary = roles.oldPrimary();
 
         MergeSession session = new MergeSession(requesterGroup, targetGroup, newPrimary, oldPrimary);
         sessions.put(session.mergeId, session);
@@ -209,8 +265,10 @@ public final class MergeCoordinator {
         JsonObject plan = buildPlan(session);
         conn.send(msg.reply(MessageType.MERGE_PLAN, plan.deepCopy(), null));
         targetConn.send(ControlMessage.of(MessageType.MERGE_PLAN, plan.deepCopy()));
-        LOGGER.info("合并计划已下发: mergeId={} 组 {} + 组 {} → 新主 {}（让出方 {}）",
-                session.mergeId, requesterGroup, targetGroup, newPrimary, oldPrimary);
+        LOGGER.info("合并计划已下发: mergeId={} 组 {} + 组 {} → 新主 {}（让出方 {}；"
+                        + "全成员选举胜者 {}，候选 {} 人）",
+                session.mergeId, requesterGroup, targetGroup, newPrimary, oldPrimary,
+                elected, candidates.size());
     }
 
     /** 组装 MERGE_PLAN 消息体（双方收到同一份，靠 newPrimaryClientId 识别自己的角色）。 */
@@ -352,7 +410,7 @@ public final class MergeCoordinator {
      * <p>
      * <b>组分离（多端，Phase 4）</b>：{@code departingClientIds} 携带多名离组成员时，
      * 服务端在离组集合内做算力分配（规范"分为两个组客户端……每个组内进行算力分配"，
-     * {@link ComputeTable#selectPrimary} 与合并选主同一套规则），胜者直发
+     * {@link ComputeTable#selectPrimaryOrRelaxed} 与合并选主同一套规则），胜者直发
      * ROLE_ASSIGN(primary) 自立门户；其余成员的 ROLE_ASSIGN(secondary) 重定向指派
      * <b>暂存</b>到新主回报 {@code GROUP_WORLD_READY}（LAN 已发布）后冲刷 ——
      * 见 {@link #pendingRedirects}。单成员分离（departing=1）是其特例，无暂存环节。
@@ -405,10 +463,20 @@ public final class MergeCoordinator {
                 }
             }
         }
-        // 离组集合内算力分配（规范"每个组内进行算力分配"）；无算力数据时取
-        // UUID 字典序最小者兜底 —— 与 ComputeTable 决胜规则同源，保证确定性
-        UUID newPrimary = computes.selectPrimary(departingSet, config.minFreeMemoryBytes);
+        // 离组集合内算力分配（规范"组分离：……每个组内进行算力分配"）：与合并选主同一套规则
+        // （ComputeTable.selectPrimaryOrRelaxed = 内存门槛 + 算力排序 + UUID 决胜，
+        // 全员不达门槛时确定性降级），两处口径一致，不会选出比落选者更弱的主
+        ComputeTable.Selection splitElection =
+                computes.selectPrimaryOrRelaxed(departingSet, config.minFreeMemoryBytes);
+        UUID newPrimary = splitElection != null ? splitElection.clientId() : null;
+        if (splitElection != null && splitElection.memoryRelaxed()) {
+            LOGGER.warn("分离选主：离组 {} 名成员均未达内存门槛 {}MB，按算力降级选出 {}（排序分 {}）",
+                    departingSet.size(), config.minFreeMemoryBytes / (1024 * 1024),
+                    newPrimary, computes.rankOf(newPrimary));
+        }
         if (newPrimary == null) {
+            // 无一人上报算力：连降级都无从选起 —— 按 UUID 字典序最小者兜底（确定性，
+            // 与 ComputeTable 的并列决胜同源），并告警
             newPrimary = departingSet.stream().min(UUID::compareTo).orElseThrow();
             LOGGER.warn("离组成员无可用算力数据，按 UUID 字典序兜底选主: {}", newPrimary);
         }
@@ -492,6 +560,77 @@ public final class MergeCoordinator {
         }
         LOGGER.info("组分离重定向已冲刷: 新组 {} 新主 {}，通知 {}/{} 名副客户端（触发: {}）",
                 newGroupId, newPrimary, sent, followers.size(), cause);
+    }
+
+    // ------------------------------------------------- 选主（纯函数，包内可见便于单测）
+
+    /** 合并预同步的双方角色：newPrimary = 接管方 B，oldPrimary = 让出方 A。 */
+    record MergeRoles(UUID newPrimary, UUID oldPrimary) {
+    }
+
+    /**
+     * 合并选主候选集 = 两组<b>全部成员</b>的并集（包内可见纯函数，便于单测）。
+     * <p>
+     * 规范依据："算力分配：重新分配此区域中的玩家的客户端等级（主客户端和副客户端）
+     * 通过算力表 算力最高的为主客户端" —— 副客户端同样有当选资格，候选集不能只有
+     * 两个主客户端。返回值按 UUID 字典序升序（TreeSet 去重 + 排序；选举本身与顺序无关，
+     * 排序只为日志与测试可复现）。
+     *
+     * @param membersA 一组全部成员（{@code GroupTable.membersOf}；null 视为空）
+     * @param membersB 另一组全部成员（同上）
+     * @return 去重排序后的候选 id 列表（两参数均为空时返回空列表）
+     */
+    static List<UUID> mergeCandidates(Collection<UUID> membersA, Collection<UUID> membersB) {
+        TreeSet<UUID> union = new TreeSet<>();
+        addMembers(union, membersA);
+        addMembers(union, membersB);
+        return new ArrayList<>(union);
+    }
+
+    /** 并入非空成员（防御性过滤 null，表数据不信任）。 */
+    private static void addMembers(Set<UUID> union, Collection<UUID> members) {
+        if (members == null) {
+            return;
+        }
+        for (UUID member : members) {
+            if (member != null) {
+                union.add(member);
+            }
+        }
+    }
+
+    /**
+     * 由"接管方"推导预同步双方角色（包内可见纯函数，便于单测）。
+     * <p>
+     * 语义（与客户端 MergeClient 的 A/B 分工严格对应）：
+     * <ul>
+     *   <li>{@code newPrimary} = 接管方 B：合并后新组的主客户端。其集成服务端全程不中断，
+     *       经 GroupHost 接收快照/增量，A 让出后两旧组的区块占用整组迁入它名下；</li>
+     *   <li>{@code oldPrimary} = 让出方 A：<b>不含接管方的那一组</b>的当前主客户端。
+     *       它冻结 tick → 发尾部增量 → 回报 switched → 降级为副客户端经隧道重连 B。</li>
+     * </ul>
+     * 两个角色因此恒为两个不同的<b>当前主客户端</b>（预同步协议不变式：
+     * {@link #handleProgress} 只接受这两者回报，{@link #abort} 只通知这两者）。
+     *
+     * @param taker            接管方（必须恰为 requesterPrimary 或 targetPrimary 之一）
+     * @param requesterPrimary 发起方组的当前主客户端（MERGE_PLAN reply 的接收方）
+     * @param targetPrimary    目标组的当前主客户端（MERGE_PLAN 单发的接收方）
+     * @return 角色对；输入非法（null / 两主相同 / taker 不是当前主客户端）返回 null，
+     *         调用方应回 ERROR 而不是硬造一个会话
+     */
+    static MergeRoles rolesForTaker(UUID taker, UUID requesterPrimary, UUID targetPrimary) {
+        if (taker == null || requesterPrimary == null || targetPrimary == null
+                || requesterPrimary.equals(targetPrimary)) {
+            return null;
+        }
+        if (taker.equals(requesterPrimary)) {
+            return new MergeRoles(requesterPrimary, targetPrimary);
+        }
+        if (taker.equals(targetPrimary)) {
+            return new MergeRoles(targetPrimary, requesterPrimary);
+        }
+        // 接管方不是当前主客户端（副客户端没有组世界，接不了预同步）
+        return null;
     }
 
     // ------------------------------------------------------------ 工具

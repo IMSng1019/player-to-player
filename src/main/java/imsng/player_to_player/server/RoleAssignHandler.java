@@ -180,14 +180,21 @@ public final class RoleAssignHandler implements MessageHandler {
 
     /**
      * 加入者是否算力更强（规范"如果加入玩家的算力更强则将该玩家作为主客户端"）：
-     * 用 {@link ComputeTable#selectPrimary} 的同一套规则（单核分 + 内存门槛 +
+     * 用 {@link ComputeTable#selectPrimaryOrRelaxed} 的同一套规则（单核分 + 内存门槛 +
      * UUID 决胜）在两人之间选主，胜者恰为加入者才算"更强" —— 与合并选主
      * （MergeCoordinator）口径完全一致，两处决策永不分叉。
+     * <p>
+     * 与合并/分离选主有一处<b>有意的差别</b>：本方法是"要不要主动去抢主"的<b>偏好判断</b>
+     * （抢主会触发一轮预连接 + 预同步 + 合并，代价不小），而不是"必须选出一个人"的强制
+     * 选举 —— 故 {@code memoryRelaxed=true}（两人都没达到内存门槛）时不算"更强"，
+     * 仍按副客户端加入（与内存门槛落地前的行为完全一致）；MergeCoordinator 与分离路径
+     * 必须有人当主，它们接受降级结果（否则组会无主）。
      */
     private boolean joinerIsStronger(UUID joiner, UUID incumbentPrimary) {
-        UUID winner = computeTable.selectPrimary(
+        ComputeTable.Selection selection = computeTable.selectPrimaryOrRelaxed(
                 java.util.List.of(joiner, incumbentPrimary), config.minFreeMemoryBytes);
-        return joiner.equals(winner);
+        return selection != null && !selection.memoryRelaxed()
+                && joiner.equals(selection.clientId());
     }
 
     /**
