@@ -38,13 +38,14 @@ ClientRole（运行期客户端等级，可随合并/分离切换）
 ```
 <游戏目录或服务端根目录>/player-to-player/
   config.json                    # 总配置 GlobalConfig
+  world-identity.json            # [服务端] 世界身份标记 WorldIdentityMarker
   registry/                      # [服务端] 区块注册表持久化（每维度一个 json）
   logs/                          # [服务端] 收集的主客户端日志（<玩家名>-latest.log）
   <IP>+<世界名>/                 # [客户端] 世界文件夹（每个"服务器+世界"一个）
-    config.json                  # 世界配置 WorldConfig
+    config.json                  # 世界配置 WorldConfig（含 worldIdentityHash）
     primary/                     # 主客户端角色专属
       environment/               #   环境文件
-      data/                      #   数据文件
+      data/                      #   数据文件（本地存档在其下 <世界名>/）
     secondary/                   # 副客户端角色专属
       environment/
       data/
@@ -52,6 +53,8 @@ ClientRole（运行期客户端等级，可随合并/分离切换）
 
 - 世界名/IP 经 `P2PPaths.sanitize()` 做文件名合法化（Windows 保留字符）。
 - 客户端每次加入世界时重新选定世界文件夹（同一客户端可进出不同服务器）。
+- 被判定为"不属于当前世界"的状态一律<b>同级改名隔离</b>为
+  `<原名>.stale-<身份短标识>-<时间戳>`（`util.Quarantine`），绝不删除。
 
 ## 3. 控制协议（netproto 包）
 
@@ -209,10 +212,20 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
 
 ### 11.2 区块申请门控与数据面（规范"特殊的区块加载"）
 
+- **世界身份（`world.WorldIdentity`）**：世界文件夹键只有 `IP+世界名`，换世界后若不比对身份，
+  客户端会沿用旧本地存档、服务端会沿用旧 WAL，造成双向静默污染。身份 = level.dat 的
+  `Data.WorldGenSettings`（缺失时回退 `RandomSeed`+`Generator`）递归规范化后的 SHA-256；
+  刻意不含 `DataVersion`/`LastPlayed`/内嵌玩家（每局都变，算进去会每次加入都误判）。
+  两处落点：**客户端** `LocalWorldLauncher.prepareSave` 身份不一致即隔离旧存档（同级改名）
+  并从服务端骨架重建，重建/校验通过的结论经 `GroupRuntime.GroupPlan` 镜像到 main 源集，
+  供加载门控使用；**服务端** `P2PServerService.quarantineStaleWorldState` 在世界身份标记
+  （`world-identity.json`）变化时隔离 `chunk-journal/registry/exit-*`。
+  判定纪律：标记缺失或身份无法确定时**只告警、不清理**（误清理会丢掉未物化到 MCA 的耐久数据）。
 - **门控（ChunkMapMixin.readChunk @RETURN）**：被接管维度的每次区块读都替换为
   "先 CHUNK_CLAIM_REQUEST(20) 申请"的组合 future —— 授予+有服务端数据 →
   CHUNK_DATA_REQUEST(25) 拉取权威 NBT（走原版 `upgradeChunkTag` 升级管线）；
-  授予+无数据 → 原 future（本地缓存/种子生成）；被拒 → future 悬置，
+  授予+无数据 → 原 future（本地缓存/种子生成），**前提是 `GroupRuntime.isLocalWorldIdentityVerified()`**，
+  未校验时按无缓存处理（返回空 → 种子生成），杜绝读到别的世界的区块；被拒 → future 悬置，
   `ChunkClaimClient` 每 `chunkClaimRetrySeconds` 秒重试（区块保持未加载，
   拒绝信息里的 blockingGroup 是 Phase 3 预连接/合并的入口）。
 - **实时上行（ChunkStorageMixin.write @HEAD 旁挂）**：`ChunkStorage.write` 是区块落盘

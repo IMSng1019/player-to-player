@@ -43,7 +43,9 @@ import java.util.concurrent.CompletableFuture;
  * <ul>
  *   <li>授予 + 服务端有数据 → 经控制连接拉取权威 NBT，走与磁盘读取相同的
  *       {@code upgradeChunkTag} 升级管线（{@link ChunkMapAccess}）；</li>
- *   <li>授予 + 无数据 → 沿用原 future（本地缓存读，通常为空 → 按种子生成）；</li>
+ *   <li>授予 + 无数据 → 沿用原 future（本地缓存读，通常为空 → 按种子生成）；
+ *       <b>前提是本地存档世界身份已校验</b>（{@link GroupRuntime#isLocalWorldIdentityVerified()}），
+ *       否则按无缓存处理走种子生成 —— 详见 {@code player_to_player$localReadOrEmpty}；</li>
  *   <li>被拒 → future 悬置，ChunkClaimClient 按间隔重试直至授予 —— 区块保持
  *       未加载（玩家视野缺口），与规范"该区块不加载"一致。</li>
  * </ul>
@@ -89,6 +91,10 @@ public abstract class ChunkMapMixin {
     @Unique
     private static volatile boolean player_to_player$saveBlockLogged = false;
 
+    /** 身份门控关闭本地磁盘回退读时只打一次 WARN，避免每区块刷屏。 */
+    @Unique
+    private static volatile boolean player_to_player$identityGateLogged = false;
+
     // ----------------------------------------------- 注入点一：预卸载屏障
 
     /**
@@ -131,7 +137,7 @@ public abstract class ChunkMapMixin {
             if (!outcome.hasServerData()) {
                 CompoundTag staged = PresyncStore.take(key);
                 if (staged == null) {
-                    return localRead;
+                    return player_to_player$localReadOrEmpty(localRead, key);
                 }
                 return CompletableFuture.completedFuture(Optional.of(staged)).thenApplyAsync(
                         opt -> opt.map(tag ->
@@ -146,8 +152,35 @@ public abstract class ChunkMapMixin {
         }));
     }
 
-    // -------------------------------------------- 注入点三：物理服务端存盘取消
+    /**
+     * "服务端无数据"时的本地磁盘回退读 —— 前提是本地存档已完成世界身份校验
+     * （{@link GroupRuntime#isLocalWorldIdentityVerified()}）。
+     * <p>
+     * 世界文件夹键只有 {@code IP+世界名}：服务端换世界后本地 {@code data/<世界名>/}
+     * 里可能仍是<b>另一个世界</b>的 {@code region/*.mca}。此时回退读会把旧地形当作
+     * 权威数据交给集成服务端，随后这些区块被上行写进服务端 MCA（双向污染）。
+     * 校验未通过（未 arm / 服务端骨架给不出身份 / 接管解除窗口）时按"本地无缓存"
+     * 处理：返回空结果，让原版按<b>本存档 level.dat 的种子</b>生成 —— 该 level.dat
+     * 已经过 {@code LocalWorldLauncher} 校验或据服务端骨架重建，与物理服务端同源。
+     *
+     * @param localRead 原版 {@code readChunk} 的返回值（读本存档 region 文件）
+     */
+    @Unique
+    private CompletableFuture<Optional<CompoundTag>> player_to_player$localReadOrEmpty(
+            CompletableFuture<Optional<CompoundTag>> localRead, ChunkKey key) {
+        if (GroupRuntime.isLocalWorldIdentityVerified()) {
+            return localRead;
+        }
+        if (!player_to_player$identityGateLogged) {
+            player_to_player$identityGateLogged = true;
+            player_to_player$LOGGER.warn(
+                    "本地存档世界身份未经校验，已禁用本地磁盘回退读（按无缓存处理，走种子生成）: {}",
+                    key.asString());
+        }
+        return CompletableFuture.completedFuture(Optional.empty());
+    }
 
+    // -------------------------------------------- 注入点三：物理服务端存盘取消
     @Inject(method = "save", at = @At("HEAD"), cancellable = true)
     private void player_to_player$blockPhysicalServerSave(
             ChunkAccess chunk, CallbackInfoReturnable<Boolean> cir) {

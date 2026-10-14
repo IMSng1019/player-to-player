@@ -79,6 +79,15 @@ public final class P2PPaths {
         return root.resolve("chunk-journal");
     }
 
+    /**
+     * [服务端] 世界身份标记：记录上次启动时"这些运行期状态属于哪个世界"。
+     * 世界被替换/重置后据此识别并隔离陈旧的 WAL/注册表/退出暂存
+     * （见 {@code world.WorldIdentityMarker}）。
+     */
+    public Path worldIdentityMarker() {
+        return root.resolve("world-identity.json");
+    }
+
     /** [服务端/中转端] 版本化不可变环境快照仓库。 */
     public Path environmentSnapshotsDir() {
         return root.resolve("environment-snapshots");

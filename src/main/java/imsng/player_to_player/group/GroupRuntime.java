@@ -48,11 +48,15 @@ public final class GroupRuntime {
      *
      * @param groupId         本组 ID（Phase 1/2 约定 == 主客户端 clientId）
      * @param serverConn      与物理服务端的控制连接（区块申请/上行走它）
+     * @param localWorldIdentity 本地存档已对齐的世界身份哈希（空串 = 服务端 level.dat
+     *                        无法给出身份）；非空即表示"本地存档与服务端骨架同源"，
+     *                        区块加载才允许回退读本地磁盘（见 {@link #isLocalWorldIdentityVerified()}）
      * @param claimRetrySeconds 区块申请被拒后的重试间隔（秒）
      * @param onServerStarted 集成服务端接管完成后的回调（LAN 发布、组宿主启动；
      *                        在服务器主线程上调用，不得阻塞）
      */
-    public record GroupPlan(UUID groupId, ControlConnection serverConn, int claimRetrySeconds,
+    public record GroupPlan(UUID groupId, ControlConnection serverConn, String localWorldIdentity,
+                            int claimRetrySeconds,
                             Consumer<MinecraftServer> onServerStarted) {
     }
 
@@ -79,6 +83,15 @@ public final class GroupRuntime {
 
     /** 本组 ID（attach 时取自组计划）。 */
     private static volatile UUID groupId;
+
+    /**
+     * 本地存档已对齐的世界身份哈希（arm 时由客户端编排方提供）；null = 未校验。
+     * <p>
+     * 只承载"是否已校验"这一事实，判定本身在 {@code LocalWorldLauncher}（client 源集）
+     * 用 {@code world.WorldIdentity} 现算 —— mixin 在 main 源集，读不了会话层状态，
+     * 故经本静态字段镜像。
+     */
+    private static volatile String localWorldIdentity;
 
     /**
      * 集成服务端<b>完全停止</b>（SERVER_STOPPED）后的回调（客户端会话层挂接，
@@ -116,12 +129,32 @@ public final class GroupRuntime {
     /** 预置组计划（LocalWorldLauncher 在打开本地世界前调用）。 */
     public static void arm(GroupPlan plan) {
         armedPlan = plan;
-        LOGGER.info("组运行时已预置: groupId={}", plan.groupId());
+        localWorldIdentity = plan.localWorldIdentity();
+        LOGGER.info("组运行时已预置: groupId={} 本地存档世界身份={}",
+                plan.groupId(), plan.localWorldIdentity().isEmpty()
+                        ? "unknown（服务端骨架未提供身份）"
+                        : imsng.player_to_player.world.WorldIdentity
+                        .shortId(plan.localWorldIdentity()));
     }
 
     /** 撤销预置（启动流程失败回退时调用）。 */
     public static void disarm() {
         armedPlan = null;
+        localWorldIdentity = null;
+    }
+
+    /**
+     * 本地存档的世界身份是否已校验（或已据服务端骨架重建对齐）。
+     * <p>
+     * {@code ChunkMapMixin} 的区块加载门控用它决定"服务端说无数据"时能否回退
+     * 到本地磁盘读：未校验时本地存档可能属于另一个世界，读到的是旧地形，
+     * 而这些区块随后又会被上行覆盖服务端 MCA。
+     *
+     * @return true = 本地存档与服务端同源，允许本地磁盘回退
+     */
+    public static boolean isLocalWorldIdentityVerified() {
+        String identity = localWorldIdentity;
+        return identity != null && !identity.isEmpty();
     }
 
     /**
@@ -206,6 +239,7 @@ public final class GroupRuntime {
         playerUploadService = null;
         serverConn = null;
         groupId = null;
+        localWorldIdentity = null; // 身份结论不跨接管残留（下次 arm 重新携带）
         managedServer = null;
         tickFrozen = false; // 冻结旗标不得跨接管残留
         LogUploader.stop(); // Phase 4：日志上行随接管终止

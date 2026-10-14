@@ -33,6 +33,17 @@ public final class WorldConfig {
     /** 最近一次在该世界担任的角色（primary / secondary），供诊断与快速恢复。 */
     public String lastRole = "";
 
+    /**
+     * 最近一次通过校验（或据服务端骨架重建）的本地存档世界身份哈希
+     * （见 {@code world.WorldIdentity}）。
+     * <p>
+     * 只作诊断与人工核对用：<b>真正的判定每次都从 level.dat 现算</b>，不读本字段。
+     * 不能复用 {@link #lastEnvironmentHash} 承担该职责——环境哈希把
+     * {@code world/level.dat}、{@code playerdata}、{@code stats} 等每局都变的文件算在内，
+     * 会持续抖动（实测约 1~2 秒一变）。
+     */
+    public String worldIdentityHash = "";
+
     /** 读取世界配置；不存在则按参数创建。 */
     public static WorldConfig loadOrCreate(Path path, String serverIp, String worldName) {
         try {
@@ -57,5 +68,24 @@ public final class WorldConfig {
         } catch (IOException e) {
             LOGGER.error("世界配置保存失败: {}", path, e);
         }
+    }
+
+    /**
+     * 只更新世界身份字段并落盘，其余字段保持磁盘上的既有值。
+     * <p>
+     * 身份校验发生在 {@code LocalWorldLauncher}（只有世界文件夹路径，没有服务端 IP），
+     * 故此处用空串作为"仅当文件不存在时"的建默认值；世界配置的正常创建点仍是
+     * 会话层（{@code WorldSession} 加入世界第 3 步）。
+     */
+    public static void updateWorldIdentity(Path path, String identityHash) {
+        if (identityHash == null || identityHash.isBlank()) {
+            return; // 身份未能确定：不覆盖上次记录，避免把"未知"写成"已校验"
+        }
+        WorldConfig config = loadOrCreate(path, "", "");
+        if (identityHash.equals(config.worldIdentityHash)) {
+            return;
+        }
+        config.worldIdentityHash = identityHash;
+        config.save(path);
     }
 }

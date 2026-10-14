@@ -18,12 +18,16 @@ import imsng.player_to_player.registry.RegionFileProbe;
 import imsng.player_to_player.registry.RegistryHandlers;
 import imsng.player_to_player.registry.RegistryMutationJournal;
 import imsng.player_to_player.registry.RegistryStore;
+import imsng.player_to_player.util.Quarantine;
+import imsng.player_to_player.world.WorldIdentity;
+import imsng.player_to_player.world.WorldIdentityMarker;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.storage.LevelResource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -96,6 +100,12 @@ public final class P2PServerService {
         // a. 服务端根 = 游戏目录（环境文件定义基于它）；世界根 = 存档根目录（region 文件在其下）
         Path serverRoot = FabricLoader.getInstance().getGameDir();
         Path worldRoot = server.getWorldPath(LevelResource.ROOT);
+
+        // a2. 世界身份校验：本模组的运行期状态目录（chunk-journal/registry/exit-*）不随
+        //     世界名分割，世界被替换/重置后旧 WAL 仍会被 RegionFileProbe 当作"服务端已有
+        //     数据"，把旧世界区块下发给新世界。必须在这些状态被加载前完成识别与隔离。
+        quarantineStaleWorldState(paths, worldRoot,
+                server.getWorldData().getLevelName());
 
         // b. 版本化不可变环境快照：排除表 = 管理员配置 + 实际存档的维度数据。
         //    管理器后台构建首版，随后 WatchService 变化监听 + 60 秒校验实时更新；
@@ -444,6 +454,91 @@ public final class P2PServerService {
             exclusions.add(worldPrefix + "/" + dim);
         }
         return exclusions;
+    }
+
+    /**
+     * 世界身份变化时隔离陈旧的 P2P 运行期状态（服务端侧的世界身份校验）。
+     * <p>
+     * 背景：{@code chunk-journal/}、{@code registry/}、{@code exit-transactions/}、
+     * {@code exit-payloads/} 都在 {@code player-to-player/} 根下、<b>不随世界名分割</b>。
+     * 服务端换世界/重置世界后（{@code level.dat} 的 {@code WorldGenSettings} 改变）：
+     * <ul>
+     *   <li>旧 WAL 里的区块会被 {@code RegionFileProbe.hasServerData} 判为"服务端已有数据"，
+     *       于是旧世界的区块被下发给新世界的客户端；</li>
+     *   <li>旧注册表的占用/回执记录属于已不存在的组。</li>
+     * </ul>
+     * 因此身份不一致时把这四个目录<b>整体隔离</b>（改名保留，绝不删除），并从空状态启动。
+     * <p>
+     * 判定纪律（不做"猜测式清理"）：
+     * <ul>
+     *   <li>标记缺失（本功能上线前的老部署）：<b>不隔离</b>，只 WARN —— 无标记时无法区分
+     *       "同一世界的既有状态"与"上一个世界的残留状态"，而误隔离会丢掉尚未物化到 MCA
+     *       的耐久数据（客户端收到 durable ACK 后已删除本地副本）；</li>
+     *   <li>标记口径版本不一致：只更新标记，不隔离（哈希不可比，不做结论）；</li>
+     *   <li>当前世界身份无法确定：保留标记与状态不动，只 WARN（宁可不清理，不可误清理）。</li>
+     * </ul>
+     */
+    private static void quarantineStaleWorldState(P2PPaths paths, Path worldRoot,
+                                                  String worldName) {
+        Path levelDat = worldRoot.resolve("level.dat");
+        java.util.Optional<String> current = WorldIdentity.ofLevelDatFile(levelDat);
+        Path markerPath = paths.worldIdentityMarker();
+        WorldIdentityMarker previous = WorldIdentityMarker.read(markerPath);
+        long now = System.currentTimeMillis();
+
+        if (previous != null && previous.formatVersion.equals(WorldIdentity.FORMAT_VERSION)) {
+            if (current.isPresent() && !previous.identityHash.isBlank()
+                    && !previous.identityHash.equals(current.get())) {
+                String label = WorldIdentity.shortId(previous.identityHash);
+                LOGGER.warn("世界身份已变化（标记={} 当前={}），隔离旧世界遗留的 P2P 运行期状态 —— "
+                                + "旧 WAL 会把旧世界区块当作服务端已有数据下发，必须整体作废",
+                        WorldIdentity.shortId(previous.identityHash),
+                        WorldIdentity.shortId(current.get()));
+                for (Path state : List.of(
+                        paths.durableChunkJournalDir(), paths.registryDir(),
+                        paths.exitTransactionsDir(), paths.exitPayloadsDir())) {
+                    try {
+                        Path stale = Quarantine.quarantine(state, label, now);
+                        if (stale != null) {
+                            LOGGER.warn("已隔离: {} → {}", state, stale);
+                        }
+                    } catch (Exception e) {
+                        LOGGER.error("隔离陈旧状态目录失败（该目录可能仍影响新区块判定，请手工改名）: {}",
+                                state, e);
+                    }
+                }
+            }
+        } else if (previous == null) {
+            boolean anyState = Files.isDirectory(paths.durableChunkJournalDir())
+                    || Files.isDirectory(paths.registryDir())
+                    || Files.isDirectory(paths.exitTransactionsDir())
+                    || Files.isDirectory(paths.exitPayloadsDir());
+            if (anyState && current.isPresent()) {
+                LOGGER.warn("检测到 P2P 运行期状态但缺少世界身份标记（首次启用世界身份校验）。"
+                        + "若世界刚被替换/重置过，请手工把 player-to-player/ 下的 chunk-journal、"
+                        + "registry、exit-transactions、exit-payloads 改名隔离，否则旧世界的区块"
+                        + "会被当作服务端已有数据下发");
+            }
+        }
+
+        if (current.isEmpty()) {
+            LOGGER.warn("当前世界身份无法确定（{} 缺 WorldGenSettings/RandomSeed），"
+                    + "保留既有身份标记与运行期状态不动", levelDat);
+            return;
+        }
+        WorldIdentityMarker marker = new WorldIdentityMarker();
+        marker.formatVersion = WorldIdentity.FORMAT_VERSION;
+        marker.identityHash = current.get();
+        marker.worldName = worldName == null ? "" : worldName;
+        marker.recordedAtEpochMillis = now;
+        try {
+            marker.save(markerPath);
+            LOGGER.info("世界身份已记录: {} (identity={})", markerPath,
+                    WorldIdentity.shortId(current.get()));
+        } catch (Exception e) {
+            LOGGER.error("世界身份标记写入失败（不影响运行，但下次启动无法识别换世界）: {}",
+                    markerPath, e);
+        }
     }
 
     private static void sleepUninterruptibly(long duration, TimeUnit unit) {
