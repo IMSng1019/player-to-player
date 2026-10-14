@@ -10,9 +10,20 @@ import java.lang.management.ManagementFactory;
  * <p>
  * 规范出处：player_to_player-prompt.txt "算力分配：……同时成为主客户段还有一个条件为
  * 目前剩余的内存大小 服务端可以设定剩余的内存大小 默认为0.5GB" ——
- * 这里读到的是<b>整机物理内存</b>（写入 {@link ComputeScore#freeMemoryBytes()} /
- * {@link ComputeScore#totalMemoryBytes()}），服务端 {@link ComputeTable#selectPrimary}
- * 据此过滤不满足 {@link imsng.player_to_player.config.GlobalConfig#minFreeMemoryBytes} 的候选。
+ * 这里读到的是<b>整机物理内存</b>（不是 JVM 堆、也不是 MC 进程占用），写入
+ * {@link ComputeScore#freeMemoryBytes()} / {@link ComputeScore#totalMemoryBytes()}。
+ *
+ * <h2>快照语义（重要）</h2>
+ * 本类方法每次调用都重新读取系统当前值，但 {@link ComputeScoreProvider} 整机只做一次
+ * 算力检测并长期缓存结果 —— 因此真正上报给服务端的是"<b>模组加载那一刻</b>"的可用内存
+ * 快照，此后不会因为玩家开/关其他程序而刷新。方向偏保守（玩家后来关掉程序腾出的内存
+ * 不会被重新计入），是当前实现的已知取舍。
+ *
+ * <h2>门槛判定在服务端</h2>
+ * 是否够格当主客户端，由服务端用
+ * {@link imsng.player_to_player.config.GlobalConfig#minFreeMemoryBytes}（默认 0.5 GB）
+ * 与这个快照比较（{@link ComputeScore#meetsMemoryRequirement(long)}，
+ * {@link ComputeTable#selectPrimary} 用它过滤候选）；客户端只负责如实上报，不做判定。
  * <p>
  * 实现：强转 {@code com.sun.management.OperatingSystemMXBean}（HotSpot / OpenJDK 系
  * 均导出该接口，Java 17 上 {@code getFreeMemorySize}/{@code getTotalMemorySize} 可用，

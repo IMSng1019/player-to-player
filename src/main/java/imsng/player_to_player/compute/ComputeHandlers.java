@@ -14,7 +14,13 @@ import java.util.UUID;
  * 规范出处：player_to_player-prompt.txt "玩家加入世界：玩家向服务端给出算力能力"；
  * 协议约定：COMPUTE_REPORT 的 JSON = {@code clientId} + {@link ComputeScore#toJson()} 平铺
  * （即 cpuModel / singleCoreScore / source / freeMemoryBytes / totalMemoryBytes
- * 与 clientId 同级）。
+ * / localSingleCoreScore / geekbenchSingleCoreScore / geekbenchVersion 与 clientId 同级）。
+ * <p>
+ * 新旧字段并存是刻意的：{@code singleCoreScore} 恒等于 {@link ComputeScore#rankScore()}
+ * （当前排序键），因此未升级的节点按老字段排序也能得到与新版一致的结论；新节点优先读
+ * {@code localSingleCoreScore}（本地微基准分，唯一可横向比较的量）与
+ * {@code geekbenchSingleCoreScore}/{@code geekbenchVersion}（仅参考），
+ * 缺失即按 0 / "unknown" 处理，见 {@link ComputeScore#fromJson}。
  * <p>
  * <b>线程模型</b>：handler 在 Netty 事件循环上执行 —— 只做 JSON 解析与
  * ConcurrentHashMap 写入（{@link ComputeTable#report}），均为非阻塞轻量操作，
@@ -46,8 +52,12 @@ public final class ComputeHandlers {
             // ComputeScore 字段与 clientId 平铺在同一 JSON 对象里，fromJson 对缺失字段自带安全默认值
             ComputeScore score = ComputeScore.fromJson(message.json());
             table.report(clientId, score);
-            LOGGER.info("收到算力上报: clientId={} cpu={} singleCore={} source={} freeMem={}MB",
-                    clientId, score.cpuModel(), score.singleCoreScore(), score.source(),
+            // 日志打出排序键与两个分：排查"选主是否失真"时能直接看出量纲来源
+            LOGGER.info("收到算力上报: clientId={} cpu={} 排序键={} (本地分={} geekbench参考分={} {}) "
+                            + "source={} freeMem={}MB",
+                    clientId, score.cpuModel(), score.rankScore(),
+                    score.localSingleCoreScore(), score.geekbenchSingleCoreScore(),
+                    score.geekbenchVersion(), score.source(),
                     score.freeMemoryBytes() / (1024 * 1024));
         });
     }
