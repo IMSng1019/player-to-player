@@ -66,6 +66,9 @@ import java.util.Map;
  */
 public final class CommandRouting {
 
+    private static final org.slf4j.Logger LOGGER =
+            org.slf4j.LoggerFactory.getLogger("player_to_player/command-routing");
+
     /** 分类结果：是否引用执行上下文；引用的绝对方块坐标（可能为空）。 */
     public record Analysis(boolean contextBound, List<BlockPos> blockPositions) {
 
@@ -208,7 +211,7 @@ public final class CommandRouting {
                     }
                     Object value = argument.getResult();
                     if (value instanceof Coordinates coordinates) {
-                        if (isRelative(coordinates)) {
+                        if (isRelativeCoordinates(node.getType(), coordinates)) {
                             contextBound = true; // ~ 或 ^：以执行者位置/朝向为原点
                         }
                         if (isPositionKind(node.getType()) && source != null) {
@@ -228,15 +231,33 @@ public final class CommandRouting {
                 contextBound |= hasDefaultedContextArgument(builder);
             }
         } catch (RuntimeException e) {
-            // 分类失败绝不能影响指令本身的执行：保守按"上下文指令"处理（只落发起组）
+            // 分类失败绝不能影响指令本身的执行：保守按"上下文指令"处理（只落发起组）。
+            // 但要留下痕迹 —— 静默的保守回退在实机上无从排查（比如把该广播的指令
+            // 一直只落在发起组），这里的日志是唯一的信号。
+            LOGGER.warn("指令分类失败，按上下文指令保守处理: {}",
+                    parse.getReader() != null ? parse.getReader().getString() : "?", e);
             return new Analysis(true, List.of());
         }
         return new Analysis(contextBound, List.copyOf(positions));
     }
 
-    /** 相对/局部坐标（{@code ~}/{@code ^}）：两种形式在 Coordinates 上都为 relative。 */
-    private static boolean isRelative(Coordinates coordinates) {
-        return coordinates.isXRelative() || coordinates.isYRelative() || coordinates.isZRelative();
+    /**
+     * 该实参是否为相对/局部坐标（{@code ~}/{@code ^}，两种形式在 Coordinates 上都为 relative）。
+     * <p>
+     * <b>必须按参数类型的维度来判</b>：{@link ColumnPosArgument}（{@code /forceload}）与
+     * {@link Vec2Argument}（{@code /spreadplayers} 的中心）只携带 X/Z，它们的
+     * {@code isYRelative()} 恒为 true（Y 槽位天然缺省，已实测）—— 若一律按
+     * "任一维相对即上下文"处理，这两类指令会被误判成"引用执行上下文"而只留在发起组：
+     * {@code /forceload add <from>} 会在发起组设票据却加载不出别人持有的区块（静默失效）。
+     */
+    private static boolean isRelativeCoordinates(Object type, Coordinates coordinates) {
+        if (coordinates.isXRelative() || coordinates.isZRelative()) {
+            return true;
+        }
+        if (type instanceof Vec3Argument || type instanceof BlockPosArgument) {
+            return coordinates.isYRelative();
+        }
+        return false; // ColumnPosArgument / Vec2Argument：Y 不参与语义
     }
 
     /**

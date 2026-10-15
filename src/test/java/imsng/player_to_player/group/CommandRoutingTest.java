@@ -195,6 +195,34 @@ class CommandRoutingTest {
         assertNull(analyze("time set day", 4).chunkRange());
     }
 
+    @Test
+    @DisplayName("缺省参数由同指令实参补齐时不按上下文处理（/forceload add <from> 的 to=from）")
+    void siblingDefaultedArgumentsAreNotContext() {
+        CommandRouting.Analysis add = analyze("forceload add 100 -200", 4);
+        assertFalse(add.contextBound(),
+                "to 未给时原版取 from（与执行者位置无关），误判为上下文会让票据只设在发起组");
+        assertEquals(List.of(new BlockPos(100, 0, -200)), add.blockPositions());
+
+        // 真正的"缺省取执行者位置"仍必须是上下文（回归保护）
+        assertTrue(analyze("spawnpoint Alice", 4).contextBound(),
+                "targets 是 EntityArgument、pos 是 Vec3Argument —— 不同类，不得按兄弟实参补齐");
+        assertTrue(analyze("setworldspawn", 4).contextBound());
+    }
+
+    @Test
+    @DisplayName("XZ 中心（Vec2）计入坐标，旋转（RotationArgument）不计入")
+    void vec2CenterCountsRotationDoesNot() {
+        CommandRouting.Analysis spread = analyze("spreadplayers 500 500 5 10 false @a", 4);
+        assertFalse(spread.contextBound());
+        assertFalse(spread.blockPositions().isEmpty(),
+                "散点的中心必须计入，否则会被广播给所有组在别人领地里取样读方块");
+        assertEquals(500 >> 4, spread.blockPositions().get(0).getX() >> 4);
+
+        CommandRouting.Analysis tp = analyze("tp Alice 1 2 3 90 0", 4);
+        assertEquals(List.of(new BlockPos(1, 2, 3)), tp.blockPositions(),
+                "朝向不是位置：RotationArgument 不得被当成方块坐标");
+    }
+
     // ------------------------------------------------------------ 边界
 
     @Test
