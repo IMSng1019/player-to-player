@@ -135,6 +135,37 @@ for p in ['primary/environment/world/level.dat','primary/data/world/level.dat']:
    **注意**：两轮复查都发现了"上一轮修正自身"的问题 —— 再动线程模型/身份判定前请先读
    `DESIGN.md` §9.2 与本文档的"复查发现"。
 
+### 2026-10-15/16 本轮：指令路由改造（口径 = fix-plan 附录 P / P.2 定稿）
+
+6. **玩家表/身份绑定/本地权限位/`_rid` 号段**（`47226ab`）：`server.ConnectionIdentity`
+   （上报身份必须是本连接所在组成员）、`PlayerTable.declare`（HELLO 是唯一建行入口，
+   修掉复查 G-09 的"表恒空"）、`server.PermissionRelay` → `group.LocalPermissions`
+   （按 ops 名单把真实等级落到主客户端集成服：F3+F4、指令补全、未拦截路径）、
+   控制连接 `_rid` 号段按端隔离（同连接双向 request 互吞，P.0 必修前置）。
+7. **全量上链 + 服务端裁定 + 分组执行**（`3edbbaf`）：`client.mixin.CommandDispatchMixin`
+   （在 `performChatCommand` 本地执行那次调用点拦截）、`group.CommandRouting`
+   （形状规则 + 归属预检的分类器，从解析树判定、不维护指令表）、重写的
+   `group.CommandRelayClient` / `server.CommandChatHandlers`、`server.CommandAggregator`
+   （回执聚合）。原 `mixin.CommandsMixin`（本地失败才上送的探针）已删除。
+   口径与边界见 `DESIGN.md` §13.2 / §13.2.1 / §13.2.2；本轮的静态证据、对抗校验与
+   否证用例见 `docs/plans/2026-10-15-command-routing-compliance-review.md` 与
+   `docs/plans/2026-10-15-command-routing-fix-plan.md`（均已提交）。
+8. 校验：`./gradlew test`（全量 301 例，新增 `CommandRoutingTest` 用**真实原版指令树**
+   锁定分类、`CommandAggregatorTest`）+ `./gradlew build`（Loom 重映射已把 mixin 的
+   `@Inject` 目标解析为 intermediary：`method_45010` / `Commands.method_9249`）。
+
+**指令路由的待办（按顺序）**：
+
+1. **实测验收**（必须实机，需要第二个客户端才能测多组项）：先跑 fix-plan §6 的
+   否证用例 F1–F4，再按 §6 的 0–6 条验收；单组环境可先测"服务端 `/op` → 补全里出现
+   `/gamemode`、F3+F4 立刻可用、`/gamemode spectator` 生效、非 OP 的报错文案与真人原版
+   一致"。注意 **F3+F4 与聊天栏是两条入口**，测试用聊天栏敲指令。
+2. **3/4 级指令的组侧副作用**（未实现）：`/save-all` 通知各组刷盘、`/save-off|on` 开关、
+   `/reload` 各组重载、`/stop` 各组有序退出、`/ban`/`/kick` 通知所在组踢出成员。
+   每条都要复用退出事务/写回通道，属新子系统；未做之前这些指令只有服务端侧效果 + 回执。
+3. 已知边界（`DESIGN.md` §13.2.1）：选择器跨组（范围外）、集成服专属指令（如 `/publish`）
+   由物理服指令集裁定、混版本节点会在发起组重复执行（升级时各端一起更新）。
+
 未实施（仍在队列）：
 
 - P1：协议 `worldId`、退出/运行期传输收敛（512 KiB 分片 + 线性超时预算 + `EXIT_STATUS` 续传）、

@@ -75,6 +75,10 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
 
 - 最大帧长 `Protocol.MAX_FRAME_BYTES`（16 MB），超限即断开（防攻击）。
 - 请求-响应关联：JSON 内 `_rid` 字段（long 自增），`ControlConnection.request()` 自动填写并等待。
+  **号段按端隔离**（`Protocol.RID_BASE_ACCEPTOR`=接受端低位 / `RID_BASE_DIALER`=发起端高位）：
+  同一条连接上两端都会发起 request（客户端上送指令、服务端下发转发执行），而应答匹配规则是
+  "命中在途表即完成 future 并不再分发" —— 共用一个自增号段会互吞：本端的 future 被对端的
+  请求错配完成，对端的请求永远不进处理器，直到 15 秒超时（表现为"指令在别的组随机不执行"）。
 - 心跳：双向 PING/PONG，30s 间隔，90s 无响应断开。
 
 ### 3.2 消息类型总表（MessageType）
@@ -112,6 +116,12 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
 - 持久化：`RegistryStore` 后端抽象（Phase 4）——默认 JSON（`player-to-player/registry/<维度>.json`，
   定期 + 关闭时写盘），可切 MySQL（见第 13.7 节）；内存表恒为权威。
 - `PlayerTable`：玩家 UUID → 名字/维度/坐标/组/端级别，供跨组 tp 指令与消息路由（第 13.2 节）使用。
+  **建行只有一个入口**：HELLO 握手（`HelloHandler` → `PlayerTable.declare`；玩家客户端的
+  `clientId` 就是其 MC 档案 UUID，见 `WorldSession.onJoin`）。1Hz 的 `PLAYER_POS_UPDATE(32)`
+  刷新坐标、角色指派/合并/分离刷新组与端级别、断连移除。位置上报与指令上送都要过
+  "身份自洽"校验（`server.ConnectionIdentity`：上报的 UUID 或玩家名必须属于该连接所在组的
+  成员）—— 玩家表落库后这些坐标会直接成为跨组 `/tp` 的落点，不校验就等于把落点交给任意
+  已握手连接。**它只保证"同一连接自洽"**（挡不住同组内冒用，那需要控制信道的玩家级认证）。
 
 ## 6. 算力（compute 包）
 
@@ -256,6 +266,11 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
   preserveExisting 区块帧；`CHUNK_RELEASE` 增加稳定 `releaseId`，新增
   `CHUNK_RELEASE_RECEIPT_CONFIRM(29)`。这是显式的不向后兼容变更，v3/v4 节点握手时
   直接拒绝混连。
+- 指令路由改造（第 13.2 节）只做**加性字段**（`dimension`/`x`/`y`/`z`/`sourceUuid`/
+  `origin`/`messageJson` 等）与**新增消息类型**（`PERMISSION_RELAY(72)`），不升
+  `Protocol.VERSION`。但 `COMMAND_RELAY` 的语义变了（"本地失败才上送"→"全量上链"）：
+  老客户端 + 新服务端会让发起组那条指令重复执行一次，**升级时各端一起更新**
+  （§13.2.1 表 7）。
 
 ## 11. Phase 2：组世界（集成服务端接管 + P2P 隧道 + 区块数据面）
 
@@ -331,8 +346,9 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
   DataVersion 不高于本服。**物理服务端自身存盘已取消**（ChunkMapMixin.save @HEAD，
   SERVER 模式 + suspendWorldTick 门控）：登录期加载的陈旧内存区块永不写盘，
   MCA 唯一写入来源收敛为客户端上行，消灭覆盖竞态。
-- **位置上报**：集成服务端每 20 tick 把组内全部玩家位置经 PLAYER_POS_UPDATE(32)
-  上报服务端玩家表。
+- **位置上报**：集成服务端每 20 tick 把组内全部玩家（主 + 副）的 uuid/名字/维度/坐标经
+  PLAYER_POS_UPDATE(32) 上报服务端玩家表；服务端按"本组成员自洽"校验后才写入（第 13.2 节
+  的身份绑定；名字字段用于覆盖离线/开发环境下集成服派生 UUID 与档案 UUID 不一致的情形）。
 
 #### 11.2.1 服务端数据基线与增量退出
 
@@ -462,37 +478,102 @@ CHUNK_PROBE_REQUEST(27) / CHUNK_PROBE_RESPONSE(28)
     只读归属探测：与 tryClaim 同一套"目标+四邻缓冲"检查但不登记占用。
     传送门预检与珍珠交接判定共用（预申请会泄漏永不释放的占用，探测无副作用）。
 GROUP_WORLD_READY(34)   C→S 主客户端组世界完成 LAN 发布的就绪通告
-COMMAND_RELAY(70)       指令逐级路由（三种载荷靠 JSON 字段区分，见 13.2）
+COMMAND_RELAY(70)       指令全量上链 / 转发执行 / 聚合回执（三种载荷靠 JSON 字段区分，见 13.2）
 CHAT_RELAY(71)          聊天全网分发 / 跨组私聊（privateTo）
+PERMISSION_RELAY(72)    S→C 权限下发（组成员 → ops 真实等级；本地权限位落地用，见 13.2）
 PEARL_HANDOFF(90)       珍珠交接（json 带目标组/维度/抛出者；binary 透传 gzip NBT）
 PEARL_LANDED(91)        珍珠落点回报（回程给抛出者所在组，落地=小型 tp）
 ```
 
-### 13.2 指令逐级路由（mixin.CommandsMixin + group.CommandRelayClient + server.CommandChatHandlers）
+### 13.2 指令路由（client.mixin.CommandDispatchMixin + group.CommandRelayClient + server.CommandChatHandlers）
 
-规范链路"副→主→中转→服务端→其他主→其他副"的实现（中转端不持业务状态，
-控制连接本就可经中转桥接，链路上它是透明的）：
+口径（2026-10-15 定稿）：**全量上链 + 服务端唯一裁定 + 分组执行**。
+规范链路"副→主→中转服务端→服务端→其他的主客户端→其他的组客户端的副客户端"即由
+这条链路承载（中转端不持业务状态，控制连接本就可经中转桥接，链路上它是透明的）：
 
 ```
-副客户端输入指令 ──隧道(原版)──→ 主客户端集成服务端执行
-  CommandsMixin 注入 Commands.performCommand（1.20.4 玩家指令唯一汇聚点）：
-    HEAD @ModifyVariable：Commands.mapSource 换上挂 CommandResultCallback 探针的源
-    RETURN @Inject：结算 —— 任一叶子成功=成功（原版反馈口径）；线程局部栈保证重入配对
-  本地失败（含解析失败：回调从未发火）→ COMMAND_RELAY 上送（2s/人限速）
-    → 服务端 CommandChatHandlers：
-        特例 /list        → 玩家表直接应答（全网玩家，不是单组视野）
-        特例 /tp /msg     → 玩家表跨组解析（规范"服务端可执行原主不能执行的 tp"）
-        泛化              → execute=true 下放其他组主客户端逐个试执行，
-                            首个 executed=true 胜出（AtomicBoolean 竞争收敛）
-    → 应答 handled/message/action：
-        action=teleport → 发起方本地把玩家 teleportTo 目标坐标（不搬实体 ——
-          落点属他组时区块申请被拒自然触发预连接/合并，机制复用）
-        message         → 投递给发出指令的玩家（规范"执行端消息返回发出端"）
-        handled=false   → 无补发（原版报错已即时显示，即规范"返回本地报错"）
+玩家（主/副客户端）在聊天栏敲指令
+  └ 集成服务端 ServerGamePacketListenerImpl.performChatCommand（原版签名校验之后）
+    └ CommandDispatchMixin：本地执行那次 Commands.performCommand 调用前拦截
+      → 无条件上链，本地不执行（副客户端的指令经隧道汇聚到主客户端集成服，同一入口）
+        COMMAND_RELAY 上送（playerUuid / playerName / command / dimension / x,y,z）
+        └ 服务端 CommandChatHandlers（权限唯一裁定的地方）：
+            ① 身份自洽（ConnectionIdentity：必须是本连接所在组的成员）
+            ② 以发起者真实 ops 等级解析原版指令树（requires 由原版裁定；
+               解析不通过 → 回原版报错文案"在原版中不合理的指令是不会被执行的"）
+            ③ 三个特例：/list（玩家表答全网玩家）、/tp <玩家名>（玩家表解析出坐标，
+               由发起端本地 teleportTo）、/msg <玩家名> <文本>（跨组私聊投递）
+            ④ 3/4 级指令（2 级权限下解析不通过）→ 在服务端执行，结果文案回发起端
+            ⑤ 0-2 级指令 → 形状规则 + 归属预检决定目标组，转发执行（权限钳到 2）
+          └ 目标组主客户端执行一次：发起组用【发起玩家实体】当指令源，
+            其余组用虚拟源（该维度出生点、entity=null）
+            └ COMMAND_RELAY 应答（executed / message）
+      └ CommandAggregator 聚合：首成功 → 执行端的消息；全失败 → 发起组那次的报错
+        → 发起端把回执显示给玩家（action=teleport 时改走本地传送）
 ```
 
-- 转发执行用**收集输出的虚拟指令源**（CollectingSource，entity=null 天然被探针
-  跳过，无递归上送），权限取服务端按 ops 名单核出的值并双侧钳制到 2。
+- **拦截点为什么选数据包入口**：只有"玩家敲的指令"经过 `performChatCommand`
+  （聊天栏与 F3+F4/F3+N 同一条路）。告示牌、命令方块、数据包函数与第三方程序化调用
+  不经过它 —— 它们照旧在本地按服务端下发的真实权限位执行（第 13.2.2 节）。
+  注入位置在**本地执行那次调用点**而非方法 HEAD：原版的签名/LastSeenMessages 校验
+  与失败处理照常执行，取消的只是本地执行这一步。
+- **形状规则**（`group.CommandRouting`，判定全部从解析树自动得出，不维护指令表）：
+  凡引用<b>执行上下文</b>的指令 —— `@s`/`@p`/`@r`、相对/局部坐标（`~`/`^`）、
+  以及缺省位置或缺省目标（`/summon zombie`、`/gamemode creative`、裸 `/kill`）——
+  <b>只在发起组执行</b>，且指令源是发起玩家实体（原版语义完整保留）；
+  其余指令在所有组各执行一次（用户口径："一条指令的语义 = 全网各执行一次"）。
+- **归属预检（挂死守则）**：带绝对坐标的指令只发给**真正持有这些区块的组**
+  （`ChunkRegistry.ownerOf`）。理由是实测的冻结机制：集成服务端里
+  `Level.getBlockState` 等路径会在主线程 `managedBlock + join` 等区块加载，而
+  "本组不持有、被其他组占用"的区块其加载 future 永远悬置（门控无限重试）⇒
+  主线程<b>永久忙等</b>（集成服没有 watchdog）；组内玩家视野里的区块本来就有 PLAYER 票，
+  所以"执行到别人的区块"随时可复现。无人持有 → 交回发起组按需申请（与原版本地执行
+  同一条加载门控）；归属跨越多个组 → 拒绝执行并说明原因。接收端在执行前再按本地
+  claim 集复核一次，兜住"服务端预检 → 实际执行"之间的归属变化（合并/分离/退出期间）。
+- **权限两套口径**（不可混，第 13.2.2 节）：
+  ① <b>本地权限位</b> = 服务端 ops 名单的<b>真实等级</b>（`PermissionRelay` 下发、
+     `LocalPermissions` 落到该组主客户端的集成服务端）；
+  ② <b>跨组广播执行的权限</b> = `min(真实等级, FORWARD_PERMISSION_CAP=2)`。
+- **回执聚合**（`server.CommandAggregator`）：首个成功即回"执行端的消息"；全部失败回
+  发起组那一次的报错（发起组也在执行集合里，它的失败文案就是规范说的"本地的报错信息"）。
+  执行侧输出统一经 `group.CommandFeedback` 收集回传、**不直发玩家** —— 玩家看到的输出
+  只有这一条回执；代价是本地报错从"立即显示"变为"回执后显示"（每条指令一次 RTT）。
+- **错误文案本地化**：解析类报错（未知指令/权限不足）随回执附带可本地化组件 JSON
+  （`messageJson`），玩家端显示的语言与真人原版一致。
+
+#### 13.2.1 边界与已知取舍（改这条链路前先读）
+
+| # | 边界 | 说明 |
+|---|------|------|
+| 1 | 选择器只在本组解析 | `@a`/`@e` 类指令在各组各解析一次（符合"每组各执行一次"）；跨组选择器（"全网最近的玩家"）不实现，`@s`/`@p`/`@r` 归发起组。**规范剩余的"选择器跨组"差距在此明确记为范围外** |
+| 2 | 指令集以物理服务端的树为准 | 集成服专属指令（如 `/publish`）不在物理服树里 → 上链后被判"未知指令"并回原版报错 |
+| 3 | 3/4 级指令的组侧副作用未实现 | `/save-all`、`/stop`、`/reload` 目前只有服务端侧效果 + 回执；"通知各组刷盘/有序退出/重载"属独立子系统（后续阶段） |
+| 4 | 3/4 级指令真的会在服务端生效 | `/stop` 会停物理服务端、`/ban`/`/op` 会改名单 —— 这是定稿口径（"3/4 级指令在服务端执行"）；3/4 级指令绝不跨组 |
+| 5 | 客户端半可信 | 身份绑定只保证"同一连接自洽"（UUID/名字属于本组），挡不住被改造的主客户端冒用本组他人身份；权威只有物理服务端的权限裁定期 |
+| 6 | 落权是纯内存、按会话 | 集成服从不读 `ops.json`（`PlayerList` 构造器不 `load`）；`StoredUserList.add` 会顺手把文件写到进程 CWD，但没有任何回读路径（无害副作用），世界关闭即随实例销毁 |
+| 7 | 混版本节点会重复执行 | 协议只做加性字段、不升 `Protocol.VERSION`：老客户端（本地失败才上送）+ 新服务端时，发起组那条指令会被执行两次（本地一次 + 广播一次）⇒ 升级时各端一起更新 |
+| 8 | 限速 | 客户端上链入口与服务端上链入口各一道令牌桶（突发 12/20、约 4 条每秒，单调钟）；超限回明确文案，不静默丢弃 |
+| 9 | 相对坐标的维度重定向 | `/execute in <维度> run <绝对坐标指令>` 按上下文处理（只在发起组执行）：绝对坐标属于哪个维度无法从本地解析判定，保守收在发起组 |
+
+#### 13.2.2 本地权限位与权限下发（PermissionRelay → LocalPermissions）
+
+组世界的权威演算是主客户端的集成服务端，而它发布时不开放作弊
+（`GroupHost` 的 `publishServer(…, false, …)`，有意决策："组世界的权威演算不应被本地
+作弊指令干预"），集成服又从不读取 `ops.json` —— 于是玩家的本地权限恒为 0：
+F3+F4 被客户端 `hasPermissions(2)` 闸门静默拦下、指令补全树按权限过滤后连 `/gamemode`
+都看不到。修复是**按玩家、按服务端 ops 名单精确落权**，不是开全局作弊：
+
+- 服务端 `PermissionRelay` 按"组 → 组成员"核出真实等级（`MinecraftServer
+  .getProfilePermissions`，组成员 clientId 即玩家档案 UUID），下发给该组主客户端；
+  触发时机 = HELLO 重连、角色指派、合并提交、分离，外加每 5 秒一次变化 diff
+  （覆盖控制台 `/op`、直接改 ops.json 等绕过模组的路径），只在变化时发包；
+- 主客户端 `LocalPermissions` 在自己的集成服里落权：
+  `PlayerList.getOps().add(new ServerOpListEntry(profile, 真实等级, false))` +
+  `sendPlayerPermissionLevel(player)`（同一次调用既发权限事件包、也重发指令树），
+  等级 0 则移除条目而不是留一个"0 级 op"。全部在集成服主线程做
+  （`ServerOpList` 内部是非并发 HashMap），落点：LAN 发布后、玩家 JOIN、
+  名单变化时；`GroupHost.reset` / `GroupRuntime.detach` / `disarm` 清缓存。**不做**：
+  改 `level.dat` 的 `allowCommands`、`setAllowCheatsForAllPlayers(true)`（都违反上述决策）。
 
 ### 13.3 消息处理（group.ChatRelay）
 
@@ -501,7 +582,9 @@ PEARL_LANDED(91)        珍珠落点回报（回程给抛出者所在组，落�
 - 入站：以 `<名字> 内容` 系统消息在本组集成服务端广播（原版链路自然下发副客户端）。
   跨组重放不用签名聊天：1.19+ 聊天签名与玩家会话绑定，跨服务端无法复现（所有
   跨服聊天桥的通行做法）；系统消息不触发 CHAT_MESSAGE 事件，回环免疫。
-- 跨组私聊（/msg 特例）：服务端解析目标 → 目标组主客户端收 privateTo 载荷定向投递。
+- 跨组私聊（/msg 特例）：服务端解析目标 → 目标组主客户端收 privateTo 载荷定向投递；
+  正文按**解析结果的实参区间**提取（旧实现用 `indexOf` 定位目标名，目标名与指令字面量
+  同形时会截错，如 `/tell tell hi`）。
 
 ### 13.4 传送门与末影珍珠（mixin.EntityPortalMixin / ThrownEnderpearlMixin）
 
