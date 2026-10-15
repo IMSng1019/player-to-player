@@ -7,7 +7,6 @@
 		"ChunkMapAccess",
 		"ChunkMapMixin",
 		"ChunkStorageMixin",
-		"CommandsMixin",
 		"EntityPortalMixin",
 		"MinecraftServerMixin",
 		"ServerLevelMixin",

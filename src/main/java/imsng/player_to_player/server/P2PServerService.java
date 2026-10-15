@@ -319,8 +319,9 @@ public final class P2PServerService {
                 sleepUninterruptibly(1, TimeUnit.SECONDS);
             }
         }
-        // 指令/聊天逐级路由（Phase 4）：COMMAND_RELAY 特例处理 + 泛化下放，CHAT_RELAY 全网分发
-        CommandChatHandlers.register(control, server, groups, players);
+        // 指令/聊天路由（Phase 4）：COMMAND_RELAY 由服务端唯一裁定（真实权限 + 形状规则 +
+        // 区块归属预检），再分组广播执行；CHAT_RELAY 全网分发。
+        CommandChatHandlers.register(control, server, groups, players, registry, permissions);
         // 末影珍珠交接路由（Phase 4）：PEARL_HANDOFF 转发目标组 / PEARL_LANDED 回程抛出者组
         PearlHandlers.register(control, groups);
 
