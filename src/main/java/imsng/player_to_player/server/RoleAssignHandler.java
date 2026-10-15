@@ -153,7 +153,7 @@ public final class RoleAssignHandler implements MessageHandler {
                     conn.send(msg.reply(MessageType.ROLE_ASSIGN, out, null));
                     // 玩家表同步组/角色（HELLO 已建行）+ 重推该组权限名单（成员变了）
                     players.updateGroupRole(peer, owningGroup, "secondary");
-                    permissions.push(owningGroup);
+                    permissions.refreshForClient(peer);
                     LOGGER.info("角色指派: {} → 副客户端（组 {}，目标区块 {}）",
                             peer, owningGroup, target.asString());
                     return;
@@ -187,7 +187,7 @@ public final class RoleAssignHandler implements MessageHandler {
         out.addProperty("primaryClientId", peer.toString());
         conn.send(msg.reply(MessageType.ROLE_ASSIGN, out, null));
         players.updateGroupRole(peer, peer, "primary");
-        permissions.push(peer);
+        permissions.refreshForClient(peer);
         LOGGER.info("角色指派: {} → 主客户端（目标区块 {}）", peer, target.asString());
     }
 

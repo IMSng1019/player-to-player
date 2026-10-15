@@ -186,7 +186,8 @@ public enum MessageType {
      * （告示牌/命令方块/第三方程序化调用）都按该等级生效；而<b>跨组广播执行</b>的
      * 权限仍单独钳制到 {@code FORWARD_PERMISSION_CAP}，两者作用面不同。
      * <p>
-     * 触发时机：角色指派、合并提交、分离、HELLO 重连，以及 ops 名单周期性 diff
+     * 触发时机：角色指派（ROLE_REQUEST 后强制重推，客户端此刻已注册好处理器）、
+     * 合并提交、分离、HELLO 重连，以及 ops 名单周期性 diff
      * （等级变化才重发）。语义上它是"缓存"，权威始终在物理服务端。
      */
     PERMISSION_RELAY(72),

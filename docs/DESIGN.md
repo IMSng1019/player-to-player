@@ -591,7 +591,9 @@ F3+F4 被客户端 `hasPermissions(2)` 闸门静默拦下、指令补全树按�
 
 - 服务端 `PermissionRelay` 按"组 → 组成员"核出真实等级（`MinecraftServer
   .getProfilePermissions`，组成员 clientId 即玩家档案 UUID），下发给该组主客户端；
-  触发时机 = HELLO 重连、角色指派、合并提交、分离，外加每 5 秒一次变化 diff
+  触发时机 = 角色指派（ROLE_REQUEST 之后强制重推：客户端此刻才注册好处理器，
+  否则第一次推送必然被"无处理器"丢弃）、HELLO 重连、合并提交、分离，
+  外加每 5 秒一次变化 diff
   （覆盖控制台 `/op`、直接改 ops.json 等绕过模组的路径），只在变化时发包；
 - 主客户端 `LocalPermissions` 在自己的集成服里落权：
   `PlayerList.getOps().add(new ServerOpListEntry(profile, 真实等级, false))` +

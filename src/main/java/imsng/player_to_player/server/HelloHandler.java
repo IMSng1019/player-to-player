@@ -171,11 +171,6 @@ public final class HelloHandler implements MessageHandler {
         // 指令路由能力位（加性字段）：客户端只有在 ACK 里看到它才启用"全量上链"，
         // 否则保持老行为（本地执行 + 失败才上送）—— 混版本时双向都有安全网
         ack.addProperty("commandRouting", 1);
-        // 重连客户端此刻还没注册 PERMISSION_RELAY 处理器：名单随 ACK 一起给，
-        // 保证"本地权限位"不会因为丢帧而停在旧值（周期兜底随后仍会幂等重发）
-        if (permissions != null) {
-            permissions.appendToAck(ack, clientId);
-        }
         connection.send(message.reply(MessageType.HELLO_ACK, ack, null));
 
         // 重连的客户端可能带着空权限名单：按其所在组强制重推一次（未入组则等待角色指派）

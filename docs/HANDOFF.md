@@ -175,8 +175,10 @@ for p in ['primary/environment/world/level.dat','primary/data/world/level.dat']:
      各自保持老行为，杜绝"重复执行/静默漏执行"；
    - **权限等级快照**（minor）：指令上送的权限裁定改读 `PermissionRelay` 在服务器
      主线程维护的快照（原先从 Netty 线程直读非并发 ops 表，属数据竞争）；
-   - **权限名单随 HELLO_ACK 下发**（minor）：重连时客户端尚未注册 PERMISSION_RELAY
-     处理器，只发帧会丢且被去重签名抑制 ⇒ 本地权限位停在旧值；
+   - **权限名单在 ROLE_REQUEST 后强制重推**（minor）：客户端注册处理器是在 HELLO_ACK
+     之后，重连时的那次推送必然落空且被去重签名抑制 ⇒ 本地权限位停在旧值（F3+F4 又不可用）。
+     改为在客户端已就绪的 ROLE_REQUEST 之后清签名重推（ACK 路径因会在 Netty 线程读
+     非并发 ops 表而弃用）；
    - **CHAT_RELAY 也做身份校验**（minor）：聊天帧的 playerName 不能再是任意自报值；
    - 测试补齐：`CommandOwnershipRouterTest`（含死区块/预演否决）、
      `CommandOwnershipVerifyTest`、`LocalPermissionsParseTest`、`TokenBucketTest`、

@@ -68,19 +68,6 @@ public final class PermissionRelay {
         return array;
     }
 
-    /** 直接按组成员构造名单数组（HELLO_ACK 用；在服务器主线程调用）。 */
-    private JsonArray buildMembers(UUID groupId) {
-        List<MemberPermission> list = new ArrayList<>();
-        for (UUID member : groups.membersOf(groupId)) {
-            String name = ConnectionIdentity.nameOf(member);
-            int level = server.getProfilePermissions(new GameProfile(member,
-                    name != null ? name : "?"));
-            list.add(new MemberPermission(member, name != null ? name : "?", level));
-            levelSnapshot.put(member, level);
-        }
-        return buildMemberArray(list);
-    }
-
     /** 一名成员的权限档（下发给主客户端的名单行）。 */
     public record MemberPermission(UUID playerId, String playerName, int level) {
     }
@@ -134,21 +121,25 @@ public final class PermissionRelay {
     }
 
     /**
-     * 把该客户端所在组的权限名单附到 HELLO_ACK 上（加性字段）。
+     * 客户端已就绪时的<b>强制重推</b>：清掉去重签名再发一次（值仍是主线程现算的）。
      * <p>
-     * 为什么要走 ACK：重连时服务端会立刻补推一次名单，但客户端此刻还没注册
-     * PERMISSION_RELAY 处理器（注册在 HELLO_ACK 之后），帧会被"无处理器"丢弃，
-     * 而去重签名又让后续推送不再重发 —— 本地权限位就会停在旧值（常见为 0）。
-     * ACK 是应答路径（客户端在等它的 future），必然送达；周期兜底随后仍会重发一次
-     * 作为幂等重试（客户端重复应用同一等级是空操作）。
+     * 用在两条路径上，都是为了解决"第一次推送必然落空"：
+     * <ul>
+     *   <li>HELLO 重连（{@link #pushForClient}）—— 客户端此刻还没注册
+     *       PERMISSION_RELAY 处理器（注册在 HELLO_ACK 之后），帧会被"无处理器"丢弃；</li>
+     *   <li>ROLE_REQUEST（{@link #refreshForClient}）—— 客户端<u>已经</u>注册完处理器
+     *       才发这条请求，此刻重推必然能落地。角色指派也正好会改变组成员。</li>
+     * </ul>
+     * 周期兜底（每 {@value #SWEEP_INTERVAL_SECONDS} 秒）随后仍会按签名差异补齐，
+     * 所以这里是"尽快送达"而不是唯一通道。
      */
-    public void appendToAck(JsonObject ack, UUID clientId) {
+    public void refreshForClient(UUID clientId) {
         UUID groupId = clientId != null ? groups.groupOf(clientId) : null;
         if (groupId == null) {
-            return; // 还没入组：角色指派时会推
+            return;
         }
-        ack.addProperty("permissionsGroupId", groupId.toString());
-        ack.add("permissions", buildMembers(groupId));
+        lastPushed.remove(groupId);
+        push(groupId);
     }
 
     /** 调度一次下发（任意线程；实际计算在服务器主线程）。 */
