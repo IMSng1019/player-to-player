@@ -223,6 +223,21 @@ class CommandRoutingTest {
                 "朝向不是位置：RotationArgument 不得被当成方块坐标");
     }
 
+    @Test
+    @DisplayName("黑盒与偏移量：/function 按上下文；/particle 的 delta 不计入坐标")
+    void blackBoxAndOffsetArguments() {
+        // 函数体是黑盒：广播会让其他组用"出生点 + entity=null"的虚拟源执行函数体，
+        // 里面的 ~/^/@s 全落错地方（在他组出生点复刻一遍建筑）
+        assertTrue(analyze("function mypack:build_hut", 4).contextBound());
+        assertTrue(analyze("schedule function mypack:tick 1t", 4).contextBound());
+
+        // /particle 的 delta 是偏移量：并入包围盒会误拒合法指令或路由到错误的组
+        CommandRouting.Analysis particle =
+                analyze("particle flame 100 64 100 0.5 0.5 0.5 0.01 20", 4);
+        assertFalse(particle.contextBound());
+        assertEquals(List.of(new BlockPos(100, 64, 100)), particle.blockPositions());
+    }
+
     // ------------------------------------------------------------ 边界
 
     @Test

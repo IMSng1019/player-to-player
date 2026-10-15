@@ -91,7 +91,12 @@ public final class CommandChatHandlers {
 
     private static final long UPLINK_REFILL_NANOS = 250_000_000L;
 
-    /** 连接身份（clientId）→ 令牌桶。 */
+    /**
+     * 玩家（归一后的成员 ID）→ 令牌桶。
+     * <p>
+     * 按<b>玩家</b>而不是按连接：一条控制连接代表整个组（主客户端 + 其副客户端都经
+     * 它上送），按连接限速会让一个玩家连打把同组其他人卡在"指令过于频繁"。
+     */
     private final Map<UUID, TokenBucket> uplinkBuckets = new java.util.concurrent.ConcurrentHashMap<>();
 
     private final MinecraftServer server;
@@ -161,7 +166,7 @@ public final class CommandChatHandlers {
                     requester, command);
             return;
         }
-        if (!uplinkBuckets.computeIfAbsent(requester,
+        if (!uplinkBuckets.computeIfAbsent(playerUuid,
                 id -> new TokenBucket(UPLINK_BURST, UPLINK_REFILL_NANOS)).tryAcquire()) {
             conn.send(error(msg, "too_many_commands", "指令过于频繁，请稍候再试"));
             return;
@@ -296,6 +301,15 @@ public final class CommandChatHandlers {
                 LOGGER.warn("服务端执行指令异常: /{}", command, e);
             }
             String message = feedback.joined();
+            // 审计痕迹：这些指令（/op、/ban、/stop…）在原版会写控制台与 latest.log，
+            // 收集器不直发的话服务端侧就只剩一行模组日志 —— 同时发一份给服务端自身
+            if (!message.isEmpty()) {
+                server.sendSystemMessage(net.minecraft.network.chat.Component.literal(
+                        "[" + playerName + ": /" + command + "] " + message));
+            } else {
+                server.sendSystemMessage(net.minecraft.network.chat.Component.literal(
+                        "[" + playerName + " 执行了 3/4 级指令: /" + command + "]"));
+            }
             if (message.isEmpty()) {
                 message = "指令已在服务端执行: /" + command;
             }
@@ -439,6 +453,9 @@ public final class CommandChatHandlers {
         push.addProperty("playerName", fromName);
         push.addProperty("text", text);
         push.addProperty("privateTo", target.playerId().toString());
+        // 目标名字一并下发：集成服里副客户端的实体 UUID 是原版离线派生值，
+        // 接收端按成员档案 UUID 查不到实体时靠它兜底（否则私聊静默丢失）
+        push.addProperty("targetName", target.playerName());
         c.send(ControlMessage.of(MessageType.CHAT_RELAY, push));
         return true;
     }
@@ -483,9 +500,13 @@ public final class CommandChatHandlers {
             return; // 入站不可信：空文本/超长文本丢弃
         }
         // 与指令上送同口径的身份校验：聊天帧的 playerName 不能是任意自报值
-        //（否则任何已握手连接都能以管理员名义跨组发言）
-        if (ConnectionIdentity.canonicalMemberId(groups, sender, null, playerName) == null) {
-            LOGGER.warn("拒绝越权聊天上送: 连接 {} 声称玩家 {}", sender, playerName);
+        //（否则任何已握手连接都能以管理员名义跨组发言）。帧里本来就带 playerUuid
+        //（集成服实体 UUID），必须一并传入 —— 只比名字会让本组任意成员都能冒用他人
+        // 名义发言；带上 UUID 后"配对判据 + 离线派生化校验"才真正生效。
+        UUID senderUuid = parseUuid(JsonUtil.getString(msg.json(), "playerUuid", ""));
+        if (ConnectionIdentity.canonicalMemberId(groups, sender, senderUuid, playerName) == null) {
+            LOGGER.warn("拒绝越权聊天上送: 连接 {} 声称玩家 {}（{}）",
+                    sender, playerName, senderUuid);
             return;
         }
         UUID originGroup = groups.groupOf(sender);

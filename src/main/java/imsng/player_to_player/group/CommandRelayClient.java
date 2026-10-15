@@ -157,9 +157,11 @@ public final class CommandRelayClient {
             }
             if (!buckets.computeIfAbsent(player.getUUID(),
                     id -> new TokenBucket(TOKEN_BURST, TOKEN_REFILL_NANOS)).tryAcquire()) {
+                // 限速命中：本次不上链，退回本地执行（此时链路上没有第二条执行路径，
+                // 不存在"本地 + 广播"重复执行），而不是把指令整条丢掉
                 player.sendSystemMessage(Component.literal(
-                        "[P2P] 指令过于频繁，请稍候再试"));
-                return true; // 丢弃且不本地执行：保持"指令只走一条路径"的不变式
+                        "[P2P] 指令过于频繁，本次仅在本地执行"));
+                return false;
             }
             String normalized = command.startsWith("/") ? command.substring(1) : command;
             JsonObject json = new JsonObject();
@@ -190,9 +192,18 @@ public final class CommandRelayClient {
                 .whenComplete((resp, err) -> {
                     MinecraftServer server = GroupRuntime.server();
                     if (resp != null && resp.type() == MessageType.ERROR) {
-                        // 服务端明确拒绝（未授权/非法帧）：把它的文案回给玩家
-                        deliverMessage(server, playerId,
-                                JsonUtil.getString(resp.json(), "message", "指令被服务端拒绝"));
+                        String code = JsonUtil.getString(resp.json(), "code", "");
+                        String text = JsonUtil.getString(resp.json(), "message", "指令被服务端拒绝");
+                        if ("too_many_commands".equals(code)) {
+                            // 服务端在限速处就拒了，保证没有执行过 ⇒ 本地补执行一次是安全的
+                            //（比"指令凭空消失"好），并给出可见文案
+                            String command = JsonUtil.getString(json, "command", "");
+                            scheduleLocalFallback(server, playerId, command);
+                            deliverMessage(server, playerId,
+                                    Component.literal("[P2P] 服务端限速，本次仅在本地执行"));
+                            return;
+                        }
+                        deliverMessage(server, playerId, Component.literal(text));
                         return;
                     }
                     if (err != null || resp == null
@@ -215,6 +226,26 @@ public final class CommandRelayClient {
                         deliverMessage(server, playerId, decodeComponent(messageJson, message));
                     }
                 });
+    }
+
+    /** 限速兜底：在本地以玩家自身指令源执行一次（服务端已确认未执行）。 */
+    private static void scheduleLocalFallback(MinecraftServer server, UUID playerId,
+                                              String command) {
+        if (server == null || command == null || command.isBlank()) {
+            return;
+        }
+        server.execute(() -> {
+            ServerPlayer player = server.getPlayerList().getPlayer(playerId);
+            if (player == null) {
+                return;
+            }
+            try {
+                server.getCommands().performPrefixedCommand(
+                        player.createCommandSourceStack(), command);
+            } catch (Exception e) {
+                LOGGER.warn("限速兜底本地执行失败: /{}", command, e);
+            }
+        });
     }
 
     /** 组件 JSON → Component（失败回退纯文本；入站数据不可信）。 */
@@ -371,6 +402,12 @@ public final class CommandRelayClient {
                                 ControlMessage msg, String command, boolean origin,
                                 UUID sourceUuid, String sourceName, String dimension,
                                 int permission) {
+        if (GroupRuntime.isExitDraining()) {
+            // 退出事务冻结期：本组的认领会被注册表直接拒绝（exitFrozenGroups），
+            // 执行指令只会撞上"门控无限重试"的忙等面 —— 干净跳过并说明
+            reply(conn, msg, false, "本组正在退出世界，已跳过执行");
+            return;
+        }
         // 区块归属复核：只要服务端下发了"持有区块"清单就要复核（含发起组自己那一次）
         String verdict = verifyOwnedChunks(msg.json());
         if (verdict != null) {

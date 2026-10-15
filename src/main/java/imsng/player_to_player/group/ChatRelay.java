@@ -63,7 +63,7 @@ public final class ChatRelay {
             }
             // signedContent = 玩家输入的原文（不带 <名字> 装饰，接收端统一格式化）
             JsonObject json = new JsonObject();
-            json.addProperty("playerUuid", sender.getUUID().toString());
+            json.addProperty("playerUuid", sender.getUUID().toString()); // 集成服实体 UUID
             json.addProperty("playerName", sender.getGameProfile().getName());
             json.addProperty("text", message.signedContent());
             conn.send(ControlMessage.of(MessageType.CHAT_RELAY, json));
@@ -87,6 +87,7 @@ public final class ChatRelay {
                 return; // 入站不可信：空/超长丢弃
             }
             String privateTo = JsonUtil.getString(msg.json(), "privateTo", "");
+            String targetName = JsonUtil.getString(msg.json(), "targetName", "");
             server.execute(() -> {
                 if (privateTo.isEmpty()) {
                     // 跨组公屏：与原版聊天同格式的系统消息，组内全员（含副客户端）可见
@@ -94,13 +95,23 @@ public final class ChatRelay {
                             Component.literal("<" + name + "> " + text), false);
                     return;
                 }
-                // 跨组私聊（/msg 的投递半程）：只给目标玩家
+                // 跨组私聊（/msg 的投递半程）：只给目标玩家。
+                // privateTo 是**成员档案 UUID**（服务端玩家表的行键），而本集成服里
+                // 经隧道加入的副客户端实体 UUID 是原版离线派生值 —— 两者不同，
+                // 只按 UUID 查找会让私聊静默丢失（无日志、无报错）。故按名字兜底，
+                // 与 LocalPermissions 的落权同一个口径（载荷来自物理服务端，可信）。
                 try {
                     ServerPlayer target =
                             server.getPlayerList().getPlayer(UUID.fromString(privateTo));
+                    if (target == null && !targetName.isEmpty()) {
+                        target = server.getPlayerList().getPlayerByName(targetName);
+                    }
                     if (target != null) {
                         target.sendSystemMessage(
                                 Component.literal(name + " 悄悄地对你说: " + text));
+                    } else {
+                        LOGGER.warn("跨组私聊目标不在本组世界: {}（{}），消息未投递",
+                                targetName, privateTo);
                     }
                 } catch (IllegalArgumentException ignored) {
                     // privateTo 非法 UUID：丢弃（入站不可信）

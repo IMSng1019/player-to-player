@@ -69,6 +69,12 @@ public final class CommandRouting {
     private static final org.slf4j.Logger LOGGER =
             org.slf4j.LoggerFactory.getLogger("player_to_player/command-routing");
 
+    /** 函数名参数节点（/function、/schedule function、/execute if function 共用此名）。 */
+    private static final String FUNCTION_NODE = "function";
+
+    /** /particle 的偏移量参数名（不是世界坐标）。 */
+    private static final String DELTA_NODE = "delta";
+
     /** 分类结果：是否引用执行上下文；引用的绝对方块坐标（可能为空）。 */
     public record Analysis(boolean contextBound, List<BlockPos> blockPositions) {
 
@@ -197,6 +203,17 @@ public final class CommandRouting {
                 Map<String, ParsedArgument<CommandSourceStack, ?>> arguments =
                         builder.getArguments();
                 for (ParsedCommandNode<CommandSourceStack> parsed : builder.getNodes()) {
+                    // 函数名节点：/function 是**字面量**节点（名 "function"），
+                    // /schedule function 与 /execute if function 是**参数**节点（同名），
+                    // 两者都要在"只看参数节点"的过滤之前判
+                    if (FUNCTION_NODE.equals(parsed.getNode().getName())) {
+                        // 函数体是黑盒：广播给其他组时它们会用"出生点 + entity=null"的
+                        // 虚拟源执行函数体，里面的 ~/^/@s 全落错地方（等于在他组出生点
+                        // 复刻一遍建筑），绝对坐标写入还绕过归属预检。黑盒形态"只在一处
+                        // 执行"是唯一安全的语义 —— 要跨组分发需要另立子系统。
+                        contextBound = true;
+                        continue;
+                    }
                     if (!(parsed.getNode() instanceof ArgumentCommandNode<?, ?> node)) {
                         continue;
                     }
@@ -208,6 +225,12 @@ public final class CommandRouting {
                             arguments.get(node.getName());
                     if (argument == null) {
                         continue; // 该参数没有实参（可选未给）
+                    }
+                    if (DELTA_NODE.equals(node.getName())) {
+                        // /particle 的 delta 是偏移量而不是世界坐标（javap 核实它也是
+                        // Vec3Argument）：并入包围盒会把盒拉向原点，造成"合法指令被拒"
+                        // 或"路由到 delta 所在区块的持有组、粒子根本不在那儿出现"
+                        continue;
                     }
                     Object value = argument.getResult();
                     if (value instanceof Coordinates coordinates) {

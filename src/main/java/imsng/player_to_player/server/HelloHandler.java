@@ -144,7 +144,12 @@ public final class HelloHandler implements MessageHandler {
             //（ConnectionIdentity 的成员校验、PermissionRelay 的名单下发都用它）。
             ConnectionIdentity.declare(clientId, playerName,
                     JsonUtil.getInt(json, "commandRouting", 0) >= 1);
-            players.declare(clientId, playerName);
+            // 玩家表只登记玩家客户端：proxy_server 的连接也走 HELLO（名字固定为
+            // proxy_server），登记进去会让 /list 把中转端算成在线玩家、
+            // 并让 /tp proxy_server 把玩家传到建行默认坐标 (0,0,0)
+            if ("client".equals(mode)) {
+                players.declare(clientId, playerName);
+            }
             // P2P 公钥指纹必须随新会话重新上报：同一个 clientId 可能来自重启后的新进程
             // （密钥对已换），旧指纹若被当作"已就绪"，服务端会把过期指纹下发给对端，
             // 对端校验必然失败 —— 那是可用性事故，且会被误读成中间人告警。

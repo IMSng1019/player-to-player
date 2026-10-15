@@ -186,6 +186,14 @@ for p in ['primary/environment/world/level.dat','primary/data/world/level.dat']:
    已知残余（未修，记在 `DESIGN.md` §13.2.1 表 10-12）：`/spreadplayers` 的散点半径、
    `/place jigsaw` 的向外延伸无法从参数统一定界；控制信道无玩家级认证（半可信模型的根，
    "被改造的客户端可冒充 op 让 /stop 生效"，当前须把控制端口按控制台同权防护）。
+10. **第二轮复查（语义/回归维度，独立代理）**：又修掉 1 条 critical + 6 条 important/minor：
+   `/msg` 跨组投递按名字兜底（此前在"实体 UUID ≠ 成员 ID"环境下静默丢消息）、
+   `/particle` 的 delta 不再当成坐标、`/function` 按上下文处理（黑盒不得在他组出生点执行）、
+   服务端限速改按玩家、限速命中退化为"仅本地执行"、CHAT_RELAY 带上帧内 uuid、
+   `proxy_server` 不进玩家表、3/4 级执行留服务端审计输出、退出冻结期不执行转发指令；
+   另把"坐标是数据"类指令、多层 `/execute` 的盒膨胀、查询类指令只回首个成功组等
+   记入 `DESIGN.md` §13.2.1 表 13-19。详见
+   `docs/plans/2026-10-16-command-routing-review-findings.md`。
 
 **指令路由的待办（按顺序）**：
 
