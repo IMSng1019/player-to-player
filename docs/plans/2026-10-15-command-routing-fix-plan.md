@@ -1,7 +1,23 @@
 # 指令传输路径修复方案（供下个会话实施）
 
+> **实施注记（2026-10-16 补）**：本文档已在后续会话中实施完毕，实现与本文有几处
+> **有意偏离**，以 `DESIGN.md` §13.2 与代码为准：
+> 1. **拦截入口**：最终不是"`CommandsMixin` 在 HEAD 取消"，也不是"`performChatCommand`
+>    的 HEAD"，而是 **`client.mixin.CommandDispatchMixin`** 注入到 `performChatCommand`
+>    内本地执行那次 `Commands.performCommand` 调用点（在 `collectSignedArguments`
+>    签名校验之后）—— 这样原版的签名/LastSeenMessages 校验与失败处理照常执行，
+>    被取消的只有本地执行这一步。`mixin.CommandsMixin` 已删除。
+>    （文中 §附录 P.0 / P.3 提到的 HEAD 均按此口径理解。）
+> 2. **归属预检**按坐标**包围盒**展开（`/fill` 只声明角点，内部区块必须一并覆盖），
+>    并把服务端核过的持有区块随转发下发（`ownedChunks`），接收端凭它复核归属未变。
+> 3. **`/list` / `/tp` / `/msg` 三个特例**的实现位置未变（服务端 handler），但
+>    `/msg` 的正文改用解析结果的实参区间提取。
+> 4. 其余按本文定稿口径实施：形状规则、3/4 级指令在服务端执行、回执在服务端聚合、
+>    本地权限位=真实等级（`PermissionRelay` → `LocalPermissions`）、`_rid` 号段隔离。
+
 日期：2026-10-15
-状态：**方案文档，未动代码**（用户在 2026-10-15 明确要求"先别急着动代码，先复查 + 给方案"）
+状态：**方案文档，未动代码**（用户在 2026-10-15 明确要求"先别急着动代码，先复查 + 给方案"；
+2026-10-16 已按本方案实施，见上面的实施注记）
 配套：`docs/plans/2026-10-15-command-routing-compliance-review.md`（逐条规范对照、8 条缺口、取证说明）
 关联：`docs/plans/2026-10-14-stale-p2p-state-after-world-replace.md`（本地权限被压到 0 的实测取证 §5）
 

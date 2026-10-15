@@ -222,8 +222,12 @@ final class NettyControlConnection extends SimpleChannelInboundHandler<ControlMe
         MessageHandler handler = handlers.get(msg.type());
         if (handler == null) {
             LOGGER.warn("消息类型 {} 无处理器（来自 {}）", msg.type(), remoteAddress());
-            if (msg.hasRid()) {
-                // 带 _rid 说明对端在 request() 等待：回 ERROR 让它快速失败
+            // 带 _rid 说明对端在 request() 等待：回 ERROR 让它快速失败。
+            // 但**绝不对 ERROR 帧回 ERROR**：迟到的应答（对端请求已超时、pending 已移除）
+            // 会带着一个本地不认识的 _rid 落进这条分支，若再回一条 ERROR，对端同样
+            // 认不出这个 _rid 又回 ERROR —— 两端会以同一个 _rid 无限互回（每帧各打一条
+            // 日志，持续到断连）。ERROR 帧到此为止，只记日志。
+            if (msg.hasRid() && msg.type() != MessageType.ERROR) {
                 JsonObject err = new JsonObject();
                 err.addProperty("code", "no_handler");
                 err.addProperty("message", "本端未注册该消息类型的处理器: " + msg.type());

@@ -1,5 +1,6 @@
 package imsng.player_to_player.client.session;
 
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import imsng.player_to_player.client.boot.ClientBootstrap;
 import imsng.player_to_player.client.group.GroupHost;
@@ -255,6 +256,22 @@ public final class WorldSession {
                     JsonUtil.getString(ackJson, "relayAddress", "(同服务端)"),
                     JsonUtil.getInt(ackJson, "relayPort", 0));
 
+            // 服务端能力位：只有它声明支持"全量上链"语义，本端才在本地执行前拦截
+            CommandRelayClient.setServerRoutingSupported(
+                    JsonUtil.getInt(ackJson, "commandRouting", 0) >= 1);
+            // 权限名单随 ACK 抵达（重连时 PERMISSION_RELAY 处理器尚未注册，帧会丢）：
+            // 先存起来，等集成服务端起来（LAN 发布 / 玩家 JOIN）再落地
+            JsonElement permissions = ackJson.get("permissions");
+            if (permissions != null && permissions.isJsonArray()) {
+                JsonObject payload = new JsonObject();
+                payload.add("members", permissions);
+                payload.addProperty("groupId",
+                        JsonUtil.getString(ackJson, "permissionsGroupId", ""));
+                LocalPermissions.updateFromJson(payload);
+            }
+            LOGGER.info("服务端指令路由能力: {}", CommandRelayClient.isServerRoutingSupported()
+                    ? "支持（全量上链）" : "不支持（保持原版本地执行语义）");
+
             // ---- 3. 世界文件夹（<IP>+<世界名>）与世界配置 ----
             Path worldFolder = paths.worldFolder(host, worldName);
             paths.ensureWorldDirs(worldFolder);
@@ -321,6 +338,9 @@ public final class WorldSession {
         hello.addProperty("clientId", playerId.toString());
         hello.addProperty("playerName", playerName);
         hello.addProperty("mode", ctx.mode().id());
+        // 指令路由能力位：服务端据此决定是否按"全量上链"语义处理上送
+        //（缺省 0 = 老客户端语义；新服务端会忽略未声明的上送，避免重复执行）
+        hello.addProperty("commandRouting", 1);
 
         // 算力：规范"玩家加入世界时向服务端给出算力能力"——未就绪则限时等待检测完成
         ComputeScore score = ctx.computeScore();

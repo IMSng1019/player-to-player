@@ -142,7 +142,8 @@ public final class HelloHandler implements MessageHandler {
             // 身份声明与实际发布同临界区：客户端约定 clientId == 玩家档案 UUID，
             // 故这里既建立玩家表的第一行，也建立"本连接代表谁"的自洽判据
             //（ConnectionIdentity 的成员校验、PermissionRelay 的名单下发都用它）。
-            ConnectionIdentity.declare(clientId, playerName);
+            ConnectionIdentity.declare(clientId, playerName,
+                    JsonUtil.getInt(json, "commandRouting", 0) >= 1);
             players.declare(clientId, playerName);
             // P2P 公钥指纹必须随新会话重新上报：同一个 clientId 可能来自重启后的新进程
             // （密钥对已换），旧指纹若被当作"已就绪"，服务端会把过期指纹下发给对端，
@@ -167,6 +168,14 @@ public final class HelloHandler implements MessageHandler {
         ack.addProperty("worldName", worldName);
         appendRelayInfo(config, ack);
         ack.addProperty("minFreeMemoryBytes", config.minFreeMemoryBytes);
+        // 指令路由能力位（加性字段）：客户端只有在 ACK 里看到它才启用"全量上链"，
+        // 否则保持老行为（本地执行 + 失败才上送）—— 混版本时双向都有安全网
+        ack.addProperty("commandRouting", 1);
+        // 重连客户端此刻还没注册 PERMISSION_RELAY 处理器：名单随 ACK 一起给，
+        // 保证"本地权限位"不会因为丢帧而停在旧值（周期兜底随后仍会幂等重发）
+        if (permissions != null) {
+            permissions.appendToAck(ack, clientId);
+        }
         connection.send(message.reply(MessageType.HELLO_ACK, ack, null));
 
         // 重连的客户端可能带着空权限名单：按其所在组强制重推一次（未入组则等待角色指派）

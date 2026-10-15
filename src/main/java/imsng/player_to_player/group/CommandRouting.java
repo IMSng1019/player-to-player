@@ -12,8 +12,10 @@ import net.minecraft.commands.arguments.EntityArgument;
 import net.minecraft.commands.arguments.coordinates.BlockPosArgument;
 import net.minecraft.commands.arguments.coordinates.ColumnPosArgument;
 import net.minecraft.commands.arguments.coordinates.Coordinates;
+import net.minecraft.commands.arguments.coordinates.Vec2Argument;
 import net.minecraft.commands.arguments.coordinates.Vec3Argument;
 import net.minecraft.commands.arguments.selector.EntitySelector;
+import imsng.player_to_player.registry.ChunkKey;
 import net.minecraft.core.BlockPos;
 
 import java.util.ArrayList;
@@ -120,6 +122,58 @@ public final class CommandRouting {
     private CommandRouting() {
     }
 
+    // ------------------------------------------------------ 归属复核（接收端用，纯函数）
+
+    /**
+     * 解析转发帧的 {@code ownedChunks} 字段（服务端核过的"持有区块"清单）。
+     * <p>
+     * 入站数据不可信：字段缺失/不是数组/条目非法一律跳过（跳过不等于放行 ——
+     * 有问题的条目本身就不构成"需要复核的持有区块"）。
+     *
+     * @return 可复核的区块键列表（可能为空）
+     */
+    public static List<ChunkKey> parseChunkKeys(com.google.gson.JsonElement raw) {
+        if (raw == null || !raw.isJsonArray()) {
+            return List.of();
+        }
+        List<ChunkKey> keys = new ArrayList<>();
+        for (com.google.gson.JsonElement element : raw.getAsJsonArray()) {
+            if (!element.isJsonPrimitive()) {
+                continue;
+            }
+            try {
+                keys.add(ChunkKey.parse(element.getAsString()));
+            } catch (RuntimeException e) {
+                // 非法键跳过
+            }
+        }
+        return List.copyOf(keys);
+    }
+
+    /**
+     * 接收端归属复核：服务端核过的持有区块必须<b>仍然</b>由本组持有。
+     * <p>
+     * 复核的是"服务端预检 → 实际执行"之间的归属变化（合并/分离/退出事务期间会发生）。
+     * 不通过则调用方<b>不执行</b>：集成服主线程一旦碰触"本组不持有"的区块，加载
+     * future 会永远悬置，主线程在 {@code managedBlock + join} 里永久忙等。
+     *
+     * @param keys    服务端核过的持有区块
+     * @param claimed 本组是否仍持有该区块
+     * @return null = 放行；否则为拒绝文案
+     */
+    public static String verifyOwnedChunks(List<ChunkKey> keys,
+                                           java.util.function.Predicate<ChunkKey> claimed) {
+        if (keys == null || keys.isEmpty()) {
+            return null; // 无坐标指令，或"无人持有 → 发起组按需申请"：无需复核
+        }
+        for (ChunkKey key : keys) {
+            if (!claimed.test(key)) {
+                return "目标区块当前不由本组持有（" + key.x() + "," + key.z() + "），已跳过执行";
+            }
+        }
+        return null;
+    }
+
     /**
      * 分类一条已解析的指令。
      *
@@ -156,11 +210,15 @@ public final class CommandRouting {
                     if (value instanceof Coordinates coordinates) {
                         if (isRelative(coordinates)) {
                             contextBound = true; // ~ 或 ^：以执行者位置/朝向为原点
-                        } else if (isPositionKind(node.getType())) {
-                            // 绝对坐标：与执行者无关，可在任意组结算为同一个方块坐标
+                        }
+                        if (isPositionKind(node.getType()) && source != null) {
+                            // 位置类实参一律结算为方块坐标：绝对坐标与执行者无关；
+                            // 相对/局部坐标用**发起者上报的位置与朝向**解析（服务端构造的
+                            // 解析源就锚在那里）—— 这样"包围盒"对 /execute positioned
+                            // 里包着的绝对坐标、以及 ~ ~ ~ 形态都成立，越界才能被拦下。
                             positions.add(coordinates.getBlockPos(source));
                         }
-                        // 其余（RotationArgument/Vec2Argument 的绝对值）与位置无关，忽略
+                        // 其余（旋转类：RotationArgument 的朝向、绝对旋转）与位置无关，忽略
                     } else if (value instanceof EntitySelector selector) {
                         if (isContextSelector(selector, rangeText(input, argument))) {
                             contextBound = true;
@@ -181,10 +239,17 @@ public final class CommandRouting {
         return coordinates.isXRelative() || coordinates.isYRelative() || coordinates.isZRelative();
     }
 
-    /** 位置类参数类型（它们的绝对形态可以直接结算为方块坐标）。 */
+    /**
+     * 位置类参数类型（它们的绝对形态可以直接结算为方块坐标）。
+     * <p>
+     * {@link Vec2Argument} 也计入：{@code /spreadplayers <center> …} 的中心是 XZ 坐标
+     * （把"散点区域"当成无坐标指令广播给所有组，会让每个组在别人领地里取样读方块 →
+     * 主线程永久忙等）。注意原版的<b>旋转</b>用的是 {@link RotationArgument}（已 javap
+     * 核实 {@code /tp} 的 rotation 是 RotationArgument），不会被这里捞进来。
+     */
     private static boolean isPositionKind(Object type) {
         return type instanceof Vec3Argument || type instanceof BlockPosArgument
-                || type instanceof ColumnPosArgument;
+                || type instanceof ColumnPosArgument || type instanceof Vec2Argument;
     }
 
     /**
@@ -238,7 +303,39 @@ public final class CommandRouting {
             if (builder.getArguments().containsKey(child.getName())) {
                 continue; // 已给实参：位置/目标由实参决定，另行判定
             }
-            if (isDefaultableContextKind(argument.getType())) {
+            if (!isDefaultableContextKind(argument.getType())) {
+                continue;
+            }
+            if (isDefaultedFromSibling(builder, argument.getType())) {
+                continue; // 缺省值取自同指令的另一个同类型实参（如 /forceload add <from> 的 to=from）
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * 该缺省参数是否"由同指令的另一个同类型实参补齐"（与执行者位置无关）。
+     * <p>
+     * 典型：{@code /forceload add <from> [<to>]} —— 只给 from 时 to 取 from
+     * （javap 核实的原版实现），末节点的 to 子参数未被消费。若按"缺省位置=执行者位置"
+     * 处理，这条指令会只留在发起组：发起组设了票据却认领不到别人持有的区块，
+     * 区块永远加载不出来（且仍回原版"Added N chunk(s)"，静默失效）。
+     */
+    private static boolean isDefaultedFromSibling(
+            CommandContextBuilder<CommandSourceStack> builder, Object childType) {
+        Class<?> childClass = childType.getClass();
+        for (ParsedCommandNode<CommandSourceStack> parsed : builder.getNodes()) {
+            if (!(parsed.getNode() instanceof ArgumentCommandNode<?, ?> node)) {
+                continue;
+            }
+            if (node.getType().getClass() != childClass) {
+                continue;
+            }
+            // 同类型实参已给 ⇒ 缺省值按"取该实参"处理（位置仍由它决定，另行提取坐标）。
+            // 只认同类型：/spawnpoint <targets> [<pos>] 这种"缺省位置真的取执行者位置"
+            // 的形态不会被误放行（targets 是 EntityArgument，与 pos 的 Vec3Argument 不同类）。
+            if (builder.getArguments().containsKey(node.getName())) {
                 return true;
             }
         }

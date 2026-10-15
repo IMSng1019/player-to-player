@@ -23,6 +23,9 @@ import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -75,6 +78,21 @@ public final class CommandRelayClient {
     /** 每玩家的令牌桶（{@link #reset()} 随会话清理）。 */
     private static final Map<UUID, TokenBucket> buckets = new ConcurrentHashMap<>();
 
+    /**
+     * 服务端是否声明支持"全量上链"语义（HELLO_ACK 的 {@code commandRouting} 字段）。
+     * <p>
+     * 混版本安全网：老服务端按旧语义理解上送（只把它当"本地失败才上送"的补充），
+     * 新客户端若已经取消本地执行就会漏执行 —— 所以看不到这个能力位就退回老行为
+     * （本地执行、失败才上送）。
+     */
+    private static volatile boolean serverRoutingSupported;
+
+    /** 每玩家暂存的回执（集成服在切换窗口内不可用时的补投队列）。 */
+    private static final Map<UUID, Deque<Component>> pendingFeedback = new ConcurrentHashMap<>();
+
+    /** 暂存队列上限（每玩家）。 */
+    private static final int MAX_PENDING_FEEDBACK = 8;
+
     /** 执行成败探针（回传 executed 字段；上下文链保证 /execute 等形态也能收敛）。 */
     private static final class Probe implements CommandResultCallback {
         volatile boolean anySuccess;
@@ -90,9 +108,21 @@ public final class CommandRelayClient {
     private CommandRelayClient() {
     }
 
-    /** 世界会话拆除时清限速状态（幂等）。 */
+    /** 世界会话拆除时清限速与暂存状态（幂等）。 */
     public static void reset() {
         buckets.clear();
+        pendingFeedback.clear();
+        serverRoutingSupported = false;
+    }
+
+    /** 记录服务端的指令路由能力位（HELLO_ACK 收到时调用）。 */
+    public static void setServerRoutingSupported(boolean supported) {
+        serverRoutingSupported = supported;
+    }
+
+    /** 当前服务端是否声明支持"全量上链"（日志/诊断用）。 */
+    public static boolean isServerRoutingSupported() {
+        return serverRoutingSupported;
     }
 
     // ------------------------------------------------------------ 拦截面（玩家敲的指令）
@@ -118,6 +148,9 @@ public final class CommandRelayClient {
             if (server == null || !GroupRuntime.isManagedServer(server)) {
                 return false; // 非组世界（单人/物理服）：原版直通
             }
+            if (!serverRoutingSupported) {
+                return false; // 服务端未声明该能力（老服务端）：退回老行为，避免漏执行
+            }
             ControlConnection conn = GroupRuntime.conn();
             if (conn == null || !conn.isOpen()) {
                 return false; // 控制连接不可用：退回本地执行（宁可本地生效，也不要指令凭空消失）
@@ -137,6 +170,9 @@ public final class CommandRelayClient {
             json.addProperty("x", player.getX());
             json.addProperty("y", player.getY());
             json.addProperty("z", player.getZ());
+            // 朝向：服务端据此把 ^ 局部坐标结算成与发起端一致的方块坐标（越界预检用）
+            json.addProperty("yRot", player.getYRot());
+            json.addProperty("xRot", player.getXRot());
             UUID playerId = player.getUUID();
             // 发包走 io 线程：Netty 写本身线程安全，但避免在服务器主线程上做排队等待
             ThreadPools.io().execute(() -> uplink(conn, playerId, json));
@@ -211,6 +247,9 @@ public final class CommandRelayClient {
             return; // 应答不完整：放弃（服务端文案已单独回给玩家）
         }
         if (server == null) {
+            // 切换窗口：跨组 tp 这一次没法做，给玩家一句明确交代（不静默）
+            deliverMessage((MinecraftServer) null, playerUuid,
+                    Component.literal("[P2P] 跨组传送未执行：组世界正在切换"));
             return;
         }
         server.execute(() -> {
@@ -223,6 +262,7 @@ public final class CommandRelayClient {
                 return; // 维度名非法（入站不可信）
             }
             player.teleportTo(level, x, y, z, player.getYRot(), player.getXRot());
+            flushPendingFeedback(player); // 同一玩家在窗口内暂存的回执一并补投
             if (!message.isEmpty()) {
                 player.sendSystemMessage(Component.literal(message));
             }
@@ -237,18 +277,67 @@ public final class CommandRelayClient {
                 Component.literal(message == null ? "" : message));
     }
 
-    /** 投递已构造好的组件（本地化报错走这条）。 */
+    /**
+     * 投递已构造好的组件（本地化报错走这条）。
+     * <p>
+     * 回执到达时**集成服务端可能已经不在**（合并让出/退出事务窗口：玩家还在游戏里，
+     * 但本地世界已经交出去了）。此时本地执行早已被取消，回执是玩家唯一的输出 ——
+     * 丢一次就是"指令凭空消失"，所以暂存起来，等玩家重新进入某个组世界时补投
+     * （{@link #flushPendingFeedback}）。
+     */
     private static void deliverMessage(MinecraftServer server, UUID playerUuid,
                                        Component message) {
-        if (server == null || message == null) {
+        if (message == null) {
+            return;
+        }
+        if (server == null) {
+            queueFeedback(playerUuid, message);
             return;
         }
         server.execute(() -> {
             ServerPlayer player = server.getPlayerList().getPlayer(playerUuid);
             if (player != null) {
                 player.sendSystemMessage(message);
+            } else {
+                // 玩家已不在本集成服（切换中/已下线）：暂存，等他回来再给
+                queueFeedback(playerUuid, message);
             }
         });
+    }
+
+    /** 暂存回执（每玩家有界；切换窗口通常只有一两条）。 */
+    private static void queueFeedback(UUID playerId, Component message) {
+        if (playerId == null) {
+            return;
+        }
+        Deque<Component> queue = pendingFeedback.computeIfAbsent(
+                playerId, id -> new ArrayDeque<>());
+        synchronized (queue) {
+            if (queue.size() >= MAX_PENDING_FEEDBACK) {
+                queue.pollFirst();
+            }
+            queue.addLast(message);
+        }
+    }
+
+    /**
+     * 补投暂存的回执（玩家进入组世界时调用；须在集成服务端主线程）。
+     * 覆盖"合并让出/退出事务窗口内收到回执"的缺口。
+     */
+    public static void flushPendingFeedback(ServerPlayer player) {
+        if (player == null) {
+            return;
+        }
+        Deque<Component> queue = pendingFeedback.remove(player.getUUID());
+        if (queue == null) {
+            return;
+        }
+        synchronized (queue) {
+            Component message;
+            while ((message = queue.pollFirst()) != null) {
+                player.sendSystemMessage(message);
+            }
+        }
     }
 
     // ------------------------------------------------------------ 接收面（服务端下发的转发执行）
@@ -282,6 +371,13 @@ public final class CommandRelayClient {
                                 ControlMessage msg, String command, boolean origin,
                                 UUID sourceUuid, String sourceName, String dimension,
                                 int permission) {
+        // 区块归属复核：只要服务端下发了"持有区块"清单就要复核（含发起组自己那一次）
+        String verdict = verifyOwnedChunks(msg.json());
+        if (verdict != null) {
+            LOGGER.info("拒绝执行越界的转发指令（{}）: /{}", verdict, command);
+            reply(conn, msg, false, verdict);
+            return;
+        }
         CommandFeedback feedback = new CommandFeedback();
         Probe probe = new Probe();
         CommandSourceStack stack;
@@ -296,18 +392,20 @@ public final class CommandRelayClient {
                 reply(conn, msg, false, "发起玩家已不在本组世界");
                 return;
             }
+            // 维度核对：发起分支用的是玩家**此刻**所在等级，而服务端的越界预检按上链时
+            // 自报的维度做 —— 两者不一致时预检查的是别的维度的注册表，等于没查
+            //（穿传送门、或改装客户端谎报维度都会走到这里）→ 干净拒绝，不放行
+            String actualDimension = player.serverLevel().dimension().location().toString();
+            if (!actualDimension.equals(dimension)) {
+                reply(conn, msg, false, "玩家所在维度与上链时不一致（" + dimension
+                        + " -> " + actualDimension + "），已跳过执行");
+                return;
+            }
             stack = player.createCommandSourceStack()
                     .withSource(feedback)
                     .withPermission(permission)
                     .withCallback(probe);
         } else {
-            // 其余组：执行前复核区块归属（服务端预检之后的最后一道防冻结闸门）
-            String verdict = verifyOwnedChunks(msg.json());
-            if (verdict != null) {
-                LOGGER.info("拒绝执行越界的转发指令（{}）: /{}", verdict, command);
-                reply(conn, msg, false, verdict);
-                return;
-            }
             ServerLevel level = resolveLevel(server, dimension);
             if (level == null) {
                 level = server.overworld();
@@ -345,29 +443,12 @@ public final class CommandRelayClient {
      * @return null = 放行；否则为拒绝文案
      */
     private static String verifyOwnedChunks(JsonObject json) {
-        var raw = json.get("ownedChunks");
-        if (raw == null || !raw.isJsonArray()) {
-            return null;
-        }
+        List<ChunkKey> keys = CommandRouting.parseChunkKeys(json.get("ownedChunks"));
         ChunkClaimClient claims = GroupRuntime.claims();
         if (claims == null) {
             return null; // 尚未接入 claim 客户端：由服务端预检负责（不应发生）
         }
-        for (var element : raw.getAsJsonArray()) {
-            if (!element.isJsonPrimitive()) {
-                continue;
-            }
-            ChunkKey key;
-            try {
-                key = ChunkKey.parse(element.getAsString());
-            } catch (RuntimeException e) {
-                continue; // 入站不可信：非法键跳过
-            }
-            if (!claims.isClaimed(key)) {
-                return "目标区块当前不由本组持有（" + key.x() + "," + key.z() + "），已跳过执行";
-            }
-        }
-        return null;
+        return CommandRouting.verifyOwnedChunks(keys, claims::isClaimed);
     }
 
     /** 维度名 → ServerLevel；非法/不存在返回 null。 */

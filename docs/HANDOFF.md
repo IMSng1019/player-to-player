@@ -150,9 +150,40 @@ for p in ['primary/environment/world/level.dat','primary/data/world/level.dat']:
    口径与边界见 `DESIGN.md` §13.2 / §13.2.1 / §13.2.2；本轮的静态证据、对抗校验与
    否证用例见 `docs/plans/2026-10-15-command-routing-compliance-review.md` 与
    `docs/plans/2026-10-15-command-routing-fix-plan.md`（均已提交）。
-8. 校验：`./gradlew test`（全量 301 例，新增 `CommandRoutingTest` 用**真实原版指令树**
-   锁定分类、`CommandAggregatorTest`）+ `./gradlew build`（Loom 重映射已把 mixin 的
+8. 校验：`./gradlew test`（全量 326 例）+ `./gradlew build`（Loom 重映射已把 mixin 的
    `@Inject` 目标解析为 intermediary：`method_45010` / `Commands.method_9249`）。
+9. **对抗式复查修正**（5 路审查 + 逐条反驳校验，共 23 条发现）：
+   - **身份判据配对化**（critical）：`ConnectionIdentity.canonicalMemberId` —— 上报的
+     UUID 与名字必须来自**同一个成员**，按名字兜底时还要求上报 UUID 恰是该名字的
+     离线派生值。修掉"组内成员用外部 op 的 UUID + 自己的名字换取 3/4 级执行"；
+   - **一人一行**（important）：位置上报归一到成员档案 UUID（集成服里副客户端的实体
+     UUID 是离线派生值，原先会一人两行 ⇒ `/list` 重复计数、`/tp` 落到 0,0,0 幽灵行、
+     `/msg` 随机答"不在线"）；
+   - **迟到应答不再引发 ERROR 帧无限回弹**（important）：`NettyControlConnection`
+     绝不对 ERROR 帧回 ERROR + 服务端对上送形状不符的帧静默忽略；
+   - **切换窗口的回执不丢**（important）：集成服已交出去时回执进暂存队列，
+     玩家重新进组世界（JOIN）时补投；
+   - **归属预检补三类漏判**（critical）：包围盒覆盖 `/fill` 内部区块；无主且
+     **侧邻属他组**的死区块（对全网都不可认领）一律拒绝；`contextBound` 形态
+     （`~/^`、`/execute positioned` 包着的绝对坐标）同样过预演检查 ——
+     越界就干净拒绝，而不是让发起组就地冻结；
+   - **`/forceload add <from>` 不再被误判为上下文指令**（important）：缺省参数
+     "由同指令另一个同类型实参补齐"（to=from）与"取执行者位置"要区分开；
+   - **`/spreadplayers` 的中心点计入坐标**（important，`Vec2Argument` 纳为位置类）；
+   - **维度核对**（important）：发起组执行前比对玩家此刻所在维度与上链时自报的维度；
+   - **混版本能力位 `commandRouting`**（important）：双向加性声明，老客户端/老服务端
+     各自保持老行为，杜绝"重复执行/静默漏执行"；
+   - **权限等级快照**（minor）：指令上送的权限裁定改读 `PermissionRelay` 在服务器
+     主线程维护的快照（原先从 Netty 线程直读非并发 ops 表，属数据竞争）；
+   - **权限名单随 HELLO_ACK 下发**（minor）：重连时客户端尚未注册 PERMISSION_RELAY
+     处理器，只发帧会丢且被去重签名抑制 ⇒ 本地权限位停在旧值；
+   - **CHAT_RELAY 也做身份校验**（minor）：聊天帧的 playerName 不能再是任意自报值；
+   - 测试补齐：`CommandOwnershipRouterTest`（含死区块/预演否决）、
+     `CommandOwnershipVerifyTest`、`LocalPermissionsParseTest`、`TokenBucketTest`、
+     `RidSegmentTest`，`ConnectionIdentityTest` 增配对判据与能力位用例。
+   已知残余（未修，记在 `DESIGN.md` §13.2.1 表 10-12）：`/spreadplayers` 的散点半径、
+   `/place jigsaw` 的向外延伸无法从参数统一定界；控制信道无玩家级认证（半可信模型的根，
+   "被改造的客户端可冒充 op 让 /stop 生效"，当前须把控制端口按控制台同权防护）。
 
 **指令路由的待办（按顺序）**：
 

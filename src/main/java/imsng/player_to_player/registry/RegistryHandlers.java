@@ -337,23 +337,28 @@ public final class RegistryHandlers {
 
     private static void handlePosUpdate(ControlConnection conn, ControlMessage msg,
                                         PlayerTable players, GroupTable groups) {
-        UUID playerId = parseUuid(JsonUtil.getString(msg.json(), "uuid", ""));
-        if (playerId == null) {
+        UUID reportedUuid = parseUuid(JsonUtil.getString(msg.json(), "uuid", ""));
+        if (reportedUuid == null) {
             return; // 无应答消息：非法数据静默丢弃并记日志即可
         }
         String playerName = JsonUtil.getString(msg.json(), "name", "");
-        // 身份自洽校验（复查 G-06）：只接受"本连接所在组成员"的坐标。玩家表落库后
-        // 这些坐标会直接成为跨组 /tp 的落点，不校验就等于把落点交给任意已握手连接。
-        if (!ConnectionIdentity.isOwnGroupMember(groups, conn.peerId(), playerId, playerName)) {
+        // 身份自洽校验 + **归一到组成员 ID**（复查 G-06 与 2026-10-16 复查）：
+        // 只接受"本连接所在组成员"的坐标 —— 玩家表落库后这些坐标会直接成为跨组
+        // /tp 的落点；而集成服里的副客户端实体 UUID 是原版**离线派生值**，与档案
+        // UUID 不同，若直接按上报 UUID 落行会一人两行（/list 重复计数、/tp 随机落到
+        // 0,0,0 的幽灵行）。归一到成员 ID 后，一人一行、位置落在正确的行上。
+        UUID memberId = ConnectionIdentity.canonicalMemberId(
+                groups, conn.peerId(), reportedUuid, playerName);
+        if (memberId == null) {
             LOGGER.warn("拒绝越权位置上报: 连接 {} 声称玩家 {}（{}）",
-                    conn.peerId(), playerId, playerName);
+                    conn.peerId(), reportedUuid, playerName);
             return;
         }
         String dimension = JsonUtil.getString(msg.json(), "dimension", "minecraft:overworld");
         HelloHandler.withCurrentSession(conn, () -> {
             // 未登记的行忽略（HELLO 声明时建行）；已登记则整行刷新位置
-            players.declare(playerId, playerName.isEmpty() ? null : playerName);
-            players.updatePosition(playerId, dimension,
+            players.declare(memberId, playerName.isEmpty() ? null : playerName);
+            players.updatePosition(memberId, dimension,
                     getDouble(msg.json(), "x"), getDouble(msg.json(), "y"),
                     getDouble(msg.json(), "z"));
             return true;

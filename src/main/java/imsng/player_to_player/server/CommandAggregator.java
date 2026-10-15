@@ -26,6 +26,9 @@ public final class CommandAggregator {
     /** 兜底文案：所有目标都失败且没有任何报错文本时。 */
     static final String NOTHING_EXECUTED = "指令未在任何组执行成功";
 
+    /** 兜底文案：执行成功但执行端没有任何输出（静默指令）时。 */
+    static final String EXECUTED_WITHOUT_OUTPUT = "指令已执行（执行端无输出）";
+
     private final int total;
     private final Consumer<String> reply;
 
@@ -60,7 +63,9 @@ public final class CommandAggregator {
         if (executed) {
             if (!replied) {
                 replied = true;
-                reply.accept(text);
+                // 成功但执行端没有任何输出（数据包/模组注册的静默指令）：不能回空串，
+                // 否则玩家端什么都不显示，"已执行"与"被吞掉"无从区分
+                reply.accept(text.isEmpty() ? EXECUTED_WITHOUT_OUTPUT : text);
             }
             return;
         }

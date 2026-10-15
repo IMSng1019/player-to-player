@@ -33,10 +33,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.StringJoiner;
 import java.util.UUID;
 
@@ -129,21 +127,38 @@ public final class CommandChatHandlers {
             conn.send(error(msg, "not_authenticated", "须先完成 HELLO 握手"));
             return;
         }
+        // 没有 command 字段的帧不是上送，而是**迟到的转发执行应答**：服务端对目标组的
+        // request 已超时（pending 已移除），应答这才回来。必须静默忽略，不能回 ERROR ——
+        // 回 ERROR 会让两端以同一个未知 _rid 无限互回（见 NettyControlConnection 的分发注释）。
+        if (!msg.json().has("command")) {
+            LOGGER.debug("忽略迟到的指令应答（来自 {}）", requester);
+            return;
+        }
         String command = JsonUtil.getString(msg.json(), "command", "").trim();
-        UUID playerUuid = parseUuid(JsonUtil.getString(msg.json(), "playerUuid", ""));
+        UUID reportedUuid = parseUuid(JsonUtil.getString(msg.json(), "playerUuid", ""));
         String playerName = JsonUtil.getString(msg.json(), "playerName", "?");
-        if (command.isEmpty() || command.length() > MAX_COMMAND_LENGTH || playerUuid == null) {
+        if (command.isEmpty() || command.length() > MAX_COMMAND_LENGTH || reportedUuid == null) {
             conn.send(error(msg, "invalid_request", "command/playerUuid 缺失或非法"));
             return;
         }
         if (command.startsWith("/")) {
             command = command.substring(1);
         }
-        // ---- 身份自洽（复查 G-06）：上报的玩家必须是本连接所在组的成员 ----
-        if (!ConnectionIdentity.isOwnGroupMember(groups, requester, playerUuid, playerName)) {
+        // ---- 身份自洽（复查 G-06 / 2026-10-16 复查）：上报身份必须**配对命中**
+        //      本组某个具体成员，并归一到该成员的档案 UUID ----
+        UUID playerUuid = ConnectionIdentity.canonicalMemberId(
+                groups, requester, reportedUuid, playerName);
+        if (playerUuid == null) {
             LOGGER.warn("拒绝越权指令上送: 连接 {} 声称玩家 {}（{}）",
-                    requester, playerUuid, playerName);
+                    requester, reportedUuid, playerName);
             conn.send(error(msg, "not_authorized", "上报的玩家身份与本连接所在组不符"));
+            return;
+        }
+        // 旧客户端（HELLO 未声明指令路由能力）只会在本地执行失败后上送：服务端
+        // 不按新语义处理，静默忽略（它本地已经执行过、玩家也已看到本地报错）
+        if (!ConnectionIdentity.supportsCommandRouting(requester)) {
+            LOGGER.info("忽略旧客户端的指令上送（{} 未声明指令路由能力）: /{}",
+                    requester, command);
             return;
         }
         if (!uplinkBuckets.computeIfAbsent(requester,
@@ -156,16 +171,24 @@ public final class CommandChatHandlers {
         double x = JsonUtil.getDouble(msg.json(), "x", 0.0);
         double y = JsonUtil.getDouble(msg.json(), "y", 0.0);
         double z = JsonUtil.getDouble(msg.json(), "z", 0.0);
+        // 朝向也要：^ 局部坐标以执行者朝向为原点，解析源必须带上它才能结算出
+        // 与发起端一致的方块坐标（越界预检依赖这个结算结果）
+        float yRot = (float) JsonUtil.getDouble(msg.json(), "yRot", 0.0);
+        float xRot = (float) JsonUtil.getDouble(msg.json(), "xRot", 0.0);
 
         // ---- 权限裁定：物理服务端 ops 名单是唯一权威（决策 3 的实现要点）----
-        int realPermission = server.getProfilePermissions(
-                new GameProfile(playerUuid, playerName));
+        // 等级取自 PermissionRelay 在服务器主线程维护的快照：ops 名单内部是非并发
+        // HashMap，从 Netty 线程直读会与主线程的 /op /deop 形成数据竞争（偶发把合法
+        // 指令判成权限不足）。快照在角色指派/HELLO/每 5 秒 diff 与每次服务端执行
+        // 3/4 级指令后刷新；未命中按 0（fail-closed，且这种连接本不该有指令上送）。
+        Integer cachedLevel = permissions.levelOf(playerUuid);
+        int realPermission = cachedLevel != null ? cachedLevel : 0;
         ServerLevel level = resolveLevel(dimension);
         if (level == null) {
             level = server.overworld();
         }
         CommandSourceStack source = new CommandSourceStack(CommandSource.NULL,
-                new Vec3(x, y, z), Vec2.ZERO, level, realPermission, playerName,
+                new Vec3(x, y, z), new Vec2(yRot, xRot), level, realPermission, playerName,
                 Component.literal(playerName), server, null);
         ParseResults<CommandSourceStack> parse;
         try {
@@ -302,58 +325,40 @@ public final class CommandChatHandlers {
         // 服务端核过的"持有区块"清单：随转发下发，接收端据此复核归属在预检之后没有变化
         List<ChunkKey> ownedChunks = new ArrayList<>();
         if (analysis.contextBound()) {
+            // 引用执行上下文的指令只在发起组执行（源 = 发起玩家实体），但**越界仍要拦**：
+            // /execute positioned … run fill ~ ~ ~ ~45 32 32 这类形态的绝对坐标同样会
+            // 伸进别人的领地 —— 发起组执行时就地冻结，比"干净拒绝"糟糕得多
+            CommandRouting.ChunkRange range = analysis.chunkRange();
+            if (originGroup != null && range != null) {
+                String veto = CommandOwnershipRouter.checkExecutableBy(
+                        range, dimension, originGroup, registry::ownerOf);
+                if (veto != null) {
+                    replyMessage(conn, msg, veto);
+                    return;
+                }
+            }
             if (originGroup != null) {
                 targetGroups.add(originGroup);
             }
         } else if (analysis.blockPositions().isEmpty()) {
             targetGroups.addAll(groups.primariesSnapshot().keySet());
         } else {
-            CommandRouting.ChunkRange range = analysis.chunkRange();
-            if (range == null) {
-                replyMessage(conn, msg, "无法确定指令影响的区块范围，未执行");
+            // 归属裁决：按坐标包围盒逐区块查（/fill 只声明角点，内部区块必须一并覆盖）
+            CommandOwnershipRouter.Decision decision = CommandOwnershipRouter.decide(
+                    analysis.chunkRange(), dimension, registry::ownerOf, originGroup);
+            if (decision.rejected()) {
+                replyMessage(conn, msg, decision.rejection());
                 return;
             }
-            if (range.count() > CommandRouting.MAX_ROUTING_CHUNKS) {
-                replyMessage(conn, msg, "指令影响的区块范围过大（" + range.count()
-                        + " 个区块），未执行");
-                return;
-            }
-            // 按包围盒逐区块查归属：/fill 只声明角点，内部方块必须一并覆盖
-            Set<UUID> owners = new LinkedHashSet<>();
-            for (int cx = range.minX(); cx <= range.maxX(); cx++) {
-                for (int cz = range.minZ(); cz <= range.maxZ(); cz++) {
-                    UUID owner = registry.ownerOf(new ChunkKey(dimension, cx, cz));
-                    if (owner != null) {
-                        owners.add(owner);
-                        if (owners.size() > 1) {
-                            break;
-                        }
-                    }
-                }
-                if (owners.size() > 1) {
-                    break;
-                }
-            }
-            if (owners.isEmpty()) {
+            if (decision.unowned()) {
                 if (originGroup != null) {
                     targetGroups.add(originGroup); // 无人持有：由发起组按需申请（原版路径）
                 }
-            } else if (owners.size() == 1) {
-                UUID owner = owners.iterator().next();
-                targetGroups.add(owner);
-                for (int cx = range.minX(); cx <= range.maxX(); cx++) {
-                    for (int cz = range.minZ(); cz <= range.maxZ(); cz++) {
-                        ChunkKey key = new ChunkKey(dimension, cx, cz);
-                        if (owner.equals(registry.ownerOf(key))) {
-                            ownedChunks.add(key);
-                        }
-                    }
-                }
-                LOGGER.debug("指令 /{} 归属组 {}（覆盖 {} 个区块）", command, owner, range.count());
             } else {
-                replyMessage(conn, msg,
-                        "指令跨越了多个组的区块归属（" + owners.size() + " 组），未执行");
-                return;
+                targetGroups.add(decision.owner());
+                ownedChunks.addAll(decision.ownedChunks());
+                LOGGER.debug("指令 /{} 归属组 {}（核过 {} 个持有区块）",
+                        command, decision.owner(), decision.ownedChunks().size());
             }
         }
 
@@ -476,6 +481,12 @@ public final class CommandChatHandlers {
         String text = JsonUtil.getString(msg.json(), "text", "");
         if (text.isBlank() || text.length() > 1024) {
             return; // 入站不可信：空文本/超长文本丢弃
+        }
+        // 与指令上送同口径的身份校验：聊天帧的 playerName 不能是任意自报值
+        //（否则任何已握手连接都能以管理员名义跨组发言）
+        if (ConnectionIdentity.canonicalMemberId(groups, sender, null, playerName) == null) {
+            LOGGER.warn("拒绝越权聊天上送: 连接 {} 声称玩家 {}", sender, playerName);
+            return;
         }
         UUID originGroup = groups.groupOf(sender);
         // 服务端留痕（规范：服务器和客户端的消息需要让所有客户端看到 —— 服务端是汇聚点）

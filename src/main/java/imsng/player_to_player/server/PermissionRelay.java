@@ -55,6 +55,32 @@ public final class PermissionRelay {
     /** 周期兜底间隔（秒）：ops 名单变化极低频，5 秒足够"服务端 /op 之后立刻能用"。 */
     private static final int SWEEP_INTERVAL_SECONDS = 5;
 
+    /** 名单数组构造（PERMISSION_RELAY 帧与 HELLO_ACK 附带的名单共用）。 */
+    private static JsonArray buildMemberArray(List<MemberPermission> list) {
+        JsonArray array = new JsonArray();
+        for (MemberPermission member : list) {
+            JsonObject row = new JsonObject();
+            row.addProperty("uuid", member.playerId().toString());
+            row.addProperty("name", member.playerName());
+            row.addProperty("level", member.level());
+            array.add(row);
+        }
+        return array;
+    }
+
+    /** 直接按组成员构造名单数组（HELLO_ACK 用；在服务器主线程调用）。 */
+    private JsonArray buildMembers(UUID groupId) {
+        List<MemberPermission> list = new ArrayList<>();
+        for (UUID member : groups.membersOf(groupId)) {
+            String name = ConnectionIdentity.nameOf(member);
+            int level = server.getProfilePermissions(new GameProfile(member,
+                    name != null ? name : "?"));
+            list.add(new MemberPermission(member, name != null ? name : "?", level));
+            levelSnapshot.put(member, level);
+        }
+        return buildMemberArray(list);
+    }
+
     /** 一名成员的权限档（下发给主客户端的名单行）。 */
     public record MemberPermission(UUID playerId, String playerName, int level) {
     }
@@ -62,8 +88,17 @@ public final class PermissionRelay {
     private final MinecraftServer server;
     private final GroupTable groups;
 
-    /** groupId → 上次下发的签名（"uuid:level,…"），用于跳过未变化的重复帧。 */
+    /** groupId → 上次下发的签名（"uuid:name:level,…"），用于跳过未变化的重复帧。 */
     private final Map<UUID, String> lastPushed = new ConcurrentHashMap<>();
+
+    /**
+     * clientId → 真实等级<b>快照</b>：只在服务器主线程写，Netty/io 线程读。
+     * <p>
+     * 为什么要有快照：{@code ServerOpList} 内部是普通 HashMap，服务器主线程的
+     * {@code /op}、{@code /deop} 会改它 —— Netty 线程直接读就是数据竞争（可能读到
+     * 丢失更新，把合法指令判成权限不足）。指令上送的权限裁定读这里。
+     */
+    private final Map<UUID, Integer> levelSnapshot = new ConcurrentHashMap<>();
 
     /** 周期兜底任务句柄。 */
     private volatile ScheduledFuture<?> sweepTask;
@@ -90,6 +125,30 @@ public final class PermissionRelay {
             task.cancel(false);
         }
         lastPushed.clear();
+        levelSnapshot.clear();
+    }
+
+    /** 该客户端的真实权限等级快照；未收录返回 null（调用方按 0 处理）。 */
+    public Integer levelOf(UUID clientId) {
+        return clientId == null ? null : levelSnapshot.get(clientId);
+    }
+
+    /**
+     * 把该客户端所在组的权限名单附到 HELLO_ACK 上（加性字段）。
+     * <p>
+     * 为什么要走 ACK：重连时服务端会立刻补推一次名单，但客户端此刻还没注册
+     * PERMISSION_RELAY 处理器（注册在 HELLO_ACK 之后），帧会被"无处理器"丢弃，
+     * 而去重签名又让后续推送不再重发 —— 本地权限位就会停在旧值（常见为 0）。
+     * ACK 是应答路径（客户端在等它的 future），必然送达；周期兜底随后仍会重发一次
+     * 作为幂等重试（客户端重复应用同一等级是空操作）。
+     */
+    public void appendToAck(JsonObject ack, UUID clientId) {
+        UUID groupId = clientId != null ? groups.groupOf(clientId) : null;
+        if (groupId == null) {
+            return; // 还没入组：角色指派时会推
+        }
+        ack.addProperty("permissionsGroupId", groupId.toString());
+        ack.add("permissions", buildMembers(groupId));
     }
 
     /** 调度一次下发（任意线程；实际计算在服务器主线程）。 */
@@ -138,11 +197,14 @@ public final class PermissionRelay {
     }
 
     private void sweepNow() {
+        Set<UUID> liveMembers = new java.util.HashSet<>();
         for (UUID groupId : groups.primariesSnapshot().keySet()) {
+            liveMembers.addAll(groups.membersOf(groupId));
             pushNow(groupId);
         }
-        // 已解散的组清掉签名，防 map 无限增长
+        // 已解散的组清掉签名、离线的成员清掉等级快照，防 map 无限增长
         lastPushed.keySet().removeIf(groupId -> !groups.exists(groupId));
+        levelSnapshot.keySet().retainAll(liveMembers);
     }
 
     /**
@@ -162,7 +224,9 @@ public final class PermissionRelay {
             int level = server.getProfilePermissions(new GameProfile(member,
                     name != null ? name : "?"));
             list.add(new MemberPermission(member, name != null ? name : "?", level));
-            signature.append(member).append(':').append(level).append(',');
+            signature.append(member).append(':').append(name).append(':').append(level)
+                    .append(','); // 名字进签名：改名也算变化（落权第二判据是名字）
+            levelSnapshot.put(member, level);
         }
         String sig = signature.toString();
         if (sig.equals(lastPushed.get(groupId))) {
@@ -177,15 +241,7 @@ public final class PermissionRelay {
 
         JsonObject out = new JsonObject();
         out.addProperty("groupId", groupId.toString());
-        JsonArray array = new JsonArray();
-        for (MemberPermission member : list) {
-            JsonObject row = new JsonObject();
-            row.addProperty("uuid", member.playerId().toString());
-            row.addProperty("name", member.playerName());
-            row.addProperty("level", member.level());
-            array.add(row);
-        }
-        out.add("members", array);
+        out.add("members", buildMemberArray(list));
         conn.send(ControlMessage.of(MessageType.PERMISSION_RELAY, out));
         lastPushed.put(groupId, sig);
         LOGGER.info("权限已下发: 组 {} → {} 名成员（{}）", groupId, list.size(),

@@ -53,7 +53,7 @@ public final class LocalPermissions {
     private static final Logger LOGGER = LoggerFactory.getLogger("player_to_player/permission");
 
     /** 一名成员的下发档（名字用于本地玩家列表按名兜底匹配）。 */
-    private record Member(String name, int level) {
+    record Member(String name, int level) {
     }
 
     /** 名单所属组（与 {@link GroupRuntime#activeGroupId()} 不符时视为陈旧帧）。 */
@@ -75,11 +75,39 @@ public final class LocalPermissions {
 
     /** 收到服务端名单：整表替换 + 尝试落地（Netty 线程）。 */
     private static void update(ControlMessage msg) {
-        JsonObject json = msg.json();
-        UUID group = parseUuid(JsonUtil.getString(json, "groupId", ""));
-        JsonElement raw = json.get("members");
-        if (group == null || raw == null || !raw.isJsonArray()) {
+        updateFromJson(msg.json());
+    }
+
+    /**
+     * 从 JSON 应用一份名单（PERMISSION_RELAY 帧与 HELLO_ACK 的附带名单共用）。
+     * <p>
+     * 两条路径都要有：帧路径是常规通道（角色指派/合并/分离/周期兜底），ACK 路径是
+     * 重连时的可靠通道（客户端此刻还没注册处理器，帧会丢）。
+     */
+    public static void updateFromJson(JsonObject json) {
+        UUID group = parseUuid(JsonUtil.getString(json, "groupId",
+                JsonUtil.getString(json, "permissionsGroupId", "")));
+        Map<UUID, Member> next = parseMembers(json.get("members"));
+        if (group == null || next == null) {
             return; // 入站数据不可信：缺字段直接忽略，保持旧名单
+        }
+        groupId = group;
+        members = next;
+        LOGGER.info("收到权限名单: 组 {} → {} 名成员", group, next.size());
+        applyScheduled(GroupRuntime.server());
+    }
+
+    /**
+     * 解析名单数组（纯函数，可单测）。
+     * <p>
+     * 入站数据不可信，逐条跳过非法项：非对象条目、缺 uuid、等级越界（钳到 0..4 ——
+     * 只有 0-4 是原版语义内的等级，越界值按边界处理而不是直接信任）。
+     *
+     * @return 解析结果；字段缺失/不是数组返回 null（调用方保持旧名单）
+     */
+    static Map<UUID, Member> parseMembers(JsonElement raw) {
+        if (raw == null || !raw.isJsonArray()) {
+            return null;
         }
         Map<UUID, Member> next = new ConcurrentHashMap<>();
         JsonArray array = raw.getAsJsonArray();
@@ -95,10 +123,7 @@ public final class LocalPermissions {
             int level = Math.max(0, Math.min(4, JsonUtil.getInt(row, "level", 0)));
             next.put(playerId, new Member(JsonUtil.getString(row, "name", "?"), level));
         }
-        groupId = group;
-        members = next;
-        LOGGER.info("收到权限名单: 组 {} → {} 名成员", group, next.size());
-        applyScheduled(GroupRuntime.server());
+        return next;
     }
 
     /** 会话拆除时清缓存（条目本身随集成服务端实例销毁，无需文件清理）。 */

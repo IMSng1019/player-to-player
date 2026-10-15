@@ -40,3 +40,11 @@ hs_err_*.log
 replay_*.log
 *.hprof
 *.jfr
+
+# 实机测试日志（含真实 IP/端口，按 AGENTS.md 不提交）
+
+test_log/
+
+# 本地侦察/交接草稿（javap 转储、临时笔记）
+
+.recon/

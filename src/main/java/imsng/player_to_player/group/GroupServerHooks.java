@@ -69,11 +69,13 @@ public final class GroupServerHooks {
 
         ServerLifecycleEvents.SERVER_STOPPING.register(GroupRuntime::captureExitStopping);
 
-        // 玩家加入被接管的组世界（房主本地进入 / 副客户端经隧道进入）：按服务端下发的
-        // ops 名单落权 —— 名单可能在玩家进服之前就到了（角色指派阶段），JOIN 是补落点
+        // 玩家加入被接管的组世界（房主本地进入 / 副客户端经隧道进入）：① 按服务端下发的
+        // ops 名单落权（名单常在角色指派阶段就到了，JOIN 是补落点）；② 补投切换窗口
+        // （合并让出/退出事务）内暂存的指令回执 —— 那时集成服已不可用，回执投不出去
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
             if (GroupRuntime.isManagedServer(server)) {
                 LocalPermissions.applyScheduled(server);
+                CommandRelayClient.flushPendingFeedback(handler.player);
             }
         });
 
