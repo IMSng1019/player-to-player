@@ -8,6 +8,7 @@ import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.netproto.Protocol;
 import imsng.player_to_player.server.HelloHandler;
+import imsng.player_to_player.registry.PlayerTable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -46,7 +47,8 @@ class EnvironmentSnapshotLifecycleTest {
 
             CapturingConnection connection = new CapturingConnection();
             HelloHandler handler = new HelloHandler(
-                    new GlobalConfig(), new ComputeTable(), manager, "world");
+                    new GlobalConfig(), new ComputeTable(), manager, "world",
+                    new PlayerTable(), null);
             JsonObject hello = new JsonObject();
             hello.addProperty("version", Protocol.VERSION);
             hello.addProperty("clientId", UUID.randomUUID().toString());

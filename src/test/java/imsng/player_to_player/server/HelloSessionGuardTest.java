@@ -8,6 +8,7 @@ import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.netproto.Protocol;
+import imsng.player_to_player.registry.PlayerTable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -128,7 +129,8 @@ class HelloSessionGuardTest {
                 temporary.resolve("source"), temporary.resolve("repository"),
                 List.of(), 10);
         return new HelloHandler(
-                new GlobalConfig(), new ComputeTable(), snapshots, "world");
+                new GlobalConfig(), new ComputeTable(), snapshots, "world",
+                new PlayerTable(), null);
     }
 
     private static ControlMessage hello() {

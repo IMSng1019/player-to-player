@@ -19,6 +19,7 @@ import imsng.player_to_player.group.ChatRelay;
 import imsng.player_to_player.group.CommandRelayClient;
 import imsng.player_to_player.group.GroupRuntime;
 import imsng.player_to_player.group.ExitTransactionClient;
+import imsng.player_to_player.group.LocalPermissions;
 import imsng.player_to_player.group.PlayerDataClient;
 import imsng.player_to_player.group.PearlHandoff;
 import imsng.player_to_player.group.PortalPreloader;
@@ -274,6 +275,9 @@ public final class WorldSession {
             CommandRelayClient.register(cc);
             ChatRelay.register(cc);
             PearlHandoff.register(cc);
+            // 权限下发（Phase 4 收口）：服务端按 ops 名单核出的真实等级 →
+            // 本机集成服务端落权（F3+F4 / 补全 / 未拦截路径），见 LocalPermissions
+            LocalPermissions.register(cc);
             // 分离晋升（Phase 3）：服务端主动推送的 ROLE_ASSIGN（不带 _rid，
             // 不会与 requestRoleAndSwitch 的 reply 路径冲突 —— 带 _rid 的应答
             // 在连接层被 pending future 消费，永远不进处理器分发）

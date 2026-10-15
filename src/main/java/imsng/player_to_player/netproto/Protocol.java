@@ -35,6 +35,19 @@ public final class Protocol {
     /** JSON 中请求-响应关联字段名（由 ControlConnection 自动填写/匹配）。 */
     public static final String RID_FIELD = "_rid";
 
+    /**
+     * {@code _rid} 号段起点 —— <b>接受端</b>（服务端/中转端接受的连接）。
+     * <p>
+     * 同一条连接上两端都会发起 request（客户端上送指令、服务端下发转发执行），
+     * 而应答匹配是"命中在途表即完成 future 并不再分发"——共用一个自增号段会互吞。
+     * 故按连接角色分段：接受端低位、发起端高位。详见
+     * {@code NettyControlConnection#ridBase} 的类内注释。
+     */
+    public static final long RID_BASE_ACCEPTOR = 1L;
+
+    /** {@code _rid} 号段起点 —— <b>发起端</b>（客户端主动拨出的连接）。 */
+    public static final long RID_BASE_DIALER = 1L << 40;
+
     private Protocol() {
     }
 }

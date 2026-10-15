@@ -79,6 +79,27 @@ public final class PlayerTable {
         }
     }
 
+    /**
+     * 声明一名玩家（HELLO 握手时调用）：新建行，或只刷新名字、保留既有位置/组/角色。
+     * <p>
+     * 这是本表<b>唯一的建行入口</b> —— {@link #updatePosition} 与
+     * {@link #updateGroupRole} 都是 {@code computeIfPresent}，没有本方法表恒空
+     * （2026-10-15 复查 G-09：玩家表从未被写入，三个特例全成死代码）。
+     * 建行时的维度取主世界：真实维度由 1Hz 的 PLAYER_POS_UPDATE 在 1 秒内覆盖，
+     * 而 {@code /tp} 需要的是一个可用的合法维度名而不是空串。
+     */
+    public void declare(UUID playerId, String playerName) {
+        if (playerId == null) {
+            return;
+        }
+        players.compute(playerId, (id, old) -> old == null
+                ? new PlayerEntry(id, playerName != null ? playerName : "?",
+                        "minecraft:overworld", 0.0, 0.0, 0.0, null, "unassigned")
+                : new PlayerEntry(id, playerName != null ? playerName : old.playerName(),
+                        old.dimension(), old.x(), old.y(), old.z(),
+                        old.groupId(), old.role()));
+    }
+
     /** 查询玩家；不在表中返回 null。 */
     public PlayerEntry get(UUID playerId) {
         return playerId == null ? null : players.get(playerId);

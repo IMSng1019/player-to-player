@@ -9,6 +9,7 @@ import imsng.player_to_player.registry.ChunkKey;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerChunkEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
@@ -67,6 +68,14 @@ public final class GroupServerHooks {
         });
 
         ServerLifecycleEvents.SERVER_STOPPING.register(GroupRuntime::captureExitStopping);
+
+        // 玩家加入被接管的组世界（房主本地进入 / 副客户端经隧道进入）：按服务端下发的
+        // ops 名单落权 —— 名单可能在玩家进服之前就到了（角色指派阶段），JOIN 是补落点
+        ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+            if (GroupRuntime.isManagedServer(server)) {
+                LocalPermissions.applyScheduled(server);
+            }
+        });
 
         ServerChunkEvents.CHUNK_UNLOAD.register((level, chunk) -> {
             if (!GroupRuntime.isManagedLevel(level)) {
@@ -128,6 +137,9 @@ public final class GroupServerHooks {
             }
             JsonObject json = new JsonObject();
             json.addProperty("uuid", player.getUUID().toString());
+            // 玩家名一并上报：服务端据此把"上报身份"与本组成员 HELLO 声明的名字对齐
+            //（集成服务端的玩家 UUID 在离线/开发环境可能与档案 UUID 不同，名字是稳健判据）
+            json.addProperty("name", player.getGameProfile().getName());
             json.addProperty("dimension",
                     player.serverLevel().dimension().location().toString());
             json.addProperty("x", player.getX());

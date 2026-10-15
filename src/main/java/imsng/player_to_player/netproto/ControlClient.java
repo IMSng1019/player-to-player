@@ -82,7 +82,10 @@ public final class ControlClient implements HandlerRegistry {
         EventLoopGroup worker = new NioEventLoopGroup(1, ThreadPools.namedFactory("p2p-netty-client"));
         // requireHandshake=false：本端是发起方，对端（服务端/中转端）身份已知，
         // 且客户端侧连接从不 setPeerId，若门控会误拒服务端推送（P2P_ENDPOINT_EXCHANGE 等）
-        NettyControlConnection conn = new NettyControlConnection(handlers, disconnectListeners, false);
+        // _rid 用发起端高位号段：本端上送与服务端下发的请求在同一条连接上并存，
+        // 同段会互吞（见 Protocol.RID_BASE_DIALER 注释）
+        NettyControlConnection conn = new NettyControlConnection(handlers, disconnectListeners,
+                false, Protocol.RID_BASE_DIALER);
         try {
             Bootstrap bootstrap = new Bootstrap()
                     .group(worker)

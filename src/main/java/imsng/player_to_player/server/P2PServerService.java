@@ -75,6 +75,8 @@ public final class P2PServerService {
     private static volatile GroupTable groupTable;
     /** 合并/分离协调器（Phase 3）。 */
     private static volatile MergeCoordinator mergeCoordinator;
+    /** 权限下发（Phase 4 收口：本地权限位按 ops 名单落地）。 */
+    private static volatile PermissionRelay permissionRelay;
     /** 兼任中转时的中转核心；不兼任则为 null。 */
     private static volatile RelayCore relayCore;
 
@@ -153,8 +155,12 @@ public final class P2PServerService {
 
         // c/d. 控制服务器 + 全部消息处理器
         ControlServer control = new ControlServer(config.controlPort);
+        // 权限下发（Phase 4 收口）：物理服务端 ops 名单是唯一权威，按"组 → 组成员"
+        // 把真实等级推给该组主客户端，由它在自己的集成服务端精确落权。
+        PermissionRelay permissions = new PermissionRelay(server, groups);
+        permissions.start();
         control.on(MessageType.HELLO,
-                new HelloHandler(config, computes, snapshots, worldName));
+                new HelloHandler(config, computes, snapshots, worldName, players, permissions));
         EnvSyncServerHandlers.register(control, snapshots, config);
         // 区块数据面（Phase 2）：CHUNK_DATA_REQUEST 下发 / CHUNK_DATA_UPLOAD 实时上行；
         // 返回的写回接口交给 RegistryHandlers 处理 CHUNK_RELEASE 携带的最终数据
@@ -166,7 +172,7 @@ public final class P2PServerService {
         P2PBrokerHandlers.register(control, config);
         // 合并/分离协调器（Phase 3）：MERGE_REQUEST/PROGRESS + SPLIT_REQUEST
         MergeCoordinator merges = MergeCoordinator.register(
-                control, config, registry, groups, computes, players);
+                control, config, registry, groups, computes, players, permissions);
         // 主客户端耐久退出：pending 元数据先落盘保护组占用，最终数据齐全并刷盘后
         // committed；客户端断线/服务端重启均可用同一 shutdownId 幂等恢复。
         ExitTransactionLedger exitLedger = new ExitTransactionLedger(
@@ -285,7 +291,7 @@ public final class P2PServerService {
         exits.register(control);
         chunkData.setExitTransactions(exits);
         RegistryHandlers.register(
-                control, registry, players, chunkData.releaseWriteback(), exits);
+                control, registry, players, chunkData.releaseWriteback(), exits, groups);
         // 玩家实时上行在 EXIT_BEGIN 后必须被拒绝，防旧 IO 任务覆盖最终玩家文件。
         PlayerDataHandlers.register(control, server, groups, exits);
         // 角色指派（Phase 2）：正常重进前先结束强杀遗留的 pending，保留实时数据。
@@ -298,7 +304,7 @@ public final class P2PServerService {
                             registry.discardDisconnectRecoveryDurably(clientId);
                             exits.awaitPendingBegins(clientId);
                         },
-                        exits::abandonPendingForRejoinNow));
+                        exits::abandonPendingForRejoinNow, players, permissions));
         // 启动网络入口前恢复 pending 冻结，并补做 committed 的暂存应用/清理。
         // committed 是必须完成的耐久意图，磁盘暂时不可用时不能跳过后开放新会话。
         int recoveryAttempt = 0;
@@ -419,6 +425,7 @@ public final class P2PServerService {
         computeTable = computes;
         groupTable = groups;
         mergeCoordinator = merges;
+        permissionRelay = permissions;
         environmentSnapshots = snapshots;
         controlServer = control;
         relayCore = relay;
@@ -643,6 +650,11 @@ public final class P2PServerService {
 
         playerTable = null;
         computeTable = null;
+        PermissionRelay permissions = permissionRelay;
+        permissionRelay = null;
+        if (permissions != null) {
+            permissions.shutdown();
+        }
         MergeCoordinator merges = mergeCoordinator;
         mergeCoordinator = null;
         if (merges != null) {

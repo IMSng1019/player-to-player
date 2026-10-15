@@ -150,15 +150,19 @@ public enum MessageType {
      * 指令逐级传递（规范"服务器的指令处理"：副→主→中转→服务端→其他主→其他副）。
      * 三种用法靠 JSON 字段区分，应答一律 reply 同类型（_rid 关联）：
      * <ul>
-     *   <li><b>上送</b> C→S（json: playerUuid, playerName, command）：主客户端把本组
-     *       集成服务端执行失败的玩家指令上送（副客户端的指令经隧道在主客户端的
-     *       集成服务端执行，失败信号在主客户端捕获 —— "副→主"一级是原版语义）；</li>
-     *   <li><b>转发执行</b> S→C（json: execute=true, command, sourceName,
-     *       permissionLevel）：服务端把指令分发给其他组的主客户端尝试执行，
-     *       应答 {executed, message}；</li>
-     *   <li><b>上送应答</b> S→C reply（json: handled, message, action?）：handled=true 且
-     *       action="teleport" 时附 dimension/x/y/z —— 服务端按玩家表解析出的跨组 tp，
-     *       由发起方主客户端在本地执行传送（随后的移动由加载门控/分离监视接管）。</li>
+     *   <li><b>上送</b> C→S（json: playerUuid, playerName, command, dimension, x, y, z）：
+     *       玩家在聊天栏敲的<a>每一条</a>指令都由主客户端的集成服务端无条件上送
+     *       （本地执行已被拦截取消），副客户端的指令经隧道汇聚到主客户端，同一入口；</li>
+     *   <li><b>转发执行</b> S→C（json: execute=true, command, sourceUuid, sourceName,
+     *       permissionLevel, origin, dimension）：服务端把指令下发给目标组的主客户端，
+     *       应答 {executed, message}。origin=true 表示"发起组自己那一次执行"——
+     *       指令源用发起玩家实体（@s/@p/~ 保持原版语义）；origin=false 的虚拟源锚在
+     *       该组主世界出生点（只服务世界状态类/绝对坐标/具名目标类指令）；</li>
+     *   <li><b>上送应答</b> S→C reply（json: handled, message, action?）：服务端聚合后的
+     *       结果文案，发起端直接显示（规范"如果被执行 则将执行端的消息返回发出指令的端"
+     *       /"在指令被传递完所有的端都报错后则返回本地的报错信息"）；action="teleport"
+     *       时附 dimension/x/y/z —— 服务端按玩家表解析出的跨组 tp，由发起方主客户端
+     *       在本地执行传送（随后的移动由加载门控/分离监视接管）。</li>
      * </ul>
      */
     COMMAND_RELAY(70),
@@ -173,6 +177,19 @@ public enum MessageType {
      * </ul>
      */
     CHAT_RELAY(71),
+    /**
+     * 权限下发（S→C，单向，无应答）：把<b>该组全部成员</b>在物理服务端 ops 名单上的
+     * 真实权限等级推给该组主客户端（json: groupId, members:[{uuid, name, level}]）。
+     * <p>
+     * 主客户端据此在<b>自己的集成服务端</b>里按名单精确落权（本地权限位 = 真实等级，
+     * 不做钳制）—— F3+F4 的游戏模式切换、指令补全树、以及未被拦截的执行路径
+     * （告示牌/命令方块/第三方程序化调用）都按该等级生效；而<b>跨组广播执行</b>的
+     * 权限仍单独钳制到 {@code FORWARD_PERMISSION_CAP}，两者作用面不同。
+     * <p>
+     * 触发时机：角色指派、合并提交、分离、HELLO 重连，以及 ops 名单周期性 diff
+     * （等级变化才重发）。语义上它是"缓存"，权威始终在物理服务端。
+     */
+    PERMISSION_RELAY(72),
 
     // ---------------------------------------------------- 合并与分离 80-89（Phase 3）
     /**

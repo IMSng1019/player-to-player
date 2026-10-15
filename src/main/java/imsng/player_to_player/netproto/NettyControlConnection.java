@@ -69,12 +69,28 @@ final class NettyControlConnection extends SimpleChannelInboundHandler<ControlMe
      */
     private final boolean requireHandshake;
 
+    /**
+     * 请求-响应关联号（{@code _rid}）的起始段。
+     * <p>
+     * <b>为什么必须按端分段</b>：{@link #channelRead0} 的匹配规则是"命中 pending 表就
+     * 完成 future 并不再分发"，而<b>同一条连接上两端都会各自发起 request</b> ——
+     * 客户端发 CHUNK_CLAIM_REQUEST / COMMAND_RELAY 上送，服务端发 COMMAND_RELAY
+     * 转发执行。两个方向若共用一段自增号（都从 1 开始），先到的那侧会<b>误吞</b>
+     * 对端的请求：本端的 pending future 被对端请求完成，对端请求则永远不进处理器，
+     * 直到 15 秒超时（表现为"指令在别的组随机不执行"）。
+     * <p>
+     * 因此：<b>接受端</b>（服务端/中转端接受的连接、{@code requireHandshake=true}）
+     * 用低位段，<b>发起端</b>（客户端主动拨出的连接）用高位段，
+     * 两段在 {@link Protocol#REQUEST_TIMEOUT_MILLIS} 内不可能重叠。
+     */
+    private final long ridBase;
+
     /** 底层通道：handlerAdded 时填充（channelActive 再次赋值兜底）。 */
     private volatile Channel channel;
     /** 对端身份（HELLO/RELAY_REGISTER 处理器设置）。 */
     private volatile UUID peerId;
 
-    /** request() 的 _rid 发号器（每连接独立，无需全局唯一）。 */
+    /** request() 的 _rid 发号器（每连接独立；实际编号 = {@link #ridBase} + 本计数器）。 */
     private final AtomicLong ridCounter = new AtomicLong();
     /** 在途请求：_rid → future（应答/超时/断连三选一完成）。 */
     private final Map<Long, CompletableFuture<ControlMessage>> pending = new ConcurrentHashMap<>();
@@ -82,13 +98,16 @@ final class NettyControlConnection extends SimpleChannelInboundHandler<ControlMe
     /**
      * @param requireHandshake 是否启用握手门控（服务端/中转端接受的连接传 true，
      *                         客户端主动发起的连接传 false，见字段注释）
+     * @param ridBase          {@code _rid} 号段起点（接受端 {@link Protocol#RID_BASE_ACCEPTOR}，
+     *                         发起端 {@link Protocol#RID_BASE_DIALER}，见字段注释）
      */
     NettyControlConnection(Map<MessageType, MessageHandler> handlers,
                            Iterable<Consumer<ControlConnection>> disconnectListeners,
-                           boolean requireHandshake) {
+                           boolean requireHandshake, long ridBase) {
         this.handlers = handlers;
         this.disconnectListeners = disconnectListeners;
         this.requireHandshake = requireHandshake;
+        this.ridBase = ridBase;
     }
 
     // ------------------------------------------------------- ControlConnection
@@ -105,7 +124,7 @@ final class NettyControlConnection extends SimpleChannelInboundHandler<ControlMe
 
     @Override
     public CompletableFuture<ControlMessage> request(ControlMessage message) {
-        long rid = ridCounter.incrementAndGet();
+        long rid = ridBase + ridCounter.incrementAndGet();
         message.json().addProperty(Protocol.RID_FIELD, rid);
         CompletableFuture<ControlMessage> future = new CompletableFuture<>();
         pending.put(rid, future);

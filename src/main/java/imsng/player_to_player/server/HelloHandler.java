@@ -13,6 +13,7 @@ import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.netproto.Protocol;
 import imsng.player_to_player.p2p.NatInfo;
 import imsng.player_to_player.p2p.P2PKeyGate;
+import imsng.player_to_player.registry.PlayerTable;
 import imsng.player_to_player.util.JsonUtil;
 import imsng.player_to_player.util.ThreadPools;
 import org.slf4j.Logger;
@@ -76,13 +77,25 @@ public final class HelloHandler implements MessageHandler {
     private final EnvironmentSnapshotManager snapshots;
     /** 服务端世界名（HELLO_ACK 下发，客户端据此确定 <IP>+<世界名> 世界文件夹）。 */
     private final String worldName;
+    /** 玩家表：HELLO 是唯一的建行入口（玩家 UUID = clientId，见 ConnectionIdentity）。 */
+    private final PlayerTable players;
+    /**
+     * 权限下发（HELLO 重连时按组成员强制重推，防客户端侧缓存丢失）。
+     * <p>
+     * 允许为 null：单测里没有真实 MinecraftServer 可查 ops 名单，传 null 即关闭
+     * 该副作用（与 {@code RegistryHandlers.register} 的 writeback 同款"null = 无此能力"口径）。
+     */
+    private final PermissionRelay permissions;
 
     public HelloHandler(GlobalConfig config, ComputeTable computeTable,
-                        EnvironmentSnapshotManager snapshots, String worldName) {
+                        EnvironmentSnapshotManager snapshots, String worldName,
+                        PlayerTable players, PermissionRelay permissions) {
         this.config = config;
         this.computeTable = computeTable;
         this.snapshots = snapshots;
         this.worldName = worldName;
+        this.players = players;
+        this.permissions = permissions;
     }
 
     @Override
@@ -126,6 +139,11 @@ public final class HelloHandler implements MessageHandler {
                 computeTable.report(clientId, score);
             }
             NAT_TABLE.put(clientId, nat);
+            // 身份声明与实际发布同临界区：客户端约定 clientId == 玩家档案 UUID，
+            // 故这里既建立玩家表的第一行，也建立"本连接代表谁"的自洽判据
+            //（ConnectionIdentity 的成员校验、PermissionRelay 的名单下发都用它）。
+            ConnectionIdentity.declare(clientId, playerName);
+            players.declare(clientId, playerName);
             // P2P 公钥指纹必须随新会话重新上报：同一个 clientId 可能来自重启后的新进程
             // （密钥对已换），旧指纹若被当作"已就绪"，服务端会把过期指纹下发给对端，
             // 对端校验必然失败 —— 那是可用性事故，且会被误读成中间人告警。
@@ -150,6 +168,11 @@ public final class HelloHandler implements MessageHandler {
         appendRelayInfo(config, ack);
         ack.addProperty("minFreeMemoryBytes", config.minFreeMemoryBytes);
         connection.send(message.reply(MessageType.HELLO_ACK, ack, null));
+
+        // 重连的客户端可能带着空权限名单：按其所在组强制重推一次（未入组则等待角色指派）
+        if (permissions != null) {
+            permissions.pushForClient(clientId);
+        }
 
         LOGGER.info("客户端握手成功: {} ({}) mode={} nat={} 来自 {}",
                 playerName, clientId, mode, nat.type(), connection.remoteAddress());
@@ -269,6 +292,8 @@ public final class HelloHandler implements MessageHandler {
                 //（重连会随新 HELLO + P2PSessions.register 重新上报）
                 NAT_TABLE.remove(clientId);
                 P2PKeyGate.SERVER.forget(clientId);
+                // 身份声明同理：连接已被新会话替换时不得误清（新 HELLO 刚写入的值）
+                ConnectionIdentity.forget(clientId);
             }
             if (transition != null) {
                 transition.run();
@@ -281,6 +306,7 @@ public final class HelloHandler implements MessageHandler {
     static void clearAll() {
         ONLINE.clear();
         NAT_TABLE.clear();
+        ConnectionIdentity.clearAll();
         // 撮合指纹表与待定撮合同属"按会话存活的静态身份数据"：服务停止一并清空，
         // 避免重启后拿着上一个进程的指纹撮合（服务已停，超时定时器也不会再触发）。
         P2PKeyGate.SERVER.clear();

@@ -143,6 +143,7 @@ public final class GroupRuntime {
     public static void disarm() {
         armedPlan = null;
         localWorldIdentity = null;
+        LocalPermissions.reset();
     }
 
     /**
@@ -242,6 +243,7 @@ public final class GroupRuntime {
         serverConn = null;
         groupId = null;
         localWorldIdentity = null; // 身份结论不跨接管残留（下次 arm 重新携带）
+        LocalPermissions.reset(); // 权限名单同理：不跨接管残留（条目随集成服务端实例销毁）
         managedServer = null;
         tickFrozen = false; // 冻结旗标不得跨接管残留
         LogUploader.stop(); // Phase 4：日志上行随接管终止

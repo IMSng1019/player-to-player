@@ -123,14 +123,18 @@ public final class MergeCoordinator {
     private final GroupTable groups;
     private final ComputeTable computes;
     private final PlayerTable players;
+    /** 权限下发：合并/分离改变组成员后重推两边的名单（本地权限位跟着组走）。 */
+    private final PermissionRelay permissions;
 
     private MergeCoordinator(GlobalConfig config, ChunkRegistry registry, GroupTable groups,
-                             ComputeTable computes, PlayerTable players) {
+                             ComputeTable computes, PlayerTable players,
+                             PermissionRelay permissions) {
         this.config = config;
         this.registry = registry;
         this.groups = groups;
         this.computes = computes;
         this.players = players;
+        this.permissions = permissions;
     }
 
     /**
@@ -140,9 +144,10 @@ public final class MergeCoordinator {
      */
     public static MergeCoordinator register(HandlerRegistry reg, GlobalConfig config,
                                             ChunkRegistry registry, GroupTable groups,
-                                            ComputeTable computes, PlayerTable players) {
+                                            ComputeTable computes, PlayerTable players,
+                                            PermissionRelay permissions) {
         MergeCoordinator coordinator =
-                new MergeCoordinator(config, registry, groups, computes, players);
+                new MergeCoordinator(config, registry, groups, computes, players, permissions);
         reg.on(MessageType.MERGE_REQUEST, coordinator::handleMergeRequest);
         reg.on(MessageType.MERGE_PROGRESS, coordinator::handleProgress);
         reg.on(MessageType.SPLIT_REQUEST, coordinator::handleSplitRequest);
@@ -361,6 +366,10 @@ public final class MergeCoordinator {
         }
         LOGGER.info("合并已提交: mergeId={} 新组 {}（{} 名成员，迁移 {} 个区块占用）",
                 session.mergeId, merged.groupId(), merged.members().size(), migrated);
+        // 组成员变了：新主拿到合并后的完整名单（旧两组的签名一并作废）
+        permissions.push(session.groupA);
+        permissions.push(session.groupB);
+        permissions.push(merged.groupId());
     }
 
     /** 中止合并：双方 MERGE_ABORT，A 继续运行（规范"服务端取消合并"）。幂等。 */
@@ -498,6 +507,9 @@ public final class MergeCoordinator {
         out.addProperty("newPrimaryClientId", newPrimary.toString());
         out.addProperty("migratedChunks", migrated);
         conn.send(msg.reply(MessageType.SPLIT_ACK, out, null));
+        // 分离：原组少人、新组多人，两边名单都要重推
+        permissions.push(groupId);
+        permissions.push(fresh.groupId());
         // 通知新主它已是新组的主（它可能在等 SPLIT_ACK 的转发，直发更可靠）
         ControlConnection primaryConn = HelloHandler.connectionOf(newPrimary);
         if (primaryConn != null && primaryConn.isOpen()) {

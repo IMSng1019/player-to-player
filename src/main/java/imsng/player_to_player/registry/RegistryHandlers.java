@@ -8,7 +8,9 @@ import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.util.JsonUtil;
 import imsng.player_to_player.util.Sha256;
 import imsng.player_to_player.util.ThreadPools;
+import imsng.player_to_player.server.ConnectionIdentity;
 import imsng.player_to_player.server.ExitTransactionHandlers;
+import imsng.player_to_player.server.GroupTable;
 import imsng.player_to_player.server.HelloHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,7 +56,7 @@ public final class RegistryHandlers {
      */
     public static void register(HandlerRegistry reg, ChunkRegistry registry, PlayerTable players,
                                 ChunkWriteback writeback,
-                                ExitTransactionHandlers exits) {
+                                ExitTransactionHandlers exits, GroupTable groups) {
         ChunkReleaseExecutionTracker releaseTracker =
                 new ChunkReleaseExecutionTracker();
         reg.on(MessageType.CHUNK_CLAIM_REQUEST,
@@ -66,7 +68,8 @@ public final class RegistryHandlers {
                 (conn, msg) -> handleReleaseConfirmation(
                         conn, msg, registry, exits, releaseTracker));
         reg.on(MessageType.CHUNK_PROBE_REQUEST, (conn, msg) -> handleProbe(conn, msg, registry));
-        reg.on(MessageType.PLAYER_POS_UPDATE, (conn, msg) -> handlePosUpdate(conn, msg, players));
+        reg.on(MessageType.PLAYER_POS_UPDATE,
+                (conn, msg) -> handlePosUpdate(conn, msg, players, groups));
     }
 
     // ------------------------------------------------------------ 区块申请
@@ -332,13 +335,24 @@ public final class RegistryHandlers {
 
     // ------------------------------------------------------------ 玩家位置
 
-    private static void handlePosUpdate(ControlConnection conn, ControlMessage msg, PlayerTable players) {
+    private static void handlePosUpdate(ControlConnection conn, ControlMessage msg,
+                                        PlayerTable players, GroupTable groups) {
         UUID playerId = parseUuid(JsonUtil.getString(msg.json(), "uuid", ""));
         if (playerId == null) {
             return; // 无应答消息：非法数据静默丢弃并记日志即可
         }
+        String playerName = JsonUtil.getString(msg.json(), "name", "");
+        // 身份自洽校验（复查 G-06）：只接受"本连接所在组成员"的坐标。玩家表落库后
+        // 这些坐标会直接成为跨组 /tp 的落点，不校验就等于把落点交给任意已握手连接。
+        if (!ConnectionIdentity.isOwnGroupMember(groups, conn.peerId(), playerId, playerName)) {
+            LOGGER.warn("拒绝越权位置上报: 连接 {} 声称玩家 {}（{}）",
+                    conn.peerId(), playerId, playerName);
+            return;
+        }
         String dimension = JsonUtil.getString(msg.json(), "dimension", "minecraft:overworld");
         HelloHandler.withCurrentSession(conn, () -> {
+            // 未登记的行忽略（HELLO 声明时建行）；已登记则整行刷新位置
+            players.declare(playerId, playerName.isEmpty() ? null : playerName);
             players.updatePosition(playerId, dimension,
                     getDouble(msg.json(), "x"), getDouble(msg.json(), "y"),
                     getDouble(msg.json(), "z"));

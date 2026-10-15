@@ -10,6 +10,7 @@ import imsng.player_to_player.netproto.MessageHandler;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.registry.ChunkKey;
 import imsng.player_to_player.registry.ChunkRegistry;
+import imsng.player_to_player.registry.PlayerTable;
 import imsng.player_to_player.util.ThreadPools;
 import net.minecraft.core.BlockPos;
 import net.minecraft.nbt.CompoundTag;
@@ -69,11 +70,16 @@ public final class RoleAssignHandler implements MessageHandler {
     private final ComputeTable computeTable;
     private final Consumer<UUID> awaitPendingExit;
     private final ToIntFunction<UUID> abandonPendingExitNow;
+    /** 玩家表：角色/组变化时同步行（HELLO 已建行；/list、/tp、/msg 都读它）。 */
+    private final PlayerTable players;
+    /** 权限下发：组成员变化后重推该组名单（本地权限位按名单落地）。 */
+    private final PermissionRelay permissions;
 
     public RoleAssignHandler(MinecraftServer server, GlobalConfig config, ChunkRegistry registry,
                              GroupTable groups, ComputeTable computeTable,
                              Consumer<UUID> awaitPendingExit,
-                             ToIntFunction<UUID> abandonPendingExitNow) {
+                             ToIntFunction<UUID> abandonPendingExitNow,
+                             PlayerTable players, PermissionRelay permissions) {
         this.server = server;
         this.config = config;
         this.registry = registry;
@@ -81,6 +87,8 @@ public final class RoleAssignHandler implements MessageHandler {
         this.computeTable = computeTable;
         this.awaitPendingExit = awaitPendingExit;
         this.abandonPendingExitNow = abandonPendingExitNow;
+        this.players = players;
+        this.permissions = permissions;
     }
 
     @Override
@@ -143,6 +151,9 @@ public final class RoleAssignHandler implements MessageHandler {
                     out.addProperty("groupId", owningGroup.toString());
                     out.addProperty("primaryClientId", primary.toString());
                     conn.send(msg.reply(MessageType.ROLE_ASSIGN, out, null));
+                    // 玩家表同步组/角色（HELLO 已建行）+ 重推该组权限名单（成员变了）
+                    players.updateGroupRole(peer, owningGroup, "secondary");
+                    permissions.push(owningGroup);
                     LOGGER.info("角色指派: {} → 副客户端（组 {}，目标区块 {}）",
                             peer, owningGroup, target.asString());
                     return;
@@ -175,6 +186,8 @@ public final class RoleAssignHandler implements MessageHandler {
         out.addProperty("groupId", peer.toString());
         out.addProperty("primaryClientId", peer.toString());
         conn.send(msg.reply(MessageType.ROLE_ASSIGN, out, null));
+        players.updateGroupRole(peer, peer, "primary");
+        permissions.push(peer);
         LOGGER.info("角色指派: {} → 主客户端（目标区块 {}）", peer, target.asString());
     }
 

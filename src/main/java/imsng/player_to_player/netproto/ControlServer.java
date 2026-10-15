@@ -113,8 +113,10 @@ public final class ControlServer implements HandlerRegistry {
                                             Protocol.HEARTBEAT_TIMEOUT_SECONDS,
                                             Protocol.HEARTBEAT_INTERVAL_SECONDS, 0))
                                     // requireHandshake=true：接受的连接身份未知，未握手只放行白名单类型
+                                    // _rid 用接受端低位号段（与客户端发起的请求号段隔离，防互吞）
                                     .addLast("connection", new NettyControlConnection(
-                                            handlers, disconnectListeners, true));
+                                            handlers, disconnectListeners, true,
+                                            Protocol.RID_BASE_ACCEPTOR));
                         }
                     });
             serverChannel = bootstrap.bind(port).syncUninterruptibly().channel();

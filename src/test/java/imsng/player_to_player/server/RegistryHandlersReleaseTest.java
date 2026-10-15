@@ -10,6 +10,7 @@ import imsng.player_to_player.registry.ChunkKey;
 import imsng.player_to_player.registry.ChunkRegistry;
 import imsng.player_to_player.registry.ChunkWriteback;
 import imsng.player_to_player.registry.PlayerTable;
+import imsng.player_to_player.server.GroupTable;
 import imsng.player_to_player.registry.RegistryHandlers;
 import imsng.player_to_player.registry.RegistryMutationJournal;
 import imsng.player_to_player.registry.RegistryStore;
@@ -122,7 +123,7 @@ class RegistryHandlersReleaseTest {
 
         FakeHandlerRegistry handlers = new FakeHandlerRegistry();
         RegistryHandlers.register(handlers, registry, new PlayerTable(),
-                writeback, exits());
+                writeback, exits(), new GroupTable());
         FakeConnection connection = new FakeConnection(GROUP);
         ControlMessage request = releaseRequest();
 
@@ -172,7 +173,7 @@ class RegistryHandlersReleaseTest {
             throws Exception {
         FakeHandlerRegistry handlers = new FakeHandlerRegistry();
         RegistryHandlers.register(handlers, registry, new PlayerTable(),
-                writeback, exits());
+                writeback, exits(), new GroupTable());
         FakeConnection connection = new FakeConnection(GROUP);
 
         handlers.handle(connection, request);
