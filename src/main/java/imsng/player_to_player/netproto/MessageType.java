@@ -158,11 +158,14 @@ public enum MessageType {
      *       应答 {executed, message}。origin=true 表示"发起组自己那一次执行"——
      *       指令源用发起玩家实体（@s/@p/~ 保持原版语义）；origin=false 的虚拟源锚在
      *       该组主世界出生点（只服务世界状态类/绝对坐标/具名目标类指令）；</li>
-     *   <li><b>上送应答</b> S→C reply（json: handled, message, action?）：服务端聚合后的
+     *   <li><b>上送应答</b> S→C reply（json: message[, messageJson][, action]）：服务端聚合后的
      *       结果文案，发起端直接显示（规范"如果被执行 则将执行端的消息返回发出指令的端"
-     *       /"在指令被传递完所有的端都报错后则返回本地的报错信息"）；action="teleport"
-     *       时附 dimension/x/y/z —— 服务端按玩家表解析出的跨组 tp，由发起方主客户端
-     *       在本地执行传送（随后的移动由加载门控/分离监视接管）。</li>
+     *       /"在指令被传递完所有的端都报错后则返回本地的报错信息"）；messageJson 是解析类
+     *       报错的可本地化组件；action="teleport" 时附 dimension/x/y/z —— 服务端按玩家表
+     *       解析出的跨组 tp，由发起方主客户端在本地执行传送（随后的移动由加载门控/分离
+     *       监视接管）。
+     *       <b>handled 字段已废弃</b>（保留仅为向后兼容的读出方无感）：服务端一律置 true，
+     *       客户端按 message/messageJson/action 决定显示与行为。</li>
      * </ul>
      */
     COMMAND_RELAY(70),
