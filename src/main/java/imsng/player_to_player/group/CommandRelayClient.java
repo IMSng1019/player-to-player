@@ -1,7 +1,6 @@
 package imsng.player_to_player.group;
 
 import com.google.gson.JsonObject;
-import com.mojang.brigadier.ParseResults;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.HandlerRegistry;
@@ -12,7 +11,6 @@ import imsng.player_to_player.util.ThreadPools;
 import imsng.player_to_player.util.TokenBucket;
 import net.minecraft.commands.CommandResultCallback;
 import net.minecraft.commands.CommandSourceStack;
-import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceKey;
@@ -304,7 +302,7 @@ public final class CommandRelayClient {
                     .withCallback(probe);
         } else {
             // 其余组：执行前复核区块归属（服务端预检之后的最后一道防冻结闸门）
-            String verdict = verifyOwnership(server, command, dimension, permission);
+            String verdict = verifyOwnedChunks(msg.json());
             if (verdict != null) {
                 LOGGER.info("拒绝执行越界的转发指令（{}）: /{}", verdict, command);
                 reply(conn, msg, false, verdict);
@@ -334,40 +332,37 @@ public final class CommandRelayClient {
     }
 
     /**
-     * 接收端区块归属复核：本组必须持有指令引用的<b>全部</b>方块所在区块。
+     * 接收端区块归属复核：服务端随转发下发的 {@code ownedChunks}（它按包围盒核出的
+     * "本组持有"清单）必须仍是本组持有。
      * <p>
-     * 服务端已按注册表预检过一遍，这里复核的是"预检与执行之间"的归属变化
-     * （合并/分离/退出事务期间会发生），以及任何预检遗漏。不通过则<b>不执行</b>：
-     * 集成服主线程一旦碰触"本组不持有"的区块，加载 future 会永远悬置，
-     * 主线程在 {@code managedBlock + join} 里永久忙等（集成服没有 watchdog）。
+     * 复核的是"服务端预检 → 实际执行"之间的归属变化（合并/分离/退出事务期间会发生）。
+     * 不通过则<b>不执行</b>：集成服主线程一旦碰触"本组不持有"的区块，加载 future
+     * 会永远悬置，主线程在 {@code managedBlock + join} 里永久忙等（集成服没有 watchdog）。
+     * <p>
+     * 清单为空/缺省（无坐标指令，或"无人持有 → 交回发起组按需申请"）时无需复核：
+     * 那种情形走的正是原版本地执行的同一条加载门控路径。
      *
      * @return null = 放行；否则为拒绝文案
      */
-    private static String verifyOwnership(MinecraftServer server, String command,
-                                          String dimension, int permission) {
+    private static String verifyOwnedChunks(JsonObject json) {
+        var raw = json.get("ownedChunks");
+        if (raw == null || !raw.isJsonArray()) {
+            return null;
+        }
         ChunkClaimClient claims = GroupRuntime.claims();
         if (claims == null) {
             return null; // 尚未接入 claim 客户端：由服务端预检负责（不应发生）
         }
-        CommandRouting.Analysis analysis;
-        try {
-            ServerLevel level = resolveLevel(server, dimension);
-            CommandSourceStack probeSource = new CommandSourceStack(
-                    net.minecraft.commands.CommandSource.NULL, Vec3.ZERO, Vec2.ZERO,
-                    level != null ? level : server.overworld(), permission,
-                    "p2p", Component.literal("p2p"), server, null);
-            ParseResults<CommandSourceStack> parse =
-                    server.getCommands().getDispatcher().parse(command, probeSource);
-            analysis = CommandRouting.analyze(parse);
-        } catch (RuntimeException e) {
-            return null; // 复核失败不阻断（服务端预检仍是主判据）
-        }
-        if (analysis.contextBound() || analysis.blockPositions().isEmpty()) {
-            return null; // 上下文类只会在发起组执行；无坐标自然无归属可查
-        }
-        for (BlockPos pos : analysis.blockPositions()) {
-            ChunkKey key = new ChunkKey(dimension,
-                    pos.getX() >> 4, pos.getZ() >> 4);
+        for (var element : raw.getAsJsonArray()) {
+            if (!element.isJsonPrimitive()) {
+                continue;
+            }
+            ChunkKey key;
+            try {
+                key = ChunkKey.parse(element.getAsString());
+            } catch (RuntimeException e) {
+                continue; // 入站不可信：非法键跳过
+            }
             if (!claims.isClaimed(key)) {
                 return "目标区块当前不由本组持有（" + key.x() + "," + key.z() + "），已跳过执行";
             }

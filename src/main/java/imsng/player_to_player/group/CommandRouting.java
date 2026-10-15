@@ -69,7 +69,53 @@ public final class CommandRouting {
 
         /** 无坐标、不引用上下文的常量（入口异常时的保守回退）。 */
         static final Analysis BROADCAST = new Analysis(false, List.of());
+
+        /**
+         * 引用的方块坐标所覆盖的<b>区块范围</b>（含两端）；无坐标返回 null。
+         * <p>
+         * 为什么看范围而不是逐点：{@code /fill}、{@code /clone} 只声明角点，
+         * <b>内部方块不属于任何实参</b>，而执行时会逐个遍历 —— 只查角点会漏掉
+         * "角点在本组、内部在他组"的形态，那正是主线程永久忙等的最短路径。
+         * 保守取所有实参坐标的包围盒，宁可多拒（失败方向是"不执行"）也不放过。
+         */
+        public ChunkRange chunkRange() {
+            if (blockPositions.isEmpty()) {
+                return null;
+            }
+            int minX = Integer.MAX_VALUE;
+            int minZ = Integer.MAX_VALUE;
+            int maxX = Integer.MIN_VALUE;
+            int maxZ = Integer.MIN_VALUE;
+            for (BlockPos pos : blockPositions) {
+                int x = pos.getX() >> 4;
+                int z = pos.getZ() >> 4;
+                minX = Math.min(minX, x);
+                minZ = Math.min(minZ, z);
+                maxX = Math.max(maxX, x);
+                maxZ = Math.max(maxZ, z);
+            }
+            return new ChunkRange(minX, minZ, maxX, maxZ);
+        }
     }
+
+    /** 区块范围（含两端，单位=区块坐标）。 */
+    public record ChunkRange(int minX, int minZ, int maxX, int maxZ) {
+
+        /** 范围内区块数（长方体展开）。 */
+        public long count() {
+            return (long) (maxX - minX + 1) * (maxZ - minZ + 1);
+        }
+    }
+
+    /**
+     * 单条指令允许覆盖的区块数上限（超出即拒绝执行）。
+     * <p>
+     * 防的是"用一个巨大的包围盒指令把预检变成 DoS"（{@code /fill 0 0 0 100000 100 100000}
+     * 之类的形态原版自己也会因方块数上限拒绝，但预检发生在原版之前）。
+     * 8192 个区块 ≈ 90×90 区块，远超正常玩法（原版 /fill 上限 32768 方块 ≈ 32 区块），
+     * 不会误伤任何合理指令。
+     */
+    public static final long MAX_ROUTING_CHUNKS = 8192L;
 
     private CommandRouting() {
     }

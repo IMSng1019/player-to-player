@@ -23,6 +23,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -166,6 +167,32 @@ class CommandRoutingTest {
         assertFalse(analyze("give @a diamond", 4).contextBound());
         assertFalse(analyze("kill @e[type=minecraft:zombie]", 4).contextBound());
         assertFalse(analyze("summon zombie 100 64 100", 4).contextBound());
+    }
+
+    @Test
+    @DisplayName("归属预检的覆盖范围：按坐标包围盒展开到区块（/fill 的内部区块不能漏）")
+    void chunkRangeCoversInteriorChunks() {
+        // 200>>4 = 12：从 (0,0) 到 (12,12) 共 13×13 = 169 个区块
+        CommandRouting.ChunkRange fill = analyze("fill 0 0 0 200 0 200 minecraft:stone", 4)
+                .chunkRange();
+        assertEquals(0, fill.minX());
+        assertEquals(12, fill.maxX());
+        assertEquals(169L, fill.count(), "/fill 只声明两个角点，内部区块必须一并覆盖");
+
+        // 负坐标的算术右移：-1>>4 = -1
+        CommandRouting.ChunkRange single = analyze("setblock 16 64 -1 minecraft:stone", 4)
+                .chunkRange();
+        assertEquals(1, single.minX());
+        assertEquals(-1, single.minZ());
+        assertEquals(1L, single.count());
+
+        // 跨 10 个区块的 clone：从 (0,0) 到 (10,10) 共 121 个区块
+        CommandRouting.ChunkRange clone = analyze("clone 0 0 0 15 15 15 160 64 160", 4)
+                .chunkRange();
+        assertEquals(121L, clone.count());
+
+        // 无坐标指令没有范围可查
+        assertNull(analyze("time set day", 4).chunkRange());
     }
 
     // ------------------------------------------------------------ 边界

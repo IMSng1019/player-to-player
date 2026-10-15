@@ -20,7 +20,6 @@ import imsng.player_to_player.util.TokenBucket;
 import net.minecraft.commands.CommandSource;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
-import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.ComponentUtils;
@@ -300,6 +299,8 @@ public final class CommandChatHandlers {
         CommandRouting.Analysis analysis = CommandRouting.analyze(parse);
         int forwardPermission = Math.min(FORWARD_PERMISSION_CAP, realPermission);
         List<UUID> targetGroups = new ArrayList<>();
+        // 服务端核过的"持有区块"清单：随转发下发，接收端据此复核归属在预检之后没有变化
+        List<ChunkKey> ownedChunks = new ArrayList<>();
         if (analysis.contextBound()) {
             if (originGroup != null) {
                 targetGroups.add(originGroup);
@@ -307,15 +308,30 @@ public final class CommandChatHandlers {
         } else if (analysis.blockPositions().isEmpty()) {
             targetGroups.addAll(groups.primariesSnapshot().keySet());
         } else {
+            CommandRouting.ChunkRange range = analysis.chunkRange();
+            if (range == null) {
+                replyMessage(conn, msg, "无法确定指令影响的区块范围，未执行");
+                return;
+            }
+            if (range.count() > CommandRouting.MAX_ROUTING_CHUNKS) {
+                replyMessage(conn, msg, "指令影响的区块范围过大（" + range.count()
+                        + " 个区块），未执行");
+                return;
+            }
+            // 按包围盒逐区块查归属：/fill 只声明角点，内部方块必须一并覆盖
             Set<UUID> owners = new LinkedHashSet<>();
-            boolean unowned = false;
-            for (BlockPos pos : analysis.blockPositions()) {
-                UUID owner = registry.ownerOf(new ChunkKey(dimension,
-                        pos.getX() >> 4, pos.getZ() >> 4));
-                if (owner == null) {
-                    unowned = true;
-                } else {
-                    owners.add(owner);
+            for (int cx = range.minX(); cx <= range.maxX(); cx++) {
+                for (int cz = range.minZ(); cz <= range.maxZ(); cz++) {
+                    UUID owner = registry.ownerOf(new ChunkKey(dimension, cx, cz));
+                    if (owner != null) {
+                        owners.add(owner);
+                        if (owners.size() > 1) {
+                            break;
+                        }
+                    }
+                }
+                if (owners.size() > 1) {
+                    break;
                 }
             }
             if (owners.isEmpty()) {
@@ -325,7 +341,15 @@ public final class CommandChatHandlers {
             } else if (owners.size() == 1) {
                 UUID owner = owners.iterator().next();
                 targetGroups.add(owner);
-                LOGGER.debug("指令 /{} 归属组 {}（unowned={}）", command, owner, unowned);
+                for (int cx = range.minX(); cx <= range.maxX(); cx++) {
+                    for (int cz = range.minZ(); cz <= range.maxZ(); cz++) {
+                        ChunkKey key = new ChunkKey(dimension, cx, cz);
+                        if (owner.equals(registry.ownerOf(key))) {
+                            ownedChunks.add(key);
+                        }
+                    }
+                }
+                LOGGER.debug("指令 /{} 归属组 {}（覆盖 {} 个区块）", command, owner, range.count());
             } else {
                 replyMessage(conn, msg,
                         "指令跨越了多个组的区块归属（" + owners.size() + " 组），未执行");
@@ -357,6 +381,13 @@ public final class CommandChatHandlers {
             forward.addProperty("permissionLevel", forwardPermission);
             forward.addProperty("origin", target.origin());
             forward.addProperty("dimension", dimension);
+            if (!ownedChunks.isEmpty()) {
+                com.google.gson.JsonArray keys = new com.google.gson.JsonArray();
+                for (ChunkKey key : ownedChunks) {
+                    keys.add(key.asString());
+                }
+                forward.add("ownedChunks", keys);
+            }
             target.conn().request(ControlMessage.of(MessageType.COMMAND_RELAY, forward))
                     .whenComplete((resp, err) -> {
                         boolean executed = err == null && resp != null
