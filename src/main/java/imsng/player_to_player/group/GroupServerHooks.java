@@ -17,6 +17,8 @@ import net.minecraft.world.level.chunk.storage.ChunkSerializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
+
 /**
  * 组客户端的集成服务端事件钩子（Phase 2，src/main —— 集成服务端类在 common 侧
  * 可见，事件处理器不必放 client 源集；{@code Player_to_player.onInitialize} 注册）。
@@ -71,11 +73,21 @@ public final class GroupServerHooks {
 
         // 玩家加入被接管的组世界（房主本地进入 / 副客户端经隧道进入）：① 按服务端下发的
         // ops 名单落权（名单常在角色指派阶段就到了，JOIN 是补落点）；② 补投切换窗口
-        // （合并让出/退出事务）内暂存的指令回执 —— 那时集成服已不可用，回执投不出去
+        // （合并让出/退出事务）内暂存的指令回执 —— 那时集成服已不可用，回执投不出去；
+        // ③ 记录真实登录锚点（P0-4）：此刻 playerdata 已读取、addNewPlayer 已完成，
+        //    坐标就是权威位置，用于回归验收"不再从共享出生点开始申请"。
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
             if (GroupRuntime.isManagedServer(server)) {
                 LocalPermissions.applyScheduled(server);
                 CommandRelayClient.flushPendingFeedback(handler.player);
+                logLoginAnchor(handler.player);
+            }
+        });
+
+        // 登录在 JOIN 前失败/断线：结束窗口，避免看门狗把后续正常加载当成登录同步等待
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+            if (GroupRuntime.isManagedServer(server) && handler.player != null) {
+                LoginLoadGuard.endLogin(handler.player.getUUID(), "DISCONNECT");
             }
         });
 
@@ -115,6 +127,57 @@ public final class GroupServerHooks {
         ServerTickEvents.END_SERVER_TICK.register(GroupServerHooks::reportPositions);
 
         LOGGER.info("组客户端事件钩子已注册");
+    }
+
+    /**
+     * JOIN 时记录真实登录锚点与首批区块申请（P0-4 验收证据）。
+     * <p>
+     * 此时 {@code placeNewPlayer} 已执行完 {@code load(playerdata)} 与
+     * {@code addNewPlayer}，玩家坐标是权威位置；若日志里的 chunk 仍是世界共享出生点，
+     * 说明登录锚点修复没有生效。{@code firstClaims} 由 {@link LoginLoadGuard}
+     * 在构造器 → JOIN 窗口内收集（最多 20 个）。
+     */
+    private static void logLoginAnchor(ServerPlayer player) {
+        LoginLoadGuard.LoginContext context = LoginLoadGuard.activeContext();
+        List<ChunkKey> firstClaims = LoginLoadGuard.recentClaimsSnapshot();
+        LOGGER.info("[player_to_player/login] 玩家加入: name={} uuid={} group={} "
+                        + "dimension={} chunk=({},{}) pos=({},{},{}) firstClaims={}",
+                player.getGameProfile().getName(), player.getUUID(),
+                GroupRuntime.activeGroupId(),
+                player.serverLevel().dimension().location(),
+                player.chunkPosition().x, player.chunkPosition().z,
+                player.getX(), player.getY(), player.getZ(), firstClaims);
+        if (context == null) {
+            LOGGER.warn("[player_to_player/login] JOIN 时登录窗口已不存在"
+                    + "（playerdata 读取前没有构造 ServerPlayer？），firstClaims 可能不完整");
+        }
+        // P0-4：申请了玩家渲染矩形之外的区块 = 疑似启动期/共享出生点加载重新出现。
+        // firstClaims 保留的是窗口内最早的 20 个（不是最后 20 个），因此出生点
+        // 依赖圈若再次被申请，一定会出现在这里。
+        String dimension = player.serverLevel().dimension().location().toString();
+        int serverViewDistance = player.server.getPlayerList().getViewDistance();
+        int requestedViewDistance = player.requestedViewDistance();
+        // 玩家实际渲染半径 = min(客户端请求, 服务端允许)；请求值缺失（0）时退回服务端值
+        int viewDistance = requestedViewDistance > 0
+                ? Math.min(requestedViewDistance, serverViewDistance)
+                : serverViewDistance;
+        int chunkX = player.chunkPosition().x;
+        int chunkZ = player.chunkPosition().z;
+        List<ChunkKey> outside = new java.util.ArrayList<>();
+        for (ChunkKey key : firstClaims) {
+            if (LoginAnchorPolicy.isOutsideRenderArea(key.dimension(), dimension,
+                    key.x(), key.z(), chunkX, chunkZ, viewDistance)) {
+                outside.add(key);
+            }
+        }
+        if (!outside.isEmpty()) {
+            LOGGER.warn("[player_to_player/login] 登录期出现玩家视野外的区块申请"
+                            + "（疑似启动期/共享出生点加载，检查 P0-1 是否被绕过）: "
+                            + "玩家={} chunk=({},{}) 视距={} 视野外={}",
+                    player.getGameProfile().getName(), chunkX, chunkZ,
+                    viewDistance, outside);
+        }
+        LoginLoadGuard.endLogin(player.getUUID(), "JOIN");
     }
 
     /** 周期位置上报 + 分离检测（服务器主线程；纯 JSON 组装 + 异步发送，微秒级）。 */

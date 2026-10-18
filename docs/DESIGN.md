@@ -171,7 +171,16 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
   `entityManager.tick()` 两个服务面调用**（区块发包/加载与实体装载），玩家可正常登录。
   （1.20.4 中区块发包、DistanceManager ticket 更新与实体分区加载都在 `tick` 内部，
   整体取消会让玩家永久卡在 "Loading terrain"，故必须保留这两个调用。）
-- **出生点常加载禁用**：跳过 `MinecraftServer.prepareLevels` 的出生区块加载。
+- **出生点常加载禁用**：覆盖两条入口：
+  1. `MinecraftServer.prepareLevels`（启动预热，`MinecraftServerMixin`）；
+  2. `ServerPlayer.fudgeSpawnLocation`（每次登录，`ServerPlayerMixin`，受管组世界直接取消）。
+  **登录锚点 = 权威 playerdata 的真实位置**：`PlayerList.placeNewPlayer` 先
+  `load(playerdata)` 再 `addNewPlayer`（区块 ticket），取消 fudge 后无需重排原版顺序。
+  登录期区块加载有看门狗：5 秒 WARN（区块/阻塞组/调用栈）：60 秒且同一登录窗口
+  仍有效时以 `LoginLoadTimeoutException`（**非 IOException**）异常结束该次加载
+  （`LoginLoadGuard`）。不能用 IOException：原版 `ChunkMap.scheduleChunkLoad` 会把
+  IOException 当作读盘失败并生成空 ProtoChunk，随后按种子生成（可能覆盖其他组数据）；
+  非 IOException 的 CompletionException 才走原版“标记失败 + rethrow”分支。
 - 日志收集：主客户端定期上传，存 `player-to-player/logs/<玩家名>-latest.log`。
 
 ## 9. 线程模型

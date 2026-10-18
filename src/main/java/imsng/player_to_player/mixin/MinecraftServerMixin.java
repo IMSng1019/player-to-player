@@ -17,6 +17,11 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * 出生点常加载区块禁用（规范出处：player_to_player-prompt.txt
  * "装载了该模组的服务器不加载出生点常加载区块"；见 docs/DESIGN.md "出生点常加载禁用"）。
  * <p>
+ * <b>覆盖范围</b>：本 mixin 只负责<b>启动预热</b>这一条入口（{@code prepareLevels}）。
+ * 每次登录还会经过 {@code ServerPlayer.fudgeSpawnLocation} 同步加载共享出生点区块，
+ * 该入口由 {@code ServerPlayerMixin} 取消——两处必须同时存在，否则登录路径仍会
+ * 触发原点 23×23 依赖区块的跨组 claim。
+ * <p>
  * <b>注入点选择理由</b>：{@code MinecraftServer.prepareLevels(ChunkProgressListener)}
  * 是原版启动流程中唯一负责"出生点预热"的方法：它给出生点挂 START 级 ticket
  * （常加载来源）、阻塞等待周边区块全部就绪、再启动强制区块（forced chunks）。

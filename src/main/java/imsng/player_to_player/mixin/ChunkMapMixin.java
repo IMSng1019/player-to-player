@@ -4,6 +4,8 @@ import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.group.ChunkClaimClient;
 import imsng.player_to_player.group.GroupRuntime;
+import imsng.player_to_player.group.LoginAnchorPolicy;
+import imsng.player_to_player.group.LoginLoadGuard;
 import imsng.player_to_player.group.PresyncStore;
 import imsng.player_to_player.registry.ChunkKey;
 import net.minecraft.Util;
@@ -133,23 +135,81 @@ public abstract class ChunkMapMixin {
         // 直发的最终态，与服务端存档同源且省一次往返）→ 有服务端数据则拉取并升级，
         // 否则用本地读结果。各阶段完成线程为 Netty 事件循环/io 池；NBT 升级
         // （DataFixer）转 Util.backgroundExecutor() —— 与原版 readChunk 的升级调度一致。
-        cir.setReturnValue(claims.claimWithRetry(key).thenCompose(outcome -> {
-            if (!outcome.hasServerData()) {
-                CompoundTag staged = PresyncStore.take(key);
-                if (staged == null) {
-                    return player_to_player$localReadOrEmpty(localRead, key);
-                }
-                return CompletableFuture.completedFuture(Optional.of(staged)).thenApplyAsync(
-                        opt -> opt.map(tag ->
-                                ((ChunkMapAccess) this).player_to_player$upgradeChunkTag(tag)),
-                        Util.backgroundExecutor());
-            }
-            // fetchChunkData 内部同样先查预同步暂存，未命中才走 CHUNK_DATA_REQUEST
-            return claims.fetchChunkData(key).thenApplyAsync(
-                    opt -> opt.map(tag ->
-                            ((ChunkMapAccess) this).player_to_player$upgradeChunkTag(tag)),
-                    Util.backgroundExecutor());
-        }));
+        CompletableFuture<Optional<CompoundTag>> composed = claims.claimWithRetry(key)
+                .thenCompose(outcome -> {
+                    if (!outcome.hasServerData()) {
+                        CompoundTag staged = PresyncStore.take(key);
+                        if (staged == null) {
+                            return player_to_player$localReadOrEmpty(localRead, key);
+                        }
+                        return CompletableFuture.completedFuture(Optional.of(staged)).thenApplyAsync(
+                                opt -> opt.map(tag ->
+                                        ((ChunkMapAccess) this).player_to_player$upgradeChunkTag(tag)),
+                                Util.backgroundExecutor());
+                    }
+                    // fetchChunkData 内部同样先查预同步暂存，未命中才走 CHUNK_DATA_REQUEST
+                    return claims.fetchChunkData(key).thenApplyAsync(
+                            opt -> opt.map(tag ->
+                                    ((ChunkMapAccess) this).player_to_player$upgradeChunkTag(tag)),
+                            Util.backgroundExecutor());
+                });
+        cir.setReturnValue(player_to_player$guardLoginWait(claims, key, composed));
+    }
+
+    /**
+     * 登录期加载看门狗（P0-3）。
+     * <p>
+     * 被拒的 claim 会让 future 一直悬置，而原版登录会在服务端主线程同步
+     * {@code join()} 这个区块 future（{@code ServerChunkCache.getChunk} 经
+     * {@code managedBlock} 等），历史事故里主线程被挂住 295 秒。
+     * {@code readChunk} 由区块调度在主线程发起，因此这里对"登录窗口 + 服务端主线程"
+     * 的组合加载武装：
+     * <ul>
+     *   <li>5 秒 WARN：区块键、阻塞组、玩家/维度/锚点、调用栈；</li>
+     *   <li>60 秒硬超时：<b>仅当同一个登录窗口仍然有效</b>时，以
+     *       {@link LoginLoadGuard.LoginLoadTimeoutException} 异常结束本次加载。</li>
+     * </ul>
+     * <b>不能用 IOException</b>：原版 {@code scheduleChunkLoad} 会把 IOException
+     * 解释为读盘失败并生成空 ProtoChunk，随后按种子生成本地数据（可能覆盖其他组）。
+     * 非 IOException 的 CompletionException 会走原版"标记失败 + rethrow"分支。
+     * JOIN 之后窗口结束，定时器不再硬失败（此时服务端主线程已不可能被这次登录阻塞）。
+     */
+    @Unique
+    private CompletableFuture<Optional<CompoundTag>> player_to_player$guardLoginWait(
+            ChunkClaimClient claims, ChunkKey key,
+            CompletableFuture<Optional<CompoundTag>> composed) {
+        if (!LoginLoadGuard.isLoginPhase()) {
+            return composed;
+        }
+        LoginLoadGuard.recordClaim(key);
+        // 共享出生点区块在登录期出现 = P0-1 没有覆盖到的路径，留下 WARN + 调用栈
+        net.minecraft.core.BlockPos spawn = this.level.getSharedSpawnPos();
+        if (LoginAnchorPolicy.isSharedSpawnChunk(
+                spawn.getX(), spawn.getZ(), key.x(), key.z())) {
+            LoginLoadGuard.warnSpawnChunkClaim(key);
+        }
+        boolean serverThread = this.level.getServer() != null
+                && this.level.getServer().isSameThread();
+        if (!LoginAnchorPolicy.shouldArmSyncWatchdog(true, serverThread)) {
+            return composed;
+        }
+        return LoginLoadGuard.guard(key, composed,
+                () -> player_to_player$describeClaimDiagnostics(claims, key), true);
+    }
+
+    /** 看门狗告警/超时时使用的只读 claim 诊断。 */
+    @Unique
+    private static String player_to_player$describeClaimDiagnostics(
+            ChunkClaimClient claims, ChunkKey key) {
+        ChunkClaimClient.ClaimDiagnostics diagnostics = claims.diagnostics(key);
+        if (diagnostics == null) {
+            return "阻塞组=未知（尚未收到拒绝应答或正在等待服务端/网络）";
+        }
+        return "阻塞组=" + diagnostics.blockingGroup()
+                + " 阻塞区块=" + diagnostics.blockingChunk()
+                + " 尝试=" + diagnostics.attempts()
+                + " 首次拒绝=" + diagnostics.firstDeniedAtMillis() + "ms"
+                + " 最近拒绝=" + diagnostics.lastDeniedAtMillis() + "ms";
     }
 
     /**

@@ -9,7 +9,9 @@
 		"ChunkStorageMixin",
 		"EntityPortalMixin",
 		"MinecraftServerMixin",
+		"PlayerListMixin",
 		"ServerLevelMixin",
+		"ServerPlayerMixin",
 		"ThrownEnderpearlMixin"
 	],
 	"injectors": {

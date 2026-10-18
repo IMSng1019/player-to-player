@@ -58,6 +58,20 @@ public final class ChunkClaimClient {
     public record ClaimOutcome(boolean hasServerData) {
     }
 
+    /**
+     * 最近一次被拒的只读诊断（登录看门狗/回归验收用；不参与 claim 状态机）。
+     *
+     * @param blockingGroup      拒绝方组 ID（服务端下发；空串表示字段缺失/非法）
+     * @param blockingChunk      拒绝方占用的区块（服务端下发）
+     * @param attempts           该 key 连续被拒次数（授予后清零）
+     * @param firstDeniedAtMillis 本轮首次被拒的墙钟时间
+     * @param lastDeniedAtMillis  最近一次被拒的墙钟时间
+     */
+    public record ClaimDiagnostics(String blockingGroup, String blockingChunk,
+                                   int attempts, long firstDeniedAtMillis,
+                                   long lastDeniedAtMillis) {
+    }
+
     private final ControlConnection conn;
     private final UUID groupId;
     private final int retrySeconds;
@@ -72,6 +86,13 @@ public final class ChunkClaimClient {
 
     /** 已授予且尚未释放的区块（上行服务据此过滤"释放后仍触发的存盘上行"）。 */
     private final Set<ChunkKey> claimed = ConcurrentHashMap.newKeySet();
+
+    /**
+     * 最近一次被拒的诊断（只读，不改变状态机）。授予/摘除/关停时清除，
+     * 防止过期阻塞组被登录看门狗误报。
+     */
+    private final ConcurrentHashMap<ChunkKey, ClaimDiagnostics> denials =
+            new ConcurrentHashMap<>();
 
     /**
      * 当前 claim 对应的服务端数据基线：true 表示物理服已经有可保留的权威区块数据，
@@ -187,6 +208,14 @@ public final class ChunkClaimClient {
         return claimed.contains(key);
     }
 
+    /**
+     * 最近一次被拒的只读诊断；null = 该 key 尚未被拒（或已授予/已摘除）。
+     * 任意线程可调，返回不可变快照。
+     */
+    public ClaimDiagnostics diagnostics(ChunkKey key) {
+        return denials.get(key);
+    }
+
     /** 已授予区块的快照（预同步发送端遍历用；防御性拷贝）。 */
     public Set<ChunkKey> claimedSnapshot() {
         return Set.copyOf(claimed);
@@ -203,6 +232,7 @@ public final class ChunkClaimClient {
         synchronized (lifecycleLock) {
             claimed.remove(key);
             serverDataKnown.remove(key);
+            denials.remove(key);
             release = releases.remove(key);
         }
         if (release != null) {
@@ -217,6 +247,7 @@ public final class ChunkClaimClient {
         synchronized (lifecycleLock) {
             claimed.clear();
             serverDataKnown.clear();
+            denials.clear();
             activeReleases = new java.util.HashMap<>(releases);
             releases.clear();
         }
@@ -285,6 +316,7 @@ public final class ChunkClaimClient {
                             }
                             serverDataKnown.put(key, hasServerData);
                             claimed.add(key);
+                            denials.remove(key);
                             pending.remove(key, future);
                         }
                         future.complete(new ClaimOutcome(hasServerData));
@@ -295,9 +327,12 @@ public final class ChunkClaimClient {
                     // （MergeClient 挂接后决定是否发起 MERGE_REQUEST），并继续重试
                     // 作兜底：合并期间/失败后区块仍按原节奏申请。
                     String blockingGroupRaw = JsonUtil.getString(resp.json(), "blockingGroup", "");
+                    String blockingChunkRaw = JsonUtil.getString(
+                            resp.json(), "blockingChunk", "?");
+                    recordDenial(key, blockingGroupRaw, blockingChunkRaw);
                     LOGGER.info("区块申请被拒（{} 秒后重试）: {} 阻塞组={} 阻塞区块={}",
                             retrySeconds, key.asString(), blockingGroupRaw,
-                            JsonUtil.getString(resp.json(), "blockingChunk", "?"));
+                            blockingChunkRaw);
                     try {
                         MergeTriggers.onClaimBlocked(UUID.fromString(blockingGroupRaw), key);
                     } catch (IllegalArgumentException ignored) {
@@ -310,6 +345,15 @@ public final class ChunkClaimClient {
     /** 安排下一轮申请重试。 */
     private void scheduleRetry(ChunkKey key, CompletableFuture<ClaimOutcome> future) {
         retryScheduler.accept(() -> attemptClaim(key, future));
+    }
+
+    /** 记录一次拒绝；同一 key 连续被拒累加次数并保留首次拒绝时间。 */
+    private void recordDenial(ChunkKey key, String blockingGroup, String blockingChunk) {
+        long now = System.currentTimeMillis();
+        denials.compute(key, (ignored, previous) -> previous == null
+                ? new ClaimDiagnostics(blockingGroup, blockingChunk, 1, now, now)
+                : new ClaimDiagnostics(blockingGroup, blockingChunk,
+                        previous.attempts() + 1, previous.firstDeniedAtMillis(), now));
     }
 
     // ------------------------------------------------------------ 数据拉取
@@ -595,6 +639,7 @@ public final class ChunkClaimClient {
             exitPreparing = true;
             pendingClaims = new java.util.HashMap<>(pending);
             pending.clear();
+            denials.clear();
         }
         pendingClaims.values().forEach(future -> future.completeExceptionally(
                 new IllegalStateException("主客户端正在准备退出事务")));
@@ -612,6 +657,7 @@ public final class ChunkClaimClient {
             exitFrozen = true;
             pendingClaims = new java.util.HashMap<>(pending);
             pending.clear();
+            denials.clear();
             snapshot = Set.copyOf(claimed);
         }
         pendingClaims.values().forEach(future -> future.completeExceptionally(
@@ -633,6 +679,7 @@ public final class ChunkClaimClient {
             releases.clear();
             claimed.clear();
             serverDataKnown.clear();
+            denials.clear();
         }
         pendingClaims.values().forEach(future -> future.completeExceptionally(
                 new IllegalStateException("组运行时已关停")));

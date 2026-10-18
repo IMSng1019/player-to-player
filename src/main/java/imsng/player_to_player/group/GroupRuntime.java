@@ -246,6 +246,7 @@ public final class GroupRuntime {
         LocalPermissions.reset(); // 权限名单同理：不跨接管残留（条目随集成服务端实例销毁）
         managedServer = null;
         tickFrozen = false; // 冻结旗标不得跨接管残留
+        LoginLoadGuard.reset("集成服务端停止"); // 登录窗口/诊断不得跨世界残留
         LogUploader.stop(); // Phase 4：日志上行随接管终止
         if (preUnloads != null) {
             preUnloads.shutdown();
