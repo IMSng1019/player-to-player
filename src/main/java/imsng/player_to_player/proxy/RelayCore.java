@@ -90,7 +90,7 @@ public final class RelayCore {
         });
         relay.start();
         server = relay;
-        LOGGER.info("中转服务已启动，端口 {}", port);
+        LOGGER.info("中转服务已启动，端口 {}", relay.boundPort());
     }
 
     /** 停止中转监听并清空登记表（幂等：未启动/已停止则忽略）。 */
@@ -102,6 +102,12 @@ public final class RelayCore {
             relay.stop();
             LOGGER.info("中转服务已停止");
         }
+    }
+
+    /** 实际绑定的中转端口；未启动返回 -1（服务端兼任中转时用于端口同步下发）。 */
+    public int boundPort() {
+        ControlServer relay = server;
+        return relay != null ? relay.boundPort() : -1;
     }
 
     /** RELAY_REGISTER：登记 clientId → 连接，使该客户端可被其他端经中转寻址。 */

@@ -6,6 +6,7 @@ import imsng.player_to_player.group.ChatRelay;
 import imsng.player_to_player.group.GroupServerHooks;
 import imsng.player_to_player.proxy.ProxyServerService;
 import imsng.player_to_player.server.P2PServerService;
+import imsng.player_to_player.server.PortSyncServer;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.loader.api.FabricLoader;
@@ -76,6 +77,9 @@ public final class P2PBootstrap {
         // 4. 按模式挂接生命周期
         switch (mode) {
             case SERVER -> {
+                // MC 频道端口同步：玩家加入时下发本机实际绑定的 controlPort/relayPort。
+                // 必须在任何玩家可能加入之前注册（模组初始化早于 SERVER_STARTED）。
+                PortSyncServer.register();
                 // 服务端主服务在 MC 服务器完全启动后再启动（需要注册表/世界目录就绪）
                 ServerLifecycleEvents.SERVER_STARTED.register(P2PServerService::start);
                 ServerLifecycleEvents.SERVER_STOPPING.register(server -> P2PServerService.stop());

@@ -1,6 +1,7 @@
 package imsng.player_to_player.client.boot;
 
 import imsng.player_to_player.client.group.GroupHost;
+import imsng.player_to_player.client.net.PortSyncClient;
 import imsng.player_to_player.client.session.WorldSession;
 import imsng.player_to_player.client.session.ClientExitCoordinator;
 import imsng.player_to_player.compute.ComputeScore;
@@ -105,7 +106,14 @@ public final class ClientBootstrap {
         }
 
         // ---------------------------------------------------------------
-        // c. 加入/离开世界钩子 → 世界会话开合（具体流程全部在 WorldSession）。
+        // c. 服务端端口同步（MC 自定义通道）：接收服务端在加入时下发的
+        //    controlPort/relayPort。必须在任何连接建立前注册；WorldSession
+        //    会在建控制连接前短暂等待本通道的数据。
+        // ---------------------------------------------------------------
+        PortSyncClient.register();
+
+        // ---------------------------------------------------------------
+        // d. 加入/离开世界钩子 → 世界会话开合（具体流程全部在 WorldSession）。
         //    JOIN 在客户端主线程触发，WorldSession 内部立刻转交 io 线程，
         //    保证不阻塞渲染。
         // ---------------------------------------------------------------
@@ -118,7 +126,7 @@ public final class ClientBootstrap {
         ClientTickEvents.END_CLIENT_TICK.register(GroupHost::onClientTick);
 
         // ---------------------------------------------------------------
-        // d. Phase 2：主客户端退出本地组世界时，DISCONNECT 事件先于集成服务端
+        // e. Phase 2：主客户端退出本地组世界时，DISCONNECT 事件先于集成服务端
         //    完全停止，而停服 saveAll 的最终区块上行必须赶在控制连接关闭之前 ——
         //    onLeave 对此延迟拆除，由 GroupRuntime 在 SERVER_STOPPED（detach）后
         //    经本回调补拆。回调在服务器线程触发，拆除转 io 线程执行。

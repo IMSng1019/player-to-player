@@ -220,6 +220,11 @@ public final class HelloHandler implements MessageHandler {
         } else if (!config.serverActsAsRelay) {
             relayPort = 0; // 既无独立中转又不兼任：显式告知客户端没有中转可用
         }
+        // relayPort 配置为 0（系统分配临时端口）时，用本机实际绑定的中转端口补齐，
+        // 保证与 MC 通道下发的端口同口径；外部中转/不兼任中转不受影响。
+        if (config.serverActsAsRelay && relayAddress.isEmpty() && relayPort <= 0) {
+            relayPort = PortSyncServer.publishedRelayPort();
+        }
         ack.addProperty("relayAddress", relayAddress);
         ack.addProperty("relayPort", relayPort);
     }

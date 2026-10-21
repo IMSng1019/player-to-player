@@ -17,6 +17,8 @@ import io.netty.util.concurrent.GlobalEventExecutor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -122,7 +124,7 @@ public final class ControlServer implements HandlerRegistry {
             serverChannel = bootstrap.bind(port).syncUninterruptibly().channel();
             bossGroup = boss;
             workerGroup = worker;
-            LOGGER.info("控制服务器已监听端口 {}", port);
+            LOGGER.info("控制服务器已监听端口 {}", boundPort());
         } catch (Exception e) {
             // 绑定失败（端口占用等）：回收事件循环并向上抛，绝不留半启动状态
             boss.shutdownGracefully();
@@ -130,6 +132,21 @@ public final class ControlServer implements HandlerRegistry {
             started = false;
             throw new IllegalStateException("控制端口 " + port + " 监听失败", e);
         }
+    }
+
+    /**
+     * 实际绑定的本地端口；未启动或无法取得时返回 -1。
+     * <p>
+     * {@code config.controlPort} / {@code relayPort} 允许为 0（由系统分配临时端口）；
+     * 端口同步/日志必须用它拿到的真实值，而不是配置里可能为 0 的原始值。
+     */
+    public int boundPort() {
+        Channel ch = serverChannel;
+        if (ch == null) {
+            return -1;
+        }
+        SocketAddress local = ch.localAddress();
+        return local instanceof InetSocketAddress inet ? inet.getPort() : -1;
     }
 
     /**

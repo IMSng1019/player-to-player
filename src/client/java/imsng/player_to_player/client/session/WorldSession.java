@@ -7,6 +7,7 @@ import imsng.player_to_player.client.group.LocalWorldLauncher;
 import imsng.player_to_player.client.group.MergeClient;
 import imsng.player_to_player.client.group.SecondaryJoiner;
 import imsng.player_to_player.client.group.WorldSwitcher;
+import imsng.player_to_player.client.net.PortSyncClient;
 import imsng.player_to_player.compute.ComputeScore;
 import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.config.P2PPaths;
@@ -40,6 +41,7 @@ import net.minecraft.network.chat.Component;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -87,6 +89,8 @@ public final class WorldSession {
 
     /** 退出事务断线重连所需的物理服会话身份；均在 SESSION_LOCK 内读写。 */
     private static String sessionHost;
+    /** 本次会话实际使用的控制端口（服务端同步/本地配置回退）；耐久退出重连复用。 */
+    private static int sessionControlPort;
     private static UUID sessionPlayerId;
     private static String sessionPlayerName;
 
@@ -123,12 +127,18 @@ public final class WorldSession {
         UUID playerId = client.getUser().getProfileId();
         String playerName = client.getUser().getName();
 
+        // 物理服加入：开启新一代端口等待。服务端会在收到本端的频道注册包后，
+        // 经 MC 自定义通道下发它实际绑定的 controlPort/relayPort（见 PortSyncClient）；
+        // 本方法仍在主线程，真正的等待发生在下面的 join-flow 阻塞线程里。
+        // 注意必须在 SESSION_LOCK 的代数自增之后开启：旧 join-flow 若因新加入而
+        // 从等待中返回，必须能看到"自己的代数已过期"，从而不再配置中转/建连。
         long myGeneration;
         synchronized (SESSION_LOCK) {
             // 代数自增与 onLeave 的"++并摘取关闭"同锁，使 openSession 的
             // "校验代数+发布连接"能与离开流程严格互斥
             myGeneration = ++generation;
         }
+        PortSyncClient.beginJoin();
         // 加入流程是一条长工作流（环境同步/角色申请/本地存档准备，含 .join() 等待 io 池上的
         // 子任务）：走专用阻塞线程，避免"池内任务等池内任务"占用名额（见 ThreadPools#startBlocking）
         ThreadPools.startBlocking("join-flow", () -> openSession(myGeneration, rawAddress, playerId, playerName));
@@ -167,6 +177,7 @@ public final class WorldSession {
             cc = controlClient;
             controlClient = null;
             sessionHost = null;
+            sessionControlPort = 0;
             sessionPlayerId = null;
             sessionPlayerName = null;
         }
@@ -213,10 +224,39 @@ public final class WorldSession {
             return;
         }
 
-        // ---- 2. 连接控制端口 + HELLO 握手 ----
-        ControlClient cc = new ControlClient(host, config.controlPort);
+        // ---- 2. 解析控制端口（优先服务端经 MC 通道同步）+ 连接 + HELLO 握手 ----
+        ResolvedPorts ports = resolvePorts(config);
+        if (myGeneration != generation) {
+            // 等待端口期间玩家已离开/重进：旧 join-flow 绝不能再用旧 host 建连，
+            // 更不能改写 RelayConnector —— 新会话可能已经用新端口建立了自己的配置。
+            LOGGER.info("会话已过期，放弃本次控制面建连");
+            return;
+        }
+        // 同步到的 relayPort 稍后预填给 RelayConnector；这里先只解析端口。
+        // （预填动作放在会话发布之后，避免过期 join-flow 改写新会话的中转配置。）
+        int controlPort = ports.controlPort();
+        ControlClient cc = new ControlClient(host, controlPort);
         try {
-            ControlConnection conn = cc.connect();
+            ControlConnection connected;
+            try {
+                connected = cc.connect();
+            } catch (IOException first) {
+                // 兼容旧部署：服务端可能经 NAT/端口转发把控制面映射成另一个外部端口，
+                // 同步下发的"实际监听端口"在外网不可达。此时用本地配置端口重试一次
+                // （仅当确有同步值且与本地配置不同；1:1 部署不会走到这里）。
+                int fallbackPort = config.controlPort;
+                if (!ports.synced() || fallbackPort <= 0 || fallbackPort == controlPort) {
+                    throw first;
+                }
+                LOGGER.warn("连接服务端同步端口 {} 失败，回退本地 controlPort={} 重试: {}",
+                        controlPort, fallbackPort, first.toString());
+                cc.close();
+                cc = new ControlClient(host, fallbackPort);
+                connected = cc.connect();
+                controlPort = fallbackPort;
+            }
+            // ROLE_ASSIGN 推送处理器会捕获该引用，故发布后不再重新赋值
+            final ControlConnection conn = connected;
 
             // —— 竞态时序（为何"校验+发布"必须持锁）——
             // 旧实现先无锁校验代数、通过后再写 controlClient，存在竞窗：
@@ -230,6 +270,7 @@ public final class WorldSession {
                 if (!expired) {
                     controlClient = cc;
                     sessionHost = host;
+                    sessionControlPort = controlPort;
                     sessionPlayerId = playerId;
                     sessionPlayerName = playerName;
                 }
@@ -237,6 +278,11 @@ public final class WorldSession {
             if (expired) {
                 cc.close(); // 玩家已经离开世界：立即关闭刚建的连接（尚未发布，不影响新会话）
                 return;
+            }
+            // 会话已确认发布：用同步到的端口预填中转端点。HELLO_ACK 到达后仍会以
+            // 服务端下发的 relayAddress/relayPort 覆盖（含独立中转地址的场景）。
+            if (ports.synced()) {
+                RelayConnector.configure(host, ports.relayPort());
             }
 
             ControlMessage ack = conn.request(ControlMessage.of(MessageType.HELLO,
@@ -349,6 +395,32 @@ public final class WorldSession {
             hello.add("nat", nat.toJson());
         }
         return hello;
+    }
+
+    /**
+     * 解析本次会话的控制端口（io 线程，可阻塞）。
+     * <p>
+     * 优先使用服务端经 MC 自定义通道同步的端口：服务端可能把 {@code controlPort}
+     * 配成非默认值，客户端本地配置无从得知，旧实现会因此完全连不上控制面。
+     * 服务端未运行本模组 / 版本过旧 / 超过等待上限时，回退本地配置（保持旧行为）。
+     * <p>
+     * 本方法<b>不产生任何副作用</b>（不配置 RelayConnector、不建连）：等待期间
+     * 会话可能已经过期，副作用必须由调用方在代数校验之后执行。
+     */
+    private static ResolvedPorts resolvePorts(GlobalConfig config) {
+        PortSyncClient.Ports ports = PortSyncClient.awaitForJoin();
+        if (ports != null) {
+            LOGGER.info("使用服务端同步的端口: controlPort={}, relayPort={}",
+                    ports.controlPort(), ports.relayPort());
+            return new ResolvedPorts(ports.controlPort(), ports.relayPort(), true);
+        }
+        LOGGER.warn("未收到服务端端口同步（服务端未运行本模组或超时），回退本地 controlPort={}",
+                config.controlPort);
+        return new ResolvedPorts(config.controlPort, 0, false);
+    }
+
+    /** 解析结果：{@code synced=false} 表示回退本地配置，调用方不得预填中转端点。 */
+    private record ResolvedPorts(int controlPort, int relayPort, boolean synced) {
     }
 
     /**
@@ -619,11 +691,13 @@ public final class WorldSession {
         String host;
         UUID playerId;
         String playerName;
+        int controlPort;
         synchronized (SESSION_LOCK) {
             existing = controlClient;
             host = sessionHost;
             playerId = sessionPlayerId;
             playerName = sessionPlayerName;
+            controlPort = sessionControlPort;
         }
         if (existing != null) {
             ControlConnection open = existing.connection();
@@ -636,7 +710,9 @@ public final class WorldSession {
         }
 
         NodeContext ctx = NodeContext.get();
-        ControlClient replacement = new ControlClient(host, ctx.config().controlPort);
+        // 复用会话建立时实际生效的端口（可能是服务端同步值，本地配置并不相同）
+        int reconnectPort = controlPort > 0 ? controlPort : ctx.config().controlPort;
+        ControlClient replacement = new ControlClient(host, reconnectPort);
         try {
             ControlConnection connection = replacement.connect();
             ControlMessage ack = connection.request(ControlMessage.of(
@@ -650,12 +726,12 @@ public final class WorldSession {
             synchronized (SESSION_LOCK) {
                 previous = controlClient;
                 controlClient = replacement;
+                sessionControlPort = reconnectPort;
             }
             if (previous != null && previous != replacement) {
                 previous.close();
             }
-            LOGGER.info("耐久退出控制连接已恢复: {}:{}", host,
-                    ctx.config().controlPort);
+            LOGGER.info("耐久退出控制连接已恢复: {}:{}", host, reconnectPort);
             return connection;
         } catch (Exception e) {
             replacement.close();

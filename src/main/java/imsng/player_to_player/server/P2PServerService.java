@@ -416,7 +416,21 @@ public final class P2PServerService {
         if (config.serverActsAsRelay && relayAddr.isEmpty()) {
             relay = new RelayCore(config.relayPort);
             relay.start();
-            LOGGER.info("服务端兼任中转 (relayPort={})", config.relayPort);
+            LOGGER.info("服务端兼任中转 (relayPort={})", relay.boundPort());
+        }
+
+        // g. 端口同步（MC 自定义通道）：把本机实际绑定的控制/中转端口发布出去，
+        //    每个客户端加入时由 PortSyncServer 下发。客户端本地 controlPort 与服务端
+        //    不一致时，旧实现会完全连不上控制面（控制端口无法由控制连接自己告知）。
+        //    外部中转不代表本机端口，下发 0；HELLO_ACK 仍会下发完整中转地址。
+        int boundControlPort = control.boundPort();
+        int boundRelayPort = relay != null ? relay.boundPort() : 0;
+        if (boundControlPort > 0) {
+            PortSyncServer.publish(boundControlPort, Math.max(0, boundRelayPort));
+            LOGGER.info("端口同步已发布: controlPort={}, relayPort={}",
+                    boundControlPort, Math.max(0, boundRelayPort));
+        } else {
+            LOGGER.warn("控制端口绑定异常，本次运行不发布端口同步（客户端将回退本地配置）");
         }
 
         // 全部组件就绪后统一发布（volatile 写），stop() 据此收尾
@@ -432,7 +446,7 @@ public final class P2PServerService {
         relayCore = relay;
         running = true;
 
-        LOGGER.info("P2P 服务端主服务已启动: controlPort={}, 世界={}", config.controlPort, worldName);
+        LOGGER.info("P2P 服务端主服务已启动: controlPort={}, 世界={}", boundControlPort, worldName);
     }
 
     // ---------------------------------------------------------------- 工具
@@ -667,6 +681,7 @@ public final class P2PServerService {
             groups.clear();
         }
         HelloHandler.clearAll(); // 清静态在线/NAT 映射，保证下次 start 干净
+        PortSyncServer.clear();  // 停止后不再向新连接下发端口（重启时重新发布）
 
         LOGGER.info("P2P 服务端主服务已停止");
     }

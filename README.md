@@ -53,6 +53,8 @@
 
 客户端连接的仍是服务器的 Minecraft 地址；控制面使用服务端下发的独立端口，组世界内部的游戏流量再通过 P2P 或中转隧道传输。
 
+玩家每次加入时，服务端会通过 MC 自定义通道 `player_to_player:server_ports` 下发它**实际绑定**的 `controlPort` / `relayPort`，客户端据此建立控制连接；客户端本地的这两个端口配置只在服务端未运行本模组或下发超时时作为回退（同步端口的 TCP 建连失败时也会用本地控制端口重试一次），不再必须与服务端配置一致。
+
 ### 中转服务端（可选）
 
 中转端是一个 Fabric 服务端实例，配置 `mode: "proxy_server"`，并设置 `parentServerAddress` 指向上级服务端。它负责：
@@ -126,7 +128,7 @@
 - `relayServerAddress`：独立中转端地址，格式为 `IP:端口` 或 `IP`。
 - `parentServerAddress`：仅中转端使用的上级服务端地址。
 - `serverActsAsRelay`：服务端是否兼任中转端。
-- `controlPort` / `relayPort`：控制面和中转面端口，均独立于 Minecraft 原版端口。
+- `controlPort` / `relayPort`：控制面和中转面端口，均独立于 Minecraft 原版端口。客户端侧的这两个值只在收不到服务端端口同步时作为回退。
 - `minFreeMemoryBytes`：成为主客户端所需的最低剩余内存，默认 512 MiB。
 - `chunkClaimRetrySeconds`：区块申请被其他组占用后的重试间隔。
 - `nonEnvironmentPaths`：相对于服务端根目录的额外非环境文件路径。
