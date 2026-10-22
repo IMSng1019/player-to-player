@@ -19,8 +19,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * CHUNK_DATA_REQUEST 往返。消费即移除（一次性），未被消费的条目随合并会话
  * 结束整体清空。
  * <p>
- * <b>容量上界</b>：{@value #MAX_STAGED_CHUNKS} 个区块（超限丢弃新条目并告警 ——
- * 服务端存档仍有同样数据，B 侧回退拉取路径，只损失带宽不损失数据）。
+ * <b>容量上界</b>：{@value #MAX_STAGED_CHUNKS} 个区块。超限终止本次预同步，
+ * 不再假定物理服必然已经持有同一版本而静默丢弃必需记录。
  * <p>
  * 线程模型：写入方是预同步接收线程（io 池），消费方是 B 集成服务端的区块
  * 加载链（Netty/io/主线程皆可能）——ConcurrentHashMap 单键原子操作，无外部锁。
@@ -39,11 +39,9 @@ public final class PresyncStore {
     }
 
     /** 暂存一个区块（预同步接收线程；同键覆盖 —— 增量追赶天然取最新）。 */
-    public static void put(ChunkKey key, CompoundTag tag) {
+    public static synchronized void put(ChunkKey key, CompoundTag tag) {
         if (STAGED.size() >= MAX_STAGED_CHUNKS && !STAGED.containsKey(key)) {
-            LOGGER.warn("预同步暂存超限（{}），丢弃 {}（B 将回退服务端拉取，无数据损失）",
-                    MAX_STAGED_CHUNKS, key.asString());
-            return;
+            throw new IllegalStateException("预同步暂存超限，不能确认完整尾部: " + key.asString());
         }
         STAGED.put(key, tag);
     }

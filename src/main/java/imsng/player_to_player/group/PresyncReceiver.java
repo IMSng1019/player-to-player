@@ -22,11 +22,9 @@ import java.util.function.Consumer;
 /**
  * 预同步接收端（Phase 3，合并接管方 B 侧；协议见 {@link PresyncProtocol}）。
  * <p>
- * <b>与规范"影子实例"的工程取舍</b>：规范设想 B 提前启动一个不可见的完整 MC
- * 服务端实例重放增量。客户端 JVM 同时只能有一个集成服务端（原版 Minecraft
- * 单例结构），真起第二个实例需要类加载器隔离，脆弱且吃内存。本实现用
- * <b>数据等价</b>方案达到同一目标：区块级全量覆盖幂等，"重放到影子世界"与
- * "暂存最新 NBT、接管后按需装载"最终态一致 ——
+ * 当前实现只暂存区块 NBT 和玩家文件，不运行影子服务端，也不重放每 tick 事件。
+ * 实体分区、POI、世界 SavedData 与任意模组内存状态尚未在此协议中完整覆盖，
+ * 因此不能宣称与运行中的影子世界等价；完整热迁移必须另行实现这些状态的屏障。
  * <ul>
  *   <li>区块记录 → 解压校验 → {@link PresyncStore}（B 集成服务端的加载门控
  *       申请授予后直接消费，省服务端往返）；</li>
@@ -52,6 +50,14 @@ public final class PresyncReceiver {
     private final String label;
     /** 进度回调（阶段名；MergeClient 转成 MERGE_PROGRESS 上报服务端）。 */
     private final Consumer<String> progress;
+    private volatile boolean cancelled;
+
+    /** 与入库互斥，返回后旧接收线程不能再次写暂存库或玩家文件。 */
+    public synchronized void cancel() { cancelled = true; }
+
+    private void requireActive() throws IOException {
+        if (cancelled) throw new IOException("预同步事务已取消");
+    }
 
     public PresyncReceiver(ReliableChannel channel, Path playerDataDir, String label,
                            Consumer<String> progress) {
@@ -63,7 +69,7 @@ public final class PresyncReceiver {
 
     /**
      * 执行接收循环（io 线程，阻塞至 TAIL_DONE 或通道死亡抛出）。
-     * 成功返回 = 最终态已全部入库；异常 = 预同步失败（调用方清空暂存并回报 failed）。
+ * 成功返回仅表示本协议携带的记录已经通过校验并暂存，不代表物理服耐久提交。
      */
     public void run() throws Exception {
         DataInputStream in = new DataInputStream(channel.inputStream());
@@ -72,6 +78,7 @@ public final class PresyncReceiver {
         int players = 0;
         progress.accept("presync_started");
         while (true) {
+            requireActive();
             byte type;
             try {
                 type = in.readByte();
@@ -110,28 +117,28 @@ public final class PresyncReceiver {
 
     // ------------------------------------------------------------ 入库
 
-    /** 区块记录入暂存库（解压 + 键一致性校验；坏数据跳过不中断 —— 服务端存档兜底）。 */
-    private void stageChunk(String rawKey, byte[] gzip) {
+    /** 必需记录失败即终止会话；没有权威耐久基线证明时不能跳过后仍 ACK。 */
+    synchronized void stageChunk(String rawKey, byte[] gzip) throws IOException {
+        requireActive();
         try {
             ChunkKey key = ChunkKey.parse(rawKey);
             CompoundTag tag = NbtIo.readCompressed(new ByteArrayInputStream(gzip),
                     NbtAccounter.create(MAX_NBT_BYTES));
             // 坐标一致性：NBT 里的 xPos/zPos 必须与声称的键一致（防错位；对端不可信）
-            if (tag.getInt("xPos") != key.x() || tag.getInt("zPos") != key.z()) {
-                LOGGER.warn("预同步区块坐标不符，丢弃: 声称 {} 实际 {},{}",
-                        rawKey, tag.getInt("xPos"), tag.getInt("zPos"));
-                return;
-            }
+            if (!tag.contains("xPos", 3) || !tag.contains("zPos", 3)
+                    || tag.getInt("xPos") != key.x() || tag.getInt("zPos") != key.z())
+                throw new IOException("预同步区块坐标缺失或不一致: " + rawKey);
             PresyncStore.put(key, tag);
         } catch (Exception e) {
-            LOGGER.warn("预同步区块解析失败，丢弃（服务端存档兜底）: {}", rawKey, e);
+            throw new IOException("预同步区块校验或暂存失败: " + rawKey, e);
         }
     }
 
-    /** 玩家数据写入 B 本地存档 playerdata（原子写；坏数据跳过）。 */
-    private void writePlayerData(String rawUuid, byte[] gzip) {
+    /** 玩家最终态写入失败禁止确认尾部，保留 A 的原组继续运行。 */
+    private synchronized void writePlayerData(String rawUuid, byte[] gzip) throws IOException {
+        requireActive();
         if (playerDataDir == null) {
-            return;
+            throw new IOException("预同步接收端没有玩家数据目录");
         }
         try {
             UUID uuid = UUID.fromString(rawUuid); // 同时充当文件名合法性校验（防路径穿越）
@@ -144,7 +151,7 @@ public final class PresyncReceiver {
                     StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
             LOGGER.info("预同步玩家数据已写入本地存档: {}", uuid);
         } catch (Exception e) {
-            LOGGER.warn("预同步玩家数据写入失败，跳过: {}", rawUuid, e);
+            throw new IOException("预同步玩家数据写入失败: " + rawUuid, e);
         }
     }
 }

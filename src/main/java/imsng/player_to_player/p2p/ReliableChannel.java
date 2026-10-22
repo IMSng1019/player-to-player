@@ -146,6 +146,11 @@ public final class ReliableChannel implements AutoCloseable {
         return open.get() && transport.isOpen();
     }
 
+    /** 取消准备/超时用的立即关闭，不在渲染线程或调度线程等待 FIN 确认。 */
+    public void abort() {
+        closeOnError(new IOException("会话已取消或超过准备期限"));
+    }
+
     /**
      * 优雅关闭：发送 FIN 并等待尾部数据确认（至多 {@value #CLOSE_LINGER_MILLIS} ms），
      * 之后关闭底层传输。幂等；任何线程可调。
@@ -163,11 +168,21 @@ public final class ReliableChannel implements AutoCloseable {
                 }
             }
             // linger：等对端把尾部（含 FIN）全部确认，尽量不丢关闭前的最后数据
-            long deadline = System.currentTimeMillis() + CLOSE_LINGER_MILLIS;
+            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(CLOSE_LINGER_MILLIS);
+            long retransmitAt = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(RTO_INITIAL_MILLIS);
             synchronized (sendLock) {
                 while (!unacked.isEmpty() && transport.isOpen()
-                        && System.currentTimeMillis() < deadline) {
-                    sendLock.wait(Math.max(1, deadline - System.currentTimeMillis()));
+                        && System.nanoTime() < deadline) {
+                    // open 已关闭，普通重传任务不会再工作；在有界 linger 中继续重传
+                    // 未确认尾帧/FIN，避免丢一个 FIN 就让远端准备会话等待整个租期。
+                    long now = System.nanoTime();
+                    if (now >= retransmitAt) {
+                        var oldest = unacked.firstEntry();
+                        if (oldest != null) transport.send(oldest.getValue());
+                        retransmitAt = now + TimeUnit.MILLISECONDS.toNanos(RTO_INITIAL_MILLIS);
+                    }
+                    sendLock.wait(Math.max(1, Math.min(RTO_CHECK_MILLIS,
+                            TimeUnit.NANOSECONDS.toMillis(deadline - now))));
                 }
             }
         } catch (InterruptedException e) {

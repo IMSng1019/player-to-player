@@ -84,19 +84,28 @@ public final class MergeCoordinator {
         final UUID groupB;
         final UUID newPrimary;
         final UUID oldPrimary;
+        final Set<UUID> preparingMembers;
+        final Set<UUID> awaitingRedirects;
+        final MergeReadiness readiness;
+        boolean drainSent;
         volatile State state = State.PLANNED;
         volatile ScheduledFuture<?> timeoutTask;
 
-        MergeSession(UUID groupA, UUID groupB, UUID newPrimary, UUID oldPrimary) {
+        MergeSession(UUID groupA, UUID groupB, UUID newPrimary, UUID oldPrimary, Set<UUID> movingMembers) {
             this.groupA = groupA;
             this.groupB = groupB;
             this.newPrimary = newPrimary;
             this.oldPrimary = oldPrimary;
+            this.preparingMembers = new HashSet<>(movingMembers);
+            this.preparingMembers.add(newPrimary); // B 的接收器同样必须先完成挂接
+            this.awaitingRedirects = new HashSet<>(movingMembers);
+            this.awaitingRedirects.remove(oldPrimary);
+            this.readiness = new MergeReadiness(oldPrimary, newPrimary, preparingMembers);
         }
 
         boolean involves(UUID clientOrGroup) {
             return groupA.equals(clientOrGroup) || groupB.equals(clientOrGroup)
-                    || newPrimary.equals(clientOrGroup) || oldPrimary.equals(clientOrGroup);
+                    || preparingMembers.contains(clientOrGroup);
         }
     }
 
@@ -158,7 +167,7 @@ public final class MergeCoordinator {
     // ------------------------------------------------------------ 合并申请
 
     /** MERGE_REQUEST：校验 + 算力分配 + 下发 MERGE_PLAN（Netty 线程，纯内存）。 */
-    private void handleMergeRequest(ControlConnection conn, ControlMessage msg) {
+    private synchronized void handleMergeRequest(ControlConnection conn, ControlMessage msg) {
         UUID requester = conn.peerId();
         if (requester == null) {
             conn.send(error(msg, "not_authenticated", "须先完成 HELLO 握手"));
@@ -196,7 +205,7 @@ public final class MergeCoordinator {
         }
         // 双方任一已卷入其他合并会话：拒绝（一次只处理一对，状态机才可推理）
         for (MergeSession s : sessions.values()) {
-            if (s.state != State.ABORTED && s.state != State.COMMITTED
+            if (s.state != State.ABORTED
                     && (s.involves(requesterGroup) || s.involves(targetGroup))) {
                 conn.send(error(msg, "busy", "有合并会话进行中: " + s.mergeId));
                 return;
@@ -256,7 +265,8 @@ public final class MergeCoordinator {
         }
         UUID oldPrimary = roles.oldPrimary();
 
-        MergeSession session = new MergeSession(requesterGroup, targetGroup, newPrimary, oldPrimary);
+        MergeSession session = new MergeSession(requesterGroup, targetGroup, newPrimary, oldPrimary,
+                groups.membersOf(groups.groupOf(oldPrimary)));
         sessions.put(session.mergeId, session);
         cooldowns.put(pairKey, now);
         purgeCooldowns(now);
@@ -266,10 +276,18 @@ public final class MergeCoordinator {
                 () -> abort(session, "合并超时（" + MERGE_TIMEOUT_SECONDS + "s）"),
                 MERGE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        // MERGE_PLAN 发给双方主客户端（reply 给发起方带 _rid；目标方单发）
+        // 所有需要重定向的成员在旧世界仍运行时准备隧道；B 原组副客户端继续使用原连接。
         JsonObject plan = buildPlan(session);
         conn.send(msg.reply(MessageType.MERGE_PLAN, plan.deepCopy(), null));
-        targetConn.send(ControlMessage.of(MessageType.MERGE_PLAN, plan.deepCopy()));
+        for (UUID member : session.preparingMembers) {
+            if (member.equals(requester)) continue;
+            ControlConnection recipient = HelloHandler.connectionOf(member);
+            if (recipient == null || !recipient.isOpen()) {
+                abort(session, "准备成员已离线");
+                return;
+            }
+            recipient.send(ControlMessage.of(MessageType.MERGE_PLAN, plan.deepCopy()));
+        }
         LOGGER.info("合并计划已下发: mergeId={} 组 {} + 组 {} → 新主 {}（让出方 {}；"
                         + "全成员选举胜者 {}，候选 {} 人）",
                 session.mergeId, requesterGroup, targetGroup, newPrimary, oldPrimary,
@@ -298,15 +316,28 @@ public final class MergeCoordinator {
     // ------------------------------------------------------------ 阶段回报
 
     /** MERGE_PROGRESS：推进状态机；switched 即提交，failed 即中止。 */
-    private void handleProgress(ControlConnection conn, ControlMessage msg) {
+    private synchronized void handleProgress(ControlConnection conn, ControlMessage msg) {
         UUID reporter = conn.peerId();
         UUID mergeId = parseUuid(JsonUtil.getString(msg.json(), "mergeId", ""));
         MergeSession session = mergeId != null ? sessions.get(mergeId) : null;
         if (reporter == null || session == null
-                || !(reporter.equals(session.newPrimary) || reporter.equals(session.oldPrimary))) {
+                || !session.preparingMembers.contains(reporter)
+                || HelloHandler.connectionOf(reporter) != conn) {
             return; // 未知会话 / 非当事方（入站不可信）：忽略
         }
         String phase = JsonUtil.getString(msg.json(), "phase", "");
+        if (session.state == State.COMMITTED) {
+            if ("redirected".equals(phase)) {
+                if (reporter.equals(session.oldPrimary) && session.drainSent) {
+                    cancelTimeout(session);
+                    sessions.remove(session.mergeId);
+                } else {
+                    session.awaitingRedirects.remove(reporter);
+                    finishRedirects(session, false);
+                }
+            }
+            return; // 提交后的迟到失败绝不能解冻旧写者
+        }
         boolean success = JsonUtil.getBoolean(msg.json(), "success", false);
         LOGGER.info("合并进度: mergeId={} 回报方={} phase={} success={}",
                 mergeId, reporter, phase, success);
@@ -315,11 +346,26 @@ public final class MergeCoordinator {
             return;
         }
         switch (phase) {
-            case "presync_started" -> session.state = State.PRESYNCING;
-            case "caught_up" -> session.state = State.CAUGHT_UP;
+            case "transport_ready" -> {
+                if (session.readiness.prepared(reporter)) {
+                    session.state = State.PRESYNCING;
+                    JsonObject start = new JsonObject();
+                    start.addProperty("mergeId", session.mergeId.toString());
+                    ControlConnection source = HelloHandler.connectionOf(session.oldPrimary);
+                    if (source != null && source.isOpen())
+                        source.send(ControlMessage.of(MessageType.MERGE_START, start));
+                    else abort(session, "原主在准备后离线");
+                }
+            }
+            case "presync_started" -> { /* 诊断事件，不允许倒退状态 */ }
+            case "caught_up" -> {
+                if (session.readiness.tailReceived(reporter)) commit(session);
+            }
             // switched 由让出方 A 在"暂停 tick + 尾部增量已被 B 确认"后回报：
             // 此刻 B 已接管演算，服务端执行归属切换（纯内存原子操作）
-            case "switched" -> commit(session);
+            case "switched" -> {
+                if (session.readiness.sourceFrozen(reporter)) commit(session);
+            }
             default -> {
                 // snapshot_done 等中间阶段：仅记日志（上面已 info），状态不回退
             }
@@ -327,19 +373,20 @@ public final class MergeCoordinator {
     }
 
     /** 提交合并：组表合并 + 注册表整组迁移 + 玩家表刷新 + MERGE_COMMIT 广播。 */
-    private void commit(MergeSession session) {
+    private synchronized void commit(MergeSession session) {
         if (session.state == State.COMMITTED || session.state == State.ABORTED) {
             return; // 幂等（重复 switched 回报 / 与超时中止竞态）
         }
-        GroupTable.GroupInfo merged =
-                groups.mergeGroups(session.groupA, session.groupB, session.newPrimary);
+        if (!session.readiness.tryCommit()) return;
+        Set<UUID> preparedSource = new HashSet<>(session.preparingMembers);
+        preparedSource.remove(session.newPrimary);
+        GroupTable.GroupInfo merged = groups.mergePreparedGroups(
+                session.groupA, session.groupB, session.newPrimary, session.oldPrimary, preparedSource);
         if (merged == null) {
             abort(session, "组表合并失败（组在提交前已解散？）");
             return;
         }
         session.state = State.COMMITTED;
-        cancelTimeout(session);
-        sessions.remove(session.mergeId);
         // 注册表：两旧组的占用全部原子改挂到新组（groupId == newPrimary），
         // 无"释放-再申请"空窗，第三组不可能趁隙抢占
         int migrated = registry.migrateAll(session.groupA, session.newPrimary)
@@ -370,20 +417,44 @@ public final class MergeCoordinator {
         permissions.push(session.groupA);
         permissions.push(session.groupB);
         permissions.push(merged.groupId());
+        finishRedirects(session, false);
+    }
+
+    /** 先让副客户端主动断开旧连接，再允许 A 关服，避免旧隧道先断导致控制会话被拆。 */
+    private void finishRedirects(MergeSession session, boolean timedOut) {
+        if (session.state != State.COMMITTED || (!timedOut && !session.awaitingRedirects.isEmpty())) return;
+        JsonObject drained = new JsonObject();
+        drained.addProperty("mergeId", session.mergeId.toString());
+        ControlConnection source = HelloHandler.connectionOf(session.oldPrimary);
+        if (!session.drainSent && source != null && source.isOpen()) {
+            session.drainSent = true;
+            source.send(ControlMessage.of(MessageType.MERGE_DRAINED, drained));
+        }
+        // A 自身也完成原版断开前，组仍被本事务占用，防第三组计划覆盖客户端的 active。
+        if (timedOut || source == null || !source.isOpen()) {
+            cancelTimeout(session);
+            sessions.remove(session.mergeId);
+        }
+        if (timedOut) LOGGER.warn("合并 {} 已提交，但部分旧连接未确认重定向，结束排空等待", session.mergeId);
     }
 
     /** 中止合并：双方 MERGE_ABORT，A 继续运行（规范"服务端取消合并"）。幂等。 */
-    private void abort(MergeSession session, String reason) {
-        if (session.state == State.COMMITTED || session.state == State.ABORTED) {
+    private synchronized void abort(MergeSession session, String reason) {
+        if (session.state == State.COMMITTED) {
+            finishRedirects(session, true);
+            return;
+        }
+        if (session.state == State.ABORTED) {
             return;
         }
         session.state = State.ABORTED;
+        session.readiness.abort();
         cancelTimeout(session);
         sessions.remove(session.mergeId);
         JsonObject json = new JsonObject();
         json.addProperty("mergeId", session.mergeId.toString());
         json.addProperty("reason", reason);
-        for (UUID party : List.of(session.newPrimary, session.oldPrimary)) {
+        for (UUID party : session.preparingMembers) {
             ControlConnection c = HelloHandler.connectionOf(party);
             if (c != null && c.isOpen()) {
                 c.send(ControlMessage.of(MessageType.MERGE_ABORT, json.deepCopy()));
@@ -396,13 +467,16 @@ public final class MergeCoordinator {
      * 中止涉及某客户端/组的全部合并会话（P2PServerService 断连清理调用）。
      * 规范"若 B 追赶失败或断开，A 继续运行"。
      */
-    public void abortInvolving(UUID clientId) {
+    public synchronized void abortInvolving(UUID clientId) {
         if (clientId == null) {
             return;
         }
         for (MergeSession session : sessions.values()) {
             if (session.involves(clientId)) {
-                abort(session, "当事方掉线: " + clientId);
+                if (session.state == State.COMMITTED) {
+                    session.awaitingRedirects.remove(clientId);
+                    finishRedirects(session, false);
+                } else abort(session, "当事方掉线: " + clientId);
             }
         }
     }
@@ -424,7 +498,7 @@ public final class MergeCoordinator {
      * <b>暂存</b>到新主回报 {@code GROUP_WORLD_READY}（LAN 已发布）后冲刷 ——
      * 见 {@link #pendingRedirects}。单成员分离（departing=1）是其特例，无暂存环节。
      */
-    private void handleSplitRequest(ControlConnection conn, ControlMessage msg) {
+    private synchronized void handleSplitRequest(ControlConnection conn, ControlMessage msg) {
         UUID requester = conn.peerId();
         if (requester == null) {
             conn.send(error(msg, "not_authenticated", "须先完成 HELLO 握手"));
@@ -456,7 +530,7 @@ public final class MergeCoordinator {
         }
         // 分离期间不与合并并行（状态机相互干扰）
         for (MergeSession s : sessions.values()) {
-            if (s.state != State.ABORTED && s.state != State.COMMITTED && s.involves(groupId)) {
+            if (s.state != State.ABORTED && s.involves(groupId)) {
                 conn.send(error(msg, "busy", "该组有合并会话进行中"));
                 return;
             }

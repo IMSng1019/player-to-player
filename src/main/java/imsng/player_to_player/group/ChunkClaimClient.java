@@ -14,6 +14,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -81,8 +83,22 @@ public final class ChunkClaimClient {
     /** 线性化退出阶段与 release 注册，避免 freeze 和新释放请求之间出现竞态。 */
     private final Object lifecycleLock = new Object();
 
-    /** 未决申请：key → 共享 future（授予后移除；被拒时保留并由定时重试驱动）。 */
-    private final Map<ChunkKey, CompletableFuture<ClaimOutcome>> pending = new ConcurrentHashMap<>();
+    /** 未决申请：每个 key 只有一个操作对象；它同时约束共享 future、在途请求和重试代次。 */
+    private final Map<ChunkKey, ClaimOperation> pending = new ConcurrentHashMap<>();
+
+    /** 字段全部由 lifecycleLock 保护，不能用 future 是否完成代替网络在途状态。 */
+    private static final class ClaimOperation {
+        private final CompletableFuture<ClaimOutcome> future = new CompletableFuture<>();
+        private long generation;
+        private boolean inFlight;
+        private boolean retryWaiting;
+        private boolean wakeRequested;
+        private UUID blockingGroup;
+    }
+
+    /** 已在锁内保留的一次唤醒；锁外发请求，generation 使重复事件与旧定时器无效。 */
+    private record ClaimAttempt(ChunkKey key, ClaimOperation operation, long generation) {
+    }
 
     /** 已授予且尚未释放的区块（上行服务据此过滤"释放后仍触发的存盘上行"）。 */
     private final Set<ChunkKey> claimed = ConcurrentHashMap.newKeySet();
@@ -183,24 +199,55 @@ public final class ChunkClaimClient {
      * 消费方不得在回调里做重活/阻塞。
      */
     public CompletableFuture<ClaimOutcome> claimWithRetry(ChunkKey key) {
-        CompletableFuture<ClaimOutcome> future;
+        ClaimOperation operation;
         boolean start = false;
         synchronized (lifecycleLock) {
             if (shutdown || exitPreparing || exitFrozen) {
                 return CompletableFuture.failedFuture(
                         new IllegalStateException("主客户端正在准备或提交退出事务"));
             }
-            future = pending.get(key);
-            if (future == null) {
-                future = new CompletableFuture<>();
-                pending.put(key, future);
+            operation = pending.get(key);
+            if (operation == null) {
+                operation = new ClaimOperation();
+                pending.put(key, operation);
                 start = true;
             }
         }
         if (start) {
-            attemptClaim(key, future);
+            attemptClaim(key, operation, 0);
         }
-        return future;
+        return operation.future;
+    }
+
+    /**
+     * 权威服务端通知归属变化后提前重试被指定组阻塞的申请；null 用于合并提交等已确认的
+     * 全局变化，唤醒本客户端全部未决申请。通知绝不授予占用，仍须重新经过服务端 claim。
+     * <p>
+     * 等待中的旧 timer 用代次失效；同 key 已在途时只记一个后续唤醒位，不能并发发出
+     * 第二次 claim。若在途应答已授予，后续唤醒自动丢弃，避免已完成的申请被旧事件复活。
+     */
+    public void wakeBlockedClaims(UUID blockingGroup) {
+        List<ClaimAttempt> ready = new ArrayList<>();
+        synchronized (lifecycleLock) {
+            if (shutdown || exitPreparing || exitFrozen) {
+                return;
+            }
+            pending.forEach((key, operation) -> {
+                if (operation.future.isDone() || (blockingGroup != null
+                        && !blockingGroup.equals(operation.blockingGroup))) {
+                    return;
+                }
+                if (operation.inFlight) {
+                    operation.wakeRequested = true;
+                } else if (operation.retryWaiting) {
+                    operation.retryWaiting = false;
+                    ready.add(new ClaimAttempt(key, operation, ++operation.generation));
+                }
+            });
+        }
+        for (ClaimAttempt attempt : ready) {
+            attemptClaim(attempt.key(), attempt.operation(), attempt.generation());
+        }
     }
 
     /** 是否持有该区块的占用。 */
@@ -276,75 +323,121 @@ public final class ChunkClaimClient {
         serverDataKnown.replace(key, true);
     }
 
-    /** 发起一次申请；被拒/失败则安排下一轮重试。 */
-    private void attemptClaim(ChunkKey key, CompletableFuture<ClaimOutcome> future) {
-        if (shutdown || exitPreparing || exitFrozen) {
-            future.completeExceptionally(new IllegalStateException(
-                    shutdown ? "组运行时已关停" : "主客户端正在准备或提交退出事务"));
-            pending.remove(key, future);
-            return;
-        }
+    /** 发起一次申请；操作身份、代次与在途位必须同时匹配才能发送。 */
+    private void attemptClaim(ChunkKey key, ClaimOperation operation, long expectedGeneration) {
         JsonObject req = new JsonObject();
         req.addProperty("dimension", key.dimension());
         req.addProperty("x", key.x());
         req.addProperty("z", key.z());
         req.addProperty("groupId", groupId.toString());
-        conn.request(ControlMessage.of(MessageType.CHUNK_CLAIM_REQUEST, req))
-                .whenComplete((resp, err) -> {
-                    if (shutdown || exitPreparing || exitFrozen) {
-                        future.completeExceptionally(new IllegalStateException(
-                                shutdown ? "组运行时已关停" : "主客户端正在准备或提交退出事务"));
-                        pending.remove(key, future);
-                        return;
-                    }
-                    if (err != null || resp == null || resp.type() != MessageType.CHUNK_CLAIM_RESPONSE) {
-                        // 网络失败/ERROR 应答：按被拒同样节奏重试（控制连接由会话层负责恢复）
-                        LOGGER.debug("区块申请通信失败，{} 秒后重试: {} ({})",
-                                retrySeconds, key.asString(), err != null ? err.toString() : "非预期应答");
-                        scheduleRetry(key, future);
-                        return;
-                    }
-                    if (JsonUtil.getBoolean(resp.json(), "granted", false)) {
-                        boolean hasServerData = JsonUtil.getBoolean(
-                                resp.json(), "hasServerData", false);
-                        synchronized (lifecycleLock) {
-                            if (shutdown || exitPreparing || exitFrozen) {
-                                future.completeExceptionally(new IllegalStateException(
-                                        "主客户端正在准备或提交退出事务"));
-                                pending.remove(key, future);
-                                return;
-                            }
-                            serverDataKnown.put(key, hasServerData);
-                            claimed.add(key);
-                            denials.remove(key);
-                            pending.remove(key, future);
-                        }
-                        future.complete(new ClaimOutcome(hasServerData));
-                        return;
-                    }
-                    // 被拒：区块保持未加载（规范：其他组占用中），按间隔重试。
-                    // blockingGroup 是规范"预连接"的入口 —— 转发给合并触发桥
-                    // （MergeClient 挂接后决定是否发起 MERGE_REQUEST），并继续重试
-                    // 作兜底：合并期间/失败后区块仍按原节奏申请。
-                    String blockingGroupRaw = JsonUtil.getString(resp.json(), "blockingGroup", "");
-                    String blockingChunkRaw = JsonUtil.getString(
-                            resp.json(), "blockingChunk", "?");
-                    recordDenial(key, blockingGroupRaw, blockingChunkRaw);
-                    LOGGER.info("区块申请被拒（{} 秒后重试）: {} 阻塞组={} 阻塞区块={}",
-                            retrySeconds, key.asString(), blockingGroupRaw,
-                            blockingChunkRaw);
-                    try {
-                        MergeTriggers.onClaimBlocked(UUID.fromString(blockingGroupRaw), key);
-                    } catch (IllegalArgumentException ignored) {
-                        // 阻塞组字段非法（入站不可信）：只重试，不触发合并
-                    }
-                    scheduleRetry(key, future);
-                });
+        CompletableFuture<ControlMessage> response;
+        long generation;
+        synchronized (lifecycleLock) {
+            if (!activeClaim(key, operation) || operation.inFlight
+                    || operation.generation != expectedGeneration) {
+                return;
+            }
+            operation.inFlight = true;
+            operation.retryWaiting = false;
+            operation.wakeRequested = false;
+            generation = ++operation.generation;
+            try {
+                // request 只登记非阻塞网络写；与退出冻结在同一临界区线性化发送起点。
+                response = Objects.requireNonNull(conn.request(
+                        ControlMessage.of(MessageType.CHUNK_CLAIM_REQUEST, req)), "请求 future");
+            } catch (RuntimeException failure) {
+                response = CompletableFuture.failedFuture(failure);
+            }
+        }
+        response.whenComplete((reply, failure) -> finishClaim(
+                key, operation, generation, reply, failure));
     }
 
-    /** 安排下一轮申请重试。 */
-    private void scheduleRetry(ChunkKey key, CompletableFuture<ClaimOutcome> future) {
-        retryScheduler.accept(() -> attemptClaim(key, future));
+    /** 调用方持有 lifecycleLock；身份判断使退出/替换后的迟到回调彻底失效。 */
+    private boolean activeClaim(ChunkKey key, ClaimOperation operation) {
+        return !shutdown && !exitPreparing && !exitFrozen && !operation.future.isDone()
+                && pending.get(key) == operation;
+    }
+
+    private void finishClaim(ChunkKey key, ClaimOperation operation, long generation,
+                             ControlMessage reply, Throwable failure) {
+        ClaimOutcome outcome = null;
+        UUID blocked = null;
+        boolean wakeImmediately = false;
+        long retryGeneration = generation;
+        synchronized (lifecycleLock) {
+            if (!activeClaim(key, operation) || !operation.inFlight
+                    || operation.generation != generation) {
+                return;
+            }
+            operation.inFlight = false;
+            boolean validReply = failure == null && reply != null
+                    && reply.type() == MessageType.CHUNK_CLAIM_RESPONSE;
+            if (validReply && JsonUtil.getBoolean(reply.json(), "granted", false)) {
+                boolean hasServerData = JsonUtil.getBoolean(reply.json(), "hasServerData", false);
+                serverDataKnown.put(key, hasServerData);
+                claimed.add(key);
+                denials.remove(key);
+                pending.remove(key, operation);
+                outcome = new ClaimOutcome(hasServerData);
+            } else {
+                if (validReply) {
+                    String blockingGroupRaw = JsonUtil.getString(reply.json(), "blockingGroup", "");
+                    String blockingChunkRaw = JsonUtil.getString(reply.json(), "blockingChunk", "?");
+                    recordDenial(key, blockingGroupRaw, blockingChunkRaw);
+                    try {
+                        blocked = UUID.fromString(blockingGroupRaw);
+                    } catch (IllegalArgumentException ignored) {
+                        // 不可信的阻塞组字段不进入定向唤醒或合并触发链。
+                    }
+                    operation.blockingGroup = blocked;
+                    LOGGER.info("区块申请被拒（{} 秒后重试）: {} 阻塞组={} 阻塞区块={}",
+                            retrySeconds, key.asString(), blockingGroupRaw, blockingChunkRaw);
+                } else {
+                    LOGGER.debug("区块申请通信失败，{} 秒后重试: {} ({})", retrySeconds,
+                            key.asString(), failure != null ? failure.toString() : "非预期应答");
+                }
+                wakeImmediately = operation.wakeRequested;
+                operation.wakeRequested = false;
+                operation.retryWaiting = !wakeImmediately;
+                if (wakeImmediately) {
+                    retryGeneration = ++operation.generation;
+                }
+            }
+        }
+        if (outcome != null) {
+            operation.future.complete(outcome);
+            return;
+        }
+        if (blocked != null) {
+            MergeTriggers.onClaimBlocked(blocked, key);
+        }
+        if (wakeImmediately) {
+            attemptClaim(key, operation, retryGeneration);
+        } else {
+            scheduleRetry(key, operation, retryGeneration);
+        }
+    }
+
+    /** 定时兜底保留原配置间隔；事件唤醒后该闭包持有的旧代次只会空操作。 */
+    private void scheduleRetry(ChunkKey key, ClaimOperation operation, long generation) {
+        try {
+            retryScheduler.accept(() -> attemptClaim(key, operation, generation));
+        } catch (RuntimeException schedulingFailure) {
+            boolean failedCurrent = false;
+            synchronized (lifecycleLock) {
+                // 提交旧 timer 的同时可能已经被事件唤醒；只有仍等待这一代 timer 的
+                // 操作可以失败，绝不能让旧调度异常删除新的在途请求或覆盖它的成功结果。
+                if (operation.generation == generation && operation.retryWaiting
+                        && !operation.inFlight && pending.remove(key, operation)) {
+                    denials.remove(key);
+                    failedCurrent = true;
+                }
+            }
+            if (failedCurrent) {
+                operation.future.completeExceptionally(schedulingFailure);
+            }
+        }
     }
 
     /** 记录一次拒绝；同一 key 连续被拒累加次数并保留首次拒绝时间。 */
@@ -631,7 +724,7 @@ public final class ChunkClaimClient {
      * 这样预卸载屏障可以在网络恢复后继续完成；调用方应等待它们清空后再 freeze。
      */
     public void beginExitPreparation() {
-        Map<ChunkKey, CompletableFuture<ClaimOutcome>> pendingClaims;
+        Map<ChunkKey, ClaimOperation> pendingClaims;
         synchronized (lifecycleLock) {
             if (shutdown || exitPreparing) {
                 return;
@@ -641,7 +734,7 @@ public final class ChunkClaimClient {
             pending.clear();
             denials.clear();
         }
-        pendingClaims.values().forEach(future -> future.completeExceptionally(
+        pendingClaims.values().forEach(operation -> operation.future.completeExceptionally(
                 new IllegalStateException("主客户端正在准备退出事务")));
     }
 
@@ -650,7 +743,7 @@ public final class ChunkClaimClient {
      * 最终由 EXIT_COMMIT 在物理服整组释放。
      */
     public Set<ChunkKey> freezeForExit() {
-        Map<ChunkKey, CompletableFuture<ClaimOutcome>> pendingClaims;
+        Map<ChunkKey, ClaimOperation> pendingClaims;
         Set<ChunkKey> snapshot;
         synchronized (lifecycleLock) {
             exitPreparing = true;
@@ -660,14 +753,14 @@ public final class ChunkClaimClient {
             denials.clear();
             snapshot = Set.copyOf(claimed);
         }
-        pendingClaims.values().forEach(future -> future.completeExceptionally(
+        pendingClaims.values().forEach(operation -> operation.future.completeExceptionally(
                 new IllegalStateException("主客户端正在提交退出事务")));
         return snapshot;
     }
 
     /** 关停：未决申请全部异常完成（区块加载链随集成服务端停摆，不泄漏）。 */
     public void shutdown() {
-        Map<ChunkKey, CompletableFuture<ClaimOutcome>> pendingClaims;
+        Map<ChunkKey, ClaimOperation> pendingClaims;
         Map<ChunkKey, ReleaseOperation> activeReleases;
         synchronized (lifecycleLock) {
             shutdown = true;
@@ -681,7 +774,7 @@ public final class ChunkClaimClient {
             serverDataKnown.clear();
             denials.clear();
         }
-        pendingClaims.values().forEach(future -> future.completeExceptionally(
+        pendingClaims.values().forEach(operation -> operation.future.completeExceptionally(
                 new IllegalStateException("组运行时已关停")));
         activeReleases.values().forEach(operation -> operation.future().completeExceptionally(
                 new IllegalStateException("组运行时已关停")));

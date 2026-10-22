@@ -245,7 +245,7 @@ public final class GroupRuntime {
         localWorldIdentity = null; // 身份结论不跨接管残留（下次 arm 重新携带）
         LocalPermissions.reset(); // 权限名单同理：不跨接管残留（条目随集成服务端实例销毁）
         managedServer = null;
-        tickFrozen = false; // 冻结旗标不得跨接管残留
+        setTickFrozen(false); // 记录完整冻结时长（包含尾部后等待提交及原版停服）
         LoginLoadGuard.reset("集成服务端停止"); // 登录窗口/诊断不得跨世界残留
         LogUploader.stop(); // Phase 4：日志上行随接管终止
         if (preUnloads != null) {
@@ -319,13 +319,20 @@ public final class GroupRuntime {
      * 最终态。冻结窗口 = 尾部序列化 + 传输 + ACK 往返，正常在数百毫秒内。
      */
     private static volatile boolean tickFrozen;
+    private static long freezeStartedNanos;
 
     /** 冻结/解冻被接管集成服务端的世界 tick（任意线程；Mixin 每 tick 一次 volatile 读）。 */
-    public static void setTickFrozen(boolean frozen) {
+    public static synchronized void setTickFrozen(boolean frozen) {
         if (tickFrozen == frozen) {
             return; // 幂等去噪：失败/中止路径可能重复解冻
         }
         tickFrozen = frozen;
+        if (frozen) freezeStartedNanos = System.nanoTime();
+        else if (freezeStartedNanos != 0) {
+            LOGGER.info("世界冻结结束: freeze.total_ms={}",
+                    (System.nanoTime() - freezeStartedNanos) / 1_000_000);
+            freezeStartedNanos = 0;
+        }
         LOGGER.info("集成服务端世界 tick {}", frozen ? "已冻结（合并切换窗口）" : "已解冻");
     }
 

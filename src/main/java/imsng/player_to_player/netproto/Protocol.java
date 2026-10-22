@@ -18,7 +18,9 @@ public final class Protocol {
      * 能重放第一次成功结果。退出最终确认同时改为复合 WAL 单次 force；任何非 v5
      * 节点都无法解释这些语义，因此必须拒绝新旧节点混连。
      */
-    public static final int VERSION = 5;
+    // v6 增加撮合 sessionId 应答、预建隧道握手及合并准备/提交屏障。
+    // v5 无法遵守新时序，因此服务端、中转端与客户端统一升级。
+    public static final int VERSION = 6;
 
     /** 单帧最大长度（16 MB）：超限视为恶意/损坏连接，立即断开。环境文件按块传输不会超过它。 */
     public static final int MAX_FRAME_BYTES = 16 * 1024 * 1024;

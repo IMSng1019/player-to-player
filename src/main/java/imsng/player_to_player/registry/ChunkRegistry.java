@@ -15,6 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
 /**
  * 区块注册表（服务端，DESIGN.md 第 5 节；规范"区块注册表：区块列表 / MySQL"）。
@@ -103,6 +104,9 @@ public final class ChunkRegistry {
     /** 自动落盘任务句柄；shutdown 时取消。 */
     private volatile ScheduledFuture<?> autoPersistTask;
 
+    /** 仅发布已经耐久完成的释放/迁移事实；监听器不参与所有权判定或持久化成功条件。 */
+    private volatile Consumer<UUID> ownershipChangeListener;
+
     public ChunkRegistry(RegistryStore store, RegionFileProbe probe) {
         this(store, probe, RegistryMutationJournal.disabled());
     }
@@ -113,6 +117,24 @@ public final class ChunkRegistry {
         this.probe = probe;
         this.journal = journal != null
                 ? journal : RegistryMutationJournal.disabled();
+    }
+
+    /** 监听旧占用组的归属变化；null 解除。生产监听器应只排队通知，不能阻塞写入路径。 */
+    public void setOwnershipChangeListener(Consumer<UUID> listener) {
+        ownershipChangeListener = listener;
+    }
+
+    /** 必须在 WAL 与内存修改均成功后、claimLock 外调用，通知失败不能逆转耐久结果。 */
+    private void notifyOwnershipChanged(UUID previousGroup) {
+        Consumer<UUID> listener = ownershipChangeListener;
+        if (listener == null) {
+            return;
+        }
+        try {
+            listener.accept(previousGroup);
+        } catch (RuntimeException failure) {
+            LOGGER.warn("归属变更通知失败，客户端将按原重试周期重新申请: {}", previousGroup, failure);
+        }
     }
 
     // ------------------------------------------------------------ 申请与释放
@@ -185,8 +207,9 @@ public final class ChunkRegistry {
             journal.appendRemove(key, groupId);
             claims.remove(key);
             markDirtyLocked();
-            return true;
         }
+        notifyOwnershipChanged(groupId);
+        return true;
     }
 
     /**
@@ -247,8 +270,9 @@ public final class ChunkRegistry {
             claims.remove(receipt.key());
             releaseReceipts.put(receipt.releaseId(), receipt);
             markDirtyLocked();
-            return receipt;
         }
+        notifyOwnershipChanged(receipt.groupId());
+        return receipt;
     }
 
     /**
@@ -307,6 +331,7 @@ public final class ChunkRegistry {
         }
         if (released > 0) {
             LOGGER.info("已释放组 {} 的 {} 个区块占用", groupId, released);
+            notifyOwnershipChanged(groupId);
         }
         return released;
     }
@@ -328,6 +353,7 @@ public final class ChunkRegistry {
         if (groupMembers == null || !groupMembers.contains(groupId)) {
             throw new IllegalArgumentException("断连释放组成员清单非法");
         }
+        int released;
         synchronized (persistLock) {
             synchronized (claimLock) {
                 exitFrozenGroups.add(groupId);
@@ -349,9 +375,13 @@ public final class ChunkRegistry {
                 // 新 recovery 即使区块清单为空也是需要 checkpoint 的状态变更。
                 markDirtyLocked();
                 exitFrozenGroups.remove(groupId);
-                return removed.size();
+                released = removed.size();
             }
         }
+        if (released > 0) {
+            notifyOwnershipChanged(groupId);
+        }
+        return released;
     }
 
     /**
@@ -515,6 +545,7 @@ public final class ChunkRegistry {
         if (groupId == null || manifestChunks == null) {
             return 0;
         }
+        int released;
         synchronized (persistLock) {
             synchronized (claimLock) {
                 exitFrozenGroups.add(groupId);
@@ -535,9 +566,13 @@ public final class ChunkRegistry {
                     markDirtyLocked();
                 }
                 exitFrozenGroups.remove(groupId);
-                return removed.size();
+                released = removed.size();
             }
         }
+        if (released > 0) {
+            notifyOwnershipChanged(groupId);
+        }
+        return released;
     }
 
     /**
@@ -574,6 +609,7 @@ public final class ChunkRegistry {
         }
         if (migrated > 0) {
             LOGGER.info("区块占用整组迁移: {} → {} ({} 个区块)", from, to, migrated);
+            notifyOwnershipChanged(from);
         }
         return migrated;
     }
@@ -613,6 +649,7 @@ public final class ChunkRegistry {
         }
         if (migrated > 0) {
             LOGGER.info("区块占用定向迁移: {} → {} ({} / {} 个区块)", from, to, migrated, keys.size());
+            notifyOwnershipChanged(from);
         }
         return migrated;
     }

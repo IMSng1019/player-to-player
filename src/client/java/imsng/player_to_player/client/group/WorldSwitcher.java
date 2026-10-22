@@ -1,5 +1,7 @@
 package imsng.player_to_player.client.group;
 
+import imsng.player_to_player.client.session.SwitchTelemetry;
+
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.ConnectScreen;
 import net.minecraft.client.gui.screens.TitleScreen;
@@ -103,6 +105,7 @@ public final class WorldSwitcher {
             throw new IllegalStateException("switchToLocalWorld 必须在客户端主线程调用");
         }
         LOGGER.info("编排性断开物理服务端，打开本地组世界: {}/{}", savesRoot, saveName);
+        SwitchTelemetry.mark("disconnect_begin");
         // 旗标只在真的会触发 DISCONNECT 时置位（level 为 null 时没有断开事件，
         // 置了也无人消费，会残留到下一次真实退出把会话拆除误吞掉）
         if (minecraft.level != null) {
@@ -111,9 +114,11 @@ public final class WorldSwitcher {
         }
         // 原版"选择世界界面打开存档"的同款入口（签名已 javap 核实）；
         // 失败回调里除业务回退外把玩家送回标题屏，避免卡在空屏
+        SwitchTelemetry.mark("local_load_begin");
         new WorldOpenFlows(minecraft, LevelStorageSource.createDefault(savesRoot))
                 .checkForBackupAndLoad(saveName, () -> {
                     LOGGER.error("本地组世界打开失败/被取消: {}", saveName);
+                    SwitchTelemetry.finish("load_cancelled_or_failed");
                     minecraft.setScreen(new TitleScreen());
                     onFail.run();
                 });
@@ -131,12 +136,14 @@ public final class WorldSwitcher {
             throw new IllegalStateException("switchToTunnel 必须在客户端主线程调用");
         }
         LOGGER.info("编排性断开物理服务端，经隧道加入主客户端 {} (127.0.0.1:{})", primaryName, port);
+        SwitchTelemetry.mark("disconnect_begin");
         if (minecraft.level != null) {
             SWITCHING.set(true);
             minecraft.disconnect();
         }
         ServerData data = new ServerData("P2P 组世界（主客户端: " + primaryName + "）",
                 "127.0.0.1:" + port, ServerData.Type.OTHER);
+        SwitchTelemetry.mark("login_begin");
         ConnectScreen.startConnecting(new JoinMultiplayerScreen(new TitleScreen()), minecraft,
                 new ServerAddress("127.0.0.1", port), data, false);
     }

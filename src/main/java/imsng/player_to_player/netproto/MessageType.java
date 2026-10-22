@@ -303,7 +303,13 @@ public enum MessageType {
     /** C→S 退出尾部区块批次；阶段 ACK 只表示已暂存，最终耐久性由 EXIT_COMMIT 提供。 */
     EXIT_CHUNK_BATCH(105),
     /** C→S 断线重连查询退出事务状态（json: shutdownId）。 */
-    EXIT_STATUS(106);
+    EXIT_STATUS(106),
+    /** S→C 迁移成员隧道及接收器全部准备完成，允许原主开始预同步。v6。 */
+    MERGE_START(107),
+    /** S→C 权威归属已变化；仅提示重试，绝不代表区块已经授予。v6。 */
+    CHUNK_OWNERSHIP_CHANGED(109),
+    /** S→C 原组其余成员已执行编排性断开，原主可以关闭旧 LAN。v6。 */
+    MERGE_DRAINED(110);
 
     private final int id;
 

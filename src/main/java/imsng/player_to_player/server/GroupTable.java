@@ -168,6 +168,19 @@ public final class GroupTable {
     }
 
     /**
+     * 预建连接的成员集合必须与提交时一致。校验和并组共用组表锁，防新成员恰在
+     * 检查后加入而没有预建隧道。变更时返回 null，原组保留，下次计划重新准备。
+     */
+    public GroupInfo mergePreparedGroups(UUID groupA, UUID groupB, UUID newPrimary,
+                                          UUID sourceGroup, Set<UUID> preparedSourceMembers) {
+        synchronized (lock) {
+            GroupInfo source = groups.get(sourceGroup);
+            if (source == null || !source.members().equals(preparedSourceMembers)) return null;
+            return mergeGroups(groupA, groupB, newPrimary);
+        }
+    }
+
+    /**
      * 组分离（Phase 3，规范"分离"）：把 departing 成员集从原组摘出，
      * 组成以 newPrimary 为主的新组（groupId == newPrimary）。
      * <p>

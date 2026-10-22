@@ -104,6 +104,14 @@ public final class WorldSession {
     private WorldSession() {
     }
 
+    /** 后台准备任务在投递切换前后均验证连接，旧世界迟到任务不得切走新世界。 */
+    public static boolean isCurrentConnection(ControlConnection conn) {
+        synchronized (SESSION_LOCK) {
+            return conn != null && conn.isOpen() && controlClient != null
+                    && controlClient.connection() == conn;
+        }
+    }
+
     // ------------------------------------------------------------------ 加入
 
     /** 加入世界（客户端主线程回调；立即转后台）。 */
@@ -113,6 +121,7 @@ public final class WorldSession {
         // 早在加入物理服务端时就建立了，切换期间被切换旗标保住，无需重建。
         ServerData serverData = client.getCurrentServer();
         if (serverData == null || client.isLocalServer()) {
+            if (GroupRuntime.isArmedOrActive()) SwitchTelemetry.joined();
             LOGGER.info("单人或本地联机世界，P2P 会话不启动");
             return;
         }
@@ -120,6 +129,7 @@ public final class WorldSession {
         // 副客户端经 127.0.0.1 隧道口连接主客户端（Phase 2）：这是组内连接，
         // 与物理服务端的会话仍然活跃，绝不能对隧道口再开一个会话
         if (WorldSwitcher.isTunnelAddress(rawAddress)) {
+            SwitchTelemetry.joined();
             LOGGER.info("经 P2P 隧道加入主客户端组世界，物理服务端会话保持");
             return;
         }
@@ -139,6 +149,7 @@ public final class WorldSession {
             myGeneration = ++generation;
         }
         PortSyncClient.beginJoin();
+        SwitchTelemetry.begin("join", Long.toString(myGeneration));
         // 加入流程是一条长工作流（环境同步/角色申请/本地存档准备，含 .join() 等待 io 池上的
         // 子任务）：走专用阻塞线程，避免"池内任务等池内任务"占用名额（见 ThreadPools#startBlocking）
         ThreadPools.startBlocking("join-flow", () -> openSession(myGeneration, rawAddress, playerId, playerName));
@@ -171,6 +182,7 @@ public final class WorldSession {
      * 全部 P2P 会话、中转连接，清空组上下文。
      */
     public static void teardownSession() {
+        SwitchTelemetry.finish("session_closed");
         ControlClient cc;
         synchronized (SESSION_LOCK) {
             generation++; // 使仍在后台跑的建连/重试流程过期
@@ -321,6 +333,16 @@ public final class WorldSession {
             // 合并/分离客户端（Phase 3）：MERGE_PLAN/ABORT/COMMIT 处理器 +
             // 区块拒绝触发面（服务端可能在角色指派后的任意时刻下发合并计划）
             MergeClient.register(cc, conn);
+            cc.on(MessageType.CHUNK_OWNERSHIP_CHANGED, (c, msg) -> {
+                if (!isCurrentConnection(conn)) return;
+                var claims = GroupRuntime.claims();
+                if (claims == null || !msg.json().has("changedGroups")
+                        || !msg.json().get("changedGroups").isJsonArray()) return;
+                for (var group : msg.json().getAsJsonArray("changedGroups")) {
+                    try { claims.wakeBlockedClaims(UUID.fromString(group.getAsString())); }
+                    catch (IllegalArgumentException | IllegalStateException ignored) { }
+                }
+            });
             // Phase 4 逐级路由入站面：其他组指令的转发执行、跨组聊天/私聊重放、
             // 末影珍珠交接/落点回报（处理器内部按"是否有被接管集成服务端"门控，
             // 副客户端收到这些推送时 GroupRuntime.server()==null，安全忽略）
@@ -442,6 +464,7 @@ public final class WorldSession {
                                                      WorldConfig worldConfig, String envHash,
                                                      boolean envReadyAtHello, long myGeneration,
                                                      String relayAddress, int relayPort) {
+        SwitchTelemetry.mark("environment_begin");
         EnvSyncClient sync = new EnvSyncClient(conn, config);
         if (!envReadyAtHello) {
             // HELLO 已声明环境未就绪：首轮请求注定失败，先等一个周期再开始
@@ -460,10 +483,8 @@ public final class WorldSession {
                 // 优先经中转端分发（减轻服务端上行带宽），失败回退直连
                 if (!trySyncViaProxy(config, paths, worldFolder, relayAddress, relayPort)) {
                     // io 线程上串行两次同步（本方法已在 io 池内，join 安全）
-                    sync.syncTo(paths.environmentDir(worldFolder, ClientRole.PRIMARY),
-                            ModPrefixResolver.Target.PRIMARY_CLIENT).join();
-                    sync.syncTo(paths.environmentDir(worldFolder, ClientRole.SECONDARY),
-                            ModPrefixResolver.Target.SECONDARY_CLIENT).join();
+                    sync.syncPair(paths.environmentDir(worldFolder, ClientRole.PRIMARY),
+                            paths.environmentDir(worldFolder, ClientRole.SECONDARY)).join();
                 }
                 if (myGeneration == generation && !envHash.isEmpty()) {
                     // lastEnvironmentHash 仅作诊断记录（最近一次同步成功时服务端的 envHash），
@@ -472,6 +493,7 @@ public final class WorldSession {
                     worldConfig.save(paths.worldConfig(worldFolder));
                 }
                 LOGGER.info("主/副两套环境同步完成（第 {} 次尝试）", attempt);
+                SwitchTelemetry.mark("environment_ready");
                 return true;
             } catch (Exception e) {
                 LOGGER.warn("环境同步失败（第 {}/{} 次），{} 秒后重试: {}",
@@ -508,10 +530,8 @@ public final class WorldSession {
             reg.addProperty("clientId", NodeContext.get().clientId().toString());
             conn.send(ControlMessage.of(MessageType.RELAY_REGISTER, reg));
             EnvSyncClient sync = new EnvSyncClient(conn, config);
-            sync.syncTo(paths.environmentDir(worldFolder, ClientRole.PRIMARY),
-                    ModPrefixResolver.Target.PRIMARY_CLIENT).join();
-            sync.syncTo(paths.environmentDir(worldFolder, ClientRole.SECONDARY),
-                    ModPrefixResolver.Target.SECONDARY_CLIENT).join();
+            sync.syncPair(paths.environmentDir(worldFolder, ClientRole.PRIMARY),
+                    paths.environmentDir(worldFolder, ClientRole.SECONDARY)).join();
             LOGGER.info("环境同步经中转端 {}:{} 完成", relayAddress, relayPort);
             return true;
         } catch (Exception e) {
@@ -550,6 +570,7 @@ public final class WorldSession {
         }
         ThreadPools.startBlocking("split-promote", () -> {
             try {
+                SwitchTelemetry.begin("split", groupId.toString());
                 LocalWorldLauncher.PreparedWorld prepared = prepareAuthoritativeWorld(
                         conn, worldFolder, worldName);
                 ctx.setGroupId(groupId);
@@ -569,7 +590,9 @@ public final class WorldSession {
     private static LocalWorldLauncher.PreparedWorld prepareAuthoritativeWorld(
             ControlConnection conn, Path worldFolder, String worldName) throws Exception {
         NodeContext ctx = NodeContext.get();
+        SwitchTelemetry.mark("player_state_begin");
         CompoundTag playerState = PlayerDataClient.requestAuthoritative(conn, ctx.clientId());
+        SwitchTelemetry.mark("player_state_ready");
         return LocalWorldLauncher.prepare(
                 worldFolder, worldName, ctx.clientId(), playerState);
     }

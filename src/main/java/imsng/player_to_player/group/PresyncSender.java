@@ -38,7 +38,7 @@ import java.util.function.Consumer;
  *   <li><b>原子切换</b>：{@link GroupRuntime#setTickFrozen 冻结} A 的世界演算
  *       → 主线程 saveAllChunks（所有脏区块经写盘咽喉产生最终增量）→ 发送尾部
  *       → TAIL_DONE / ACK_TAIL 握手。<b>冻结窗口只覆盖这一段</b>（存盘 + 尾部
- *       传输 + 一次 ACK 往返），正常在数百毫秒内（规范目标 300ms 量级）。</li>
+ *       传输 + 一次 ACK 往返），实际时长由阶段日志测量；300ms 是目标而非保证。</li>
  * </ol>
  * 任何失败即抛出（调用方回报 MERGE_PROGRESS failed 并解冻），A 继续运行 ——
  * 规范"若 B 追赶失败或断开，A 继续运行，服务端取消合并"。
@@ -88,6 +88,7 @@ public final class PresyncSender {
      * 回报 switched，随后走"让出"流程（关停集成服务端、以副客户端重连 B）。
      */
     public void run() throws Exception {
+        var timing = new imsng.player_to_player.util.WorkflowTrace("presync", label);
         DataOutputStream out = new DataOutputStream(channel.outputStream());
         DataInputStream in = new DataInputStream(channel.inputStream());
         PresyncTaps.add(tap);
@@ -113,6 +114,7 @@ public final class PresyncSender {
             PresyncProtocol.writeMarker(out, PresyncProtocol.TYPE_SNAPSHOT_DONE);
             awaitAck(in, PresyncProtocol.TYPE_ACK_SNAPSHOT);
             progress.accept("snapshot_done");
+            timing.mark("snapshot_ack");
             LOGGER.info("预同步 {} 快照完成: 实发 {} 个区块，进入增量追赶", label, sent);
 
             // ---- 2. 增量追赶：循环吃空快照期间与追赶期间的写盘增量 ----
@@ -134,14 +136,17 @@ public final class PresyncSender {
                 }
             }
             progress.accept("caught_up");
+            timing.mark("catchup_sent");
 
             // ---- 3. 原子切换：冻结 → 全量存盘（脏区块产生最终增量）→ 尾部 ----
-            long freezeStart = System.currentTimeMillis();
+            long freezeStart = System.nanoTime();
+            timing.mark("freeze_begin");
             GroupRuntime.setTickFrozen(true);
             frozen = true;
             // saveAllChunks 在主线程执行：所有 unsaved 区块经写盘咽喉 → 分接器
             //（suppressLogs=true, flush=true, forced=true —— 与停服 saveAll 同参）
             runOnMainThread(() -> server.saveAllChunks(true, true, true));
+            timing.mark("save_all_complete");
             Map<ChunkKey, CompoundTag> tail = drainDeltas();
             for (Map.Entry<ChunkKey, CompoundTag> e : tail.entrySet()) {
                 byte[] gzip = ChunkUploadService.compress(e.getValue());
@@ -153,10 +158,12 @@ public final class PresyncSender {
             sendPlayerData(out); // 玩家最终态（位置/背包）也在尾部重发一次
             PresyncProtocol.writeMarker(out, PresyncProtocol.TYPE_TAIL_DONE);
             awaitAck(in, PresyncProtocol.TYPE_ACK_TAIL);
+            timing.finish("tail_ack");
             LOGGER.info("预同步 {} 切换完成: 尾部 {} 个区块，冻结窗口 {} ms",
-                    label, tail.size(), System.currentTimeMillis() - freezeStart);
+                    label, tail.size(), (System.nanoTime() - freezeStart) / 1_000_000);
             // 成功路径不解冻：A 即将关停集成服务端，冻结状态随 detach 一起清除
         } catch (Exception e) {
+            timing.finish("failed");
             if (frozen) {
                 GroupRuntime.setTickFrozen(false); // 失败：A 解冻继续运行
             }
@@ -229,10 +236,15 @@ public final class PresyncSender {
 
     /** 阻塞等待对端的指定 ACK 标记（其他类型即协议错误）。 */
     private void awaitAck(DataInputStream in, byte expected) throws IOException {
-        // ReliableChannel 输入流阻塞语义：底层死亡抛 IOException，无需自旋
-        byte type = in.readByte();
-        if (type != expected) {
-            throw new IOException("预同步协议错误: 期望 ACK " + expected + " 收到 " + type);
+        // 总超时覆盖实际阻塞读取，不依赖对端主动关闭。
+        var timeout = imsng.player_to_player.util.ThreadPools.scheduler().schedule(
+                channel::abort, ACK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        try {
+            byte type = in.readByte();
+            if (type != expected)
+                throw new IOException("预同步协议错误: 期望 ACK " + expected + " 收到 " + type);
+        } finally {
+            timeout.cancel(false);
         }
     }
 

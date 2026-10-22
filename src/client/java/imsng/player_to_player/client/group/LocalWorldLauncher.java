@@ -1,6 +1,7 @@
 package imsng.player_to_player.client.group;
 
 import imsng.player_to_player.client.session.WorldSession;
+import imsng.player_to_player.client.session.SwitchTelemetry;
 import imsng.player_to_player.config.P2PPaths;
 import imsng.player_to_player.config.WorldConfig;
 import imsng.player_to_player.core.ClientRole;
@@ -76,6 +77,7 @@ public final class LocalWorldLauncher {
         LOGGER.info("物理服务器权威玩家状态已安装到本地主缓存: {} (世界身份={})",
                 saveDir, WorldIdentity.shortId(identity));
         WorldConfig.updateWorldIdentity(paths.worldConfig(worldFolder), identity);
+        SwitchTelemetry.mark("local_save_prepared");
         return new PreparedWorld(savesRoot, saveName, identity);
     }
 

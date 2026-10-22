@@ -136,6 +136,11 @@ public final class P2PBrokerHandlers {
         // 会话号标识这一次打洞尝试：双方 P2P_RESULT 回报与中转降级都用它关联
         UUID sessionId = UUID.randomUUID();
         SESSIONS.put(sessionId, new PunchSession(requesterId, targetId));
+        // v6：先回传本次撮合号，再开始下发端点。调用方据此区分同一 peer 的
+        // 游戏预连接与预同步，防止两个 ReliableChannel 同时认领同一 transport。
+        JsonObject accepted = new JsonObject();
+        accepted.addProperty("sessionId", sessionId.toString());
+        connection.send(message.reply(MessageType.P2P_CONNECT_REQUEST, accepted, null));
 
         // ---- 指纹门控：双方指纹齐备才下发；缺失先索要，超时降级（见类 Javadoc）----
         // 先冲刷一次超时项：定时器万一被调度线程挤住，新请求也能把旧撮合推进下去

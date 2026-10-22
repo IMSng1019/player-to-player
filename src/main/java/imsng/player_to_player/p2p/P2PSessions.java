@@ -73,6 +73,10 @@ public final class P2PSessions {
 
     /** sessionId → 对端 clientId（EXCHANGE/USE_RELAY 均携带；监听器回调用）。 */
     private static final Map<String, UUID> SESSION_PEERS = new ConcurrentHashMap<>();
+    /** 取消的撮合号短期保留，迟到打洞/中转结果不得复活资源。 */
+    private static final Map<String, Long> CANCELLED = new ConcurrentHashMap<>();
+    private static final java.util.concurrent.atomic.AtomicLong GENERATION =
+            new java.util.concurrent.atomic.AtomicLong();
 
     /** 会话就绪监听器（主客户端组宿主、副客户端加入器挂接）。 */
     private static final List<SessionListener> LISTENERS = new CopyOnWriteArrayList<>();
@@ -102,6 +106,43 @@ public final class P2PSessions {
     }
 
     private P2PSessions() {
+    }
+
+    /**
+     * 发起并准确领取一次撮合（专用阻塞线程调用）。监听先于请求；服务端回复
+     * sessionId 后只接收该会话。失败时留下取消标记，迟到传输立即关闭。
+     */
+    public static P2PTransport connect(ControlConnection conn, UUID peer) throws Exception {
+        PendingSession pending = new PendingSession(peer);
+        SessionListener listener = pending::ready;
+        addListener(listener);
+        String sessionId = null;
+        boolean transferred = false;
+        try {
+            JsonObject request = new JsonObject();
+            request.addProperty("targetClientId", peer.toString());
+            var replyFuture = conn.request(ControlMessage.of(MessageType.P2P_CONNECT_REQUEST, request));
+            ControlMessage reply = replyFuture.get(15, java.util.concurrent.TimeUnit.SECONDS);
+            if (reply.type() != MessageType.P2P_CONNECT_REQUEST)
+                throw new java.io.IOException("撮合请求被拒绝");
+            sessionId = UUID.fromString(JsonUtil.getString(reply.json(), "sessionId", "")).toString();
+            pending.bind(sessionId);
+            pending.future().get(30, java.util.concurrent.TimeUnit.SECONDS);
+            if (!conn.isOpen()) throw new java.io.IOException("控制会话已关闭");
+            P2PTransport transport = pending.take();
+            transferred = true;
+            return transport;
+        } finally {
+            removeListener(listener);
+            if (!transferred) {
+                if (sessionId != null) {
+                    CANCELLED.put(sessionId, System.nanoTime());
+                    P2PTransport transport = remove(sessionId);
+                    if (transport != null) transport.close();
+                }
+                pending.cancel();
+            }
+        }
     }
 
     /**
@@ -151,6 +192,12 @@ public final class P2PSessions {
 
     /** 存入会话（打洞成功内部调用；中转降级建立后 RelayClient 的持有方也可存入）。 */
     public static void put(String sessionId, P2PTransport transport) {
+        long now = System.nanoTime();
+        CANCELLED.entrySet().removeIf(e -> now - e.getValue() > 120_000_000_000L);
+        if (CANCELLED.containsKey(sessionId)) {
+            transport.close();
+            return;
+        }
         P2PTransport previous = SESSIONS.put(sessionId, transport);
         if (previous != null && previous != transport) {
             previous.close(); // 同会话被替换：旧传输关闭防泄漏
@@ -170,6 +217,7 @@ public final class P2PSessions {
      * ConcurrentHashMap 迭代期间容忍并发移除（RelayClient.close 会自摘出表）。
      */
     public static void closeAll() {
+        GENERATION.incrementAndGet();
         int count = 0;
         for (Map.Entry<String, P2PTransport> entry : SESSIONS.entrySet()) {
             try {
@@ -181,6 +229,7 @@ public final class P2PSessions {
         }
         SESSIONS.clear();
         SESSION_PEERS.clear();
+        CANCELLED.clear();
         LISTENERS.clear();
         // 会话密钥对随世界会话弃用：重进世界换新密钥（register 时会重新上报指纹）。
         // 服务端侧的同名指纹也会在新 HELLO 与断连清理路径被移除 —— 两侧生命周期一致，
@@ -200,6 +249,7 @@ public final class P2PSessions {
     /** 会话就绪：登记对端并通知全部监听器（监听器异常互不影响）。 */
     private static void fireSessionReady(String sessionId, UUID peerClientId,
                                          P2PTransport transport, boolean initiator) {
+        if (!transport.isOpen()) return;
         if (peerClientId != null) {
             SESSION_PEERS.put(sessionId, peerClientId);
         }
@@ -265,6 +315,7 @@ public final class P2PSessions {
 
         // 打洞是阻塞流程（最长约 5 秒），转入 IO 线程执行
         final NatType peerNatFinal = peerNat;
+        long generation = GENERATION.get();
         ThreadPools.io().execute(() -> {
             boolean success = false;
             DatagramSocket socket = null;
@@ -275,6 +326,10 @@ public final class P2PSessions {
                 // 复用本会话密钥对：保证 KEY 包里发出的公钥与已上报给服务端的指纹同源
                 P2PChannel channel = HolePuncher.punch(socket, peerEndpoint, sessionId, initiator,
                         sessionKeyPair(), peerFingerprint);
+                if (generation != GENERATION.get()) {
+                    channel.close();
+                    return;
+                }
                 put(sessionId, channel); // 通道已接管 socket 所有权
                 success = true;
                 // 会话就绪通知：组宿主/加入器/合并端据此启动隧道或预同步（Phase 2/3）
@@ -328,6 +383,7 @@ public final class P2PSessions {
      * 握手后按 HELLO_ACK 配置好端点，这里的字段仅作覆盖）。
      */
     private static void handleUseRelay(ControlMessage msg) {
+        long generation = GENERATION.get();
         JsonObject json = msg.json();
         String sessionId = JsonUtil.getString(json, "sessionId", "");
         UUID peerClientId = parseUuid(JsonUtil.getString(json, "peerClientId", ""));
@@ -347,6 +403,10 @@ public final class P2PSessions {
                 ControlConnection relayConn = RelayConnector.getOrConnect();
                 UUID selfId = NodeContext.get().clientId();
                 RelayClient transport = new RelayClient(relayConn, selfId, peerClientId, sessionId);
+                if (generation != GENERATION.get()) {
+                    transport.close();
+                    return;
+                }
                 put(sessionId, transport);
                 fireSessionReady(sessionId, peerClientId, transport, initiator);
                 LOGGER.info("会话 {} 已降级为中转传输 (对端 {})", sessionId, peerClientId);

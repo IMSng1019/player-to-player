@@ -69,6 +69,8 @@ public final class P2PServerService {
 
     private static volatile ControlServer controlServer;
     private static volatile ChunkRegistry chunkRegistry;
+    /** 区块归属变化的批量提示；关闭时清空尚未发送的旧世界事件。 */
+    private static volatile OwnershipChangeBroadcaster ownershipChanges;
     private static volatile DurableChunkJournal durableChunkJournal;
     private static volatile PlayerTable playerTable;
     private static volatile ComputeTable computeTable;
@@ -149,6 +151,8 @@ public final class P2PServerService {
         PlayerTable players = new PlayerTable();
         ComputeTable computes = new ComputeTable();
         GroupTable groups = new GroupTable();
+        OwnershipChangeBroadcaster ownershipBroadcaster = new OwnershipChangeBroadcaster(groups);
+        registry.setOwnershipChangeListener(ownershipBroadcaster::changed);
 
         // 世界名：HELLO_ACK 下发，客户端据此拼 <IP>+<世界名> 世界文件夹
         String worldName = server.getWorldData().getLevelName();
@@ -435,6 +439,7 @@ public final class P2PServerService {
 
         // 全部组件就绪后统一发布（volatile 写），stop() 据此收尾
         chunkRegistry = registry;
+        ownershipChanges = ownershipBroadcaster;
         durableChunkJournal = durableJournal;
         playerTable = players;
         computeTable = computes;
@@ -631,6 +636,12 @@ public final class P2PServerService {
         }
         running = false;
 
+        OwnershipChangeBroadcaster ownershipBroadcaster = ownershipChanges;
+        ownershipChanges = null;
+        if (ownershipBroadcaster != null) {
+            ownershipBroadcaster.close();
+        }
+
         // 顺序：先停网络入口（不再有新请求），再持久化注册表，最后停中转
         ControlServer control = controlServer;
         controlServer = null;
@@ -647,6 +658,7 @@ public final class P2PServerService {
         ChunkRegistry registry = chunkRegistry;
         chunkRegistry = null;
         if (registry != null) {
+            registry.setOwnershipChangeListener(null);
             registry.shutdown(); // 停自动落盘并做最终 persist
         }
         DurableChunkJournal durable = durableChunkJournal;

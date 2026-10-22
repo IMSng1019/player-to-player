@@ -105,18 +105,25 @@ public final class GroupHost {
     /** LAN 端口（volatile：发布在主线程，隧道桥接在 io 线程读）。 */
     private static volatile int lanPort;
 
+    /** 准备会话激活时重新检查，不能缓存停止前的端口。 */
+    public static int currentPort() { return lanPort; }
+
     /**
      * 预同步会话处理器（Phase 3；MergeClient 挂接）：参数为会话头 JSON 与已就绪
      * 的可靠通道（所有权移交处理器）。null = 未挂接（op=presync 一律拒绝）。
      */
-    private static volatile java.util.function.BiConsumer<JsonObject, ReliableChannel> presyncHandler;
+    @FunctionalInterface
+    public interface PresyncHandler {
+        void accept(JsonObject header, ReliableChannel channel, Runnable terminated);
+    }
+    private static volatile PresyncHandler presyncHandler;
 
     private GroupHost() {
     }
 
     /** 挂接预同步会话处理器（MergeClient 注册时调用；null 清除）。 */
     public static void setPresyncHandler(
-            java.util.function.BiConsumer<JsonObject, ReliableChannel> handler) {
+            PresyncHandler handler) {
         presyncHandler = handler;
     }
 
@@ -259,6 +266,13 @@ public final class GroupHost {
             JsonObject header = JsonUtil.parseObject(headerJson);
             String op = JsonUtil.getString(header, "op", "");
             switch (op) {
+                case "tunnel_prepare" -> {
+                    // 等待激活的长驻读取不能占接待池；名额仍随准备/隧道生命周期保留。
+                    ThreadPools.startBlocking("tunnel-prepared", () ->
+                            imsng.player_to_player.p2p.PreparedTunnel.accept(channel, header,
+                                    () -> lanPort, HOST_SESSION_SLOTS::release));
+                    tunnelHandedOff = true;
+                }
                 case "tunnel_join" -> {
                     int port = lanPort;
                     if (port <= 0) {
@@ -282,9 +296,9 @@ public final class GroupHost {
                         channel.close();
                         return;
                     }
-                    handler.accept(header, channel); // 通道所有权移交处理器
-                    // 预同步会话条数由服务端协调的合并数量决定（不受对端自由放大），
-                    // 故在 finally 里即时归还名额，只把"接待窗口"计入上限
+                    handler.accept(header, channel, HOST_SESSION_SLOTS::release);
+                    // 原主的预同步通道随后成为游戏隧道，名额覆盖完整生命周期。
+                    tunnelHandedOff = true;
                 }
                 default -> {
                     LOGGER.warn("会话 {} 的用途未知（op={}），关闭", sessionId, op);

@@ -84,6 +84,14 @@ public final class TcpTunnel {
         return new DataInputStream(channel.inputStream()).readUTF();
     }
 
+    /** 准备握手的阻塞读取有总期限，不能永久占住接待资源。 */
+    public static String readHeader(ReliableChannel channel, long timeoutSeconds) throws IOException {
+        var timeout = ThreadPools.scheduler().schedule(channel::abort, timeoutSeconds,
+                java.util.concurrent.TimeUnit.SECONDS);
+        try { return readHeader(channel); }
+        finally { timeout.cancel(false); }
+    }
+
     // ------------------------------------------------------- 主客户端侧桥接
 
     /**
@@ -137,6 +145,24 @@ public final class TcpTunnel {
      * @throws IOException 监听口创建失败
      */
     public static int listenAndBridge(ReliableChannel channel, String label) throws IOException {
+        return listenPrepared(channel, label, () -> { }).port();
+    }
+
+    @FunctionalInterface
+    public interface Activation { void run() throws IOException; }
+
+    /** 可立即取消的监听器；准备世界切换失败时不必等原先的 60 秒 accept 超时。 */
+    public record Listener(ServerSocket socket, ReliableChannel channel) implements AutoCloseable {
+        public int port() { return socket.getLocalPort(); }
+        @Override public void close() {
+            try { socket.close(); } catch (IOException ignored) { }
+            channel.abort();
+        }
+    }
+
+    /** 本机 MC 真正连接后才激活远端 LAN，避免预连接等待期间触发 MC 登录超时。 */
+    public static Listener listenPrepared(ReliableChannel channel, String label,
+                                          Activation activation) throws IOException {
         // backlog=1 + 仅回环绑定：只接受本机 MC 客户端的那一条连接
         ServerSocket server = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
         server.setSoTimeout(ACCEPT_TIMEOUT_MILLIS);
@@ -146,6 +172,7 @@ public final class TcpTunnel {
             try {
                 socket = server.accept();
                 socket.setTcpNoDelay(true);
+                activation.run();
                 startPumps(channel, socket, label);
             } catch (IOException e) {
                 LOGGER.warn("隧道 {} 等待本机 MC 客户端连入失败: {}", label, e.toString());
@@ -159,7 +186,22 @@ public final class TcpTunnel {
             }
         });
         LOGGER.info("隧道 {} 已在 127.0.0.1:{} 监听本机 MC 客户端", label, port);
-        return port;
+        return new Listener(server, channel);
+    }
+
+    /** 准备端已收到激活后连接 LAN，并在任何游戏字节之前发送确认。 */
+    static void activateAndBridge(ReliableChannel channel, int port, String label,
+                                  String activationReply, Runnable terminated) throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 10_000);
+            socket.setTcpNoDelay(true);
+            writeHeader(channel, activationReply);
+            startPumps(channel, socket, label, terminated);
+        } catch (IOException error) {
+            closeQuietly(channel, socket);
+            throw error;
+        }
     }
 
     // ---------------------------------------------------------------- 泵送

@@ -4,6 +4,7 @@ import imsng.player_to_player.client.group.GroupHost;
 import imsng.player_to_player.client.net.PortSyncClient;
 import imsng.player_to_player.client.session.WorldSession;
 import imsng.player_to_player.client.session.ClientExitCoordinator;
+import imsng.player_to_player.client.session.SwitchTelemetry;
 import imsng.player_to_player.compute.ComputeScore;
 import imsng.player_to_player.compute.ComputeScoreProvider;
 import imsng.player_to_player.config.GlobalConfig;
@@ -124,6 +125,7 @@ public final class ClientBootstrap {
         // publishServer。每个客户端 tick 末尾仅做常量时间状态检查；门控满足后只消费一次，
         // 不使用固定延时，也不会因机器性能差异提前发布。
         ClientTickEvents.END_CLIENT_TICK.register(GroupHost::onClientTick);
+        ClientTickEvents.END_CLIENT_TICK.register(SwitchTelemetry::tick);
 
         // ---------------------------------------------------------------
         // e. Phase 2：主客户端退出本地组世界时，DISCONNECT 事件先于集成服务端
