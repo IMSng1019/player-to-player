@@ -213,6 +213,16 @@ public final class GroupTable {
         }
     }
 
+    /** 排空期间成员变化必须重新准备，不能让新加入者的加载需求被悄悄拆走。 */
+    public GroupInfo splitPreparedGroup(UUID groupId, Set<UUID> departing,
+                                         UUID newPrimary, Set<UUID> preparedMembers) {
+        synchronized (lock) {
+            GroupInfo current = groups.get(groupId);
+            if (current == null || !current.members().equals(preparedMembers)) return null;
+            return splitGroup(groupId, departing, newPrimary);
+        }
+    }
+
     /** 组是否存在。 */
     public boolean exists(UUID groupId) {
         return groups.containsKey(groupId);

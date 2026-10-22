@@ -30,9 +30,10 @@ import java.util.function.Consumer;
  * <ol>
  *   <li><b>先挂增量分接</b>（{@link PresyncTaps}）再拍快照 —— 快照期间发生的
  *       写盘不会漏；增量按区块合并（同键覆盖，幂等最终态）；</li>
- *   <li><b>快照</b>：遍历本组占用区块，逐个在<b>服务器主线程</b>序列化
- *       （NBT 一经生成即不可变），gzip 与发送在本 io 线程 —— 主线程每次只被
- *       占用单区块序列化的微秒~毫秒级时间，游戏不卡顿；玩家数据一并快照；</li>
+ *   <li><b>快照</b>：遍历本组占用区块，在<b>服务器主线程</b>按个数与时间预算
+ *       分批序列化（NBT 生成后仅只读使用），gzip 与发送在后台工作线程。
+ *       一批消费完再申请下一批，避免每块都独立排队或全量 NBT 同时驻留内存；
+ *       单块序列化不可中断，时间预算是软上限。玩家数据一并快照；</li>
  *   <li><b>追赶</b>：SNAPSHOT_DONE / ACK_SNAPSHOT 握手后循环发送积累的增量，
  *       直至增量队列吃空（B 已接近同步）；</li>
  *   <li><b>原子切换</b>：{@link GroupRuntime#setTickFrozen 冻结} A 的世界演算
@@ -55,6 +56,10 @@ public final class PresyncSender {
 
     /** 追赶阶段的最大轮数：防对端消费极慢时无限追（超过即失败，A 继续运行）。 */
     private static final int MAX_CATCHUP_ROUNDS = 50;
+
+    /** 单次主线程快照任务的双重上限，避免一批大 NBT 长时间占住游戏 tick。 */
+    private static final int SNAPSHOT_BATCH_CHUNKS = 32;
+    private static final long SNAPSHOT_BATCH_NANOS = TimeUnit.MILLISECONDS.toNanos(2);
 
     private final ReliableChannel channel;
     private final MinecraftServer server;
@@ -99,23 +104,48 @@ public final class PresyncSender {
             // ---- 1. 快照：占用区块 + 玩家数据 ----
             Set<ChunkKey> snapshot = claims.claimedSnapshot();
             LOGGER.info("预同步 {} 快照开始: {} 个区块", label, snapshot.size());
-            int sent = 0;
-            for (ChunkKey key : snapshot) {
-                byte[] gzip = serializeChunkOnMainThread(key);
-                if (gzip != null) {
-                    PresyncProtocol.writeRecord(out, PresyncProtocol.TYPE_CHUNK,
-                            key.asString(), gzip);
-                    sent++;
+            SnapshotTiming snapshotTiming = new SnapshotTiming();
+            SnapshotBatchCollector<ChunkKey, CompoundTag> collector = new SnapshotBatchCollector<>(
+                    snapshot.iterator(), server::execute, this::captureChunkOnMainThread,
+                    SNAPSHOT_BATCH_CHUNKS, SNAPSHOT_BATCH_NANOS, System::nanoTime);
+            boolean snapshotFinished = snapshot.isEmpty();
+            while (!snapshotFinished) {
+                var pending = collector.next();
+                SnapshotBatchCollector.Batch<ChunkKey, CompoundTag> batch;
+                try {
+                    batch = pending.get(ACK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+                } catch (Exception error) {
+                    // 主线程没能及时采集时终止预同步，不能把整批超时误报为正常空区块。
+                    pending.cancel(false);
+                    throw error;
                 }
-                // 未加载/序列化失败的区块跳过：其最新态已在服务端存档
-                //（存盘上行），B 申请时走服务端拉取路径，无数据损失
+                snapshotFinished = batch.finished();
+                snapshotTiming.batches++;
+                snapshotTiming.queueNanos += batch.queueNanos();
+                snapshotTiming.captureNanos += batch.captureNanos();
+                for (Map.Entry<ChunkKey, CompoundTag> entry : batch.values()) {
+                    compressAndWrite(out, PresyncProtocol.TYPE_CHUNK,
+                            entry.getKey().asString(), entry.getValue(), snapshotTiming);
+                }
+                // 延续现有未加载区块的服务端拉取路径；分项日志显式记下未实发数量，
+                // 不能把“占用区块数”误认为“完整世界状态已成功迁移的数量”。
             }
-            sendPlayerData(out);
+            sendPlayerData(out, snapshotTiming);
             PresyncProtocol.writeMarker(out, PresyncProtocol.TYPE_SNAPSHOT_DONE);
+            timing.mark("snapshot_sent");
+            LOGGER.info("预同步 {} 快照发送分项: batches={} chunks={} skipped={} players={} gzip_bytes={}"
+                            + " main_queue_ms={} main_capture_ms={} compress_ms={} channel_write_ms={}",
+                    label, snapshotTiming.batches, snapshotTiming.chunks,
+                    snapshot.size() - snapshotTiming.chunks, snapshotTiming.players,
+                    snapshotTiming.compressedBytes, snapshotTiming.queueNanos / 1_000_000,
+                    snapshotTiming.captureNanos / 1_000_000,
+                    snapshotTiming.compressNanos / 1_000_000, snapshotTiming.writeNanos / 1_000_000);
+            long snapshotAckStart = System.nanoTime();
             awaitAck(in, PresyncProtocol.TYPE_ACK_SNAPSHOT);
             progress.accept("snapshot_done");
             timing.mark("snapshot_ack");
-            LOGGER.info("预同步 {} 快照完成: 实发 {} 个区块，进入增量追赶", label, sent);
+            LOGGER.info("预同步 {} 快照完成: 实发 {} 个区块，ack_wait_ms={}，进入增量追赶",
+                    label, snapshotTiming.chunks, (System.nanoTime() - snapshotAckStart) / 1_000_000);
 
             // ---- 2. 增量追赶：循环吃空快照期间与追赶期间的写盘增量 ----
             int rounds = 0;
@@ -155,7 +185,7 @@ public final class PresyncSender {
                             e.getKey().asString(), gzip);
                 }
             }
-            sendPlayerData(out); // 玩家最终态（位置/背包）也在尾部重发一次
+            sendPlayerData(out, null); // 玩家最终态（位置/背包）也在尾部重发一次
             PresyncProtocol.writeMarker(out, PresyncProtocol.TYPE_TAIL_DONE);
             awaitAck(in, PresyncProtocol.TYPE_ACK_TAIL);
             timing.finish("tail_ack");
@@ -175,51 +205,99 @@ public final class PresyncSender {
 
     // ------------------------------------------------------------ 内部
 
-    /** 主线程序列化单个区块并在本线程压缩；未加载/失败返回 null。 */
-    private byte[] serializeChunkOnMainThread(ChunkKey key) {
-        CompletableFuture<CompoundTag> future = new CompletableFuture<>();
-        server.execute(() -> {
-            try {
-                ServerLevel level = resolveLevel(key.dimension());
-                LevelChunk chunk = level != null
-                        ? level.getChunkSource().getChunkNow(key.x(), key.z())
-                        : null;
-                future.complete(chunk != null ? ChunkSerializer.write(level, chunk) : null);
-            } catch (Exception e) {
-                LOGGER.warn("预同步序列化失败（跳过，服务端存档兜底）: {}", key.asString(), e);
-                future.complete(null);
-            }
-        });
+    /** 只在批次主线程任务中读取区块；NBT 交给后台工作线程压缩和发送。 */
+    private CompoundTag captureChunkOnMainThread(ChunkKey key) {
         try {
-            CompoundTag tag = future.get(ACK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
-            return tag != null ? ChunkUploadService.compress(tag) : null;
+            ServerLevel level = resolveLevel(key.dimension());
+            LevelChunk chunk = level != null
+                    ? level.getChunkSource().getChunkNow(key.x(), key.z())
+                    : null;
+            return chunk != null ? ChunkSerializer.write(level, chunk) : null;
         } catch (Exception e) {
+            LOGGER.warn("预同步序列化失败（跳过，服务端存档兜底）: {}", key.asString(), e);
             return null;
         }
     }
 
-    /** 发送全部在线玩家的 NBT（B 写入其存档 playerdata，玩家背包/位置连续）。 */
-    private void sendPlayerData(DataOutputStream out) throws Exception {
-        CompletableFuture<Map<String, byte[]>> future = new CompletableFuture<>();
+    /**
+     * 玩家对象只能在主线程读取；压缩与网络写入回到当前后台线程，避免原实现把 gzip
+     * 一并放在主线程，在多人或玩家 NBT 较大时增加游戏暂停。
+     */
+    private void sendPlayerData(DataOutputStream out, SnapshotTiming timing) throws Exception {
+        long submitted = System.nanoTime();
+        CompletableFuture<PlayerSnapshot> future = new CompletableFuture<>();
         server.execute(() -> {
-            Map<String, byte[]> result = new LinkedHashMap<>();
-            for (var player : server.getPlayerList().getPlayers()) {
-                try {
-                    CompoundTag tag = player.saveWithoutId(new CompoundTag());
-                    byte[] gzip = ChunkUploadService.compress(tag);
-                    if (gzip != null) {
-                        result.put(player.getUUID().toString(), gzip);
-                    }
-                } catch (Exception e) {
-                    LOGGER.warn("预同步玩家数据序列化失败: {}", player.getUUID(), e);
-                }
+            if (future.isCancelled()) {
+                return;
             }
-            future.complete(result);
+            long started = System.nanoTime();
+            try {
+                Map<String, CompoundTag> result = new LinkedHashMap<>();
+                for (var player : server.getPlayerList().getPlayers()) {
+                    try {
+                        result.put(player.getUUID().toString(), player.saveWithoutId(new CompoundTag()));
+                    } catch (Exception error) {
+                        LOGGER.warn("预同步玩家数据序列化失败: {}", player.getUUID(), error);
+                    }
+                }
+                future.complete(new PlayerSnapshot(result, started - submitted, System.nanoTime() - started));
+            } catch (Exception error) {
+                future.completeExceptionally(error);
+            }
         });
-        for (Map.Entry<String, byte[]> e
-                : future.get(ACK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS).entrySet()) {
-            PresyncProtocol.writeRecord(out, PresyncProtocol.TYPE_PLAYER, e.getKey(), e.getValue());
+        PlayerSnapshot players;
+        try {
+            players = future.get(ACK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (Exception error) {
+            future.cancel(false);
+            throw error;
         }
+        if (timing != null) {
+            timing.queueNanos += players.queueNanos();
+            timing.captureNanos += players.captureNanos();
+        }
+        for (Map.Entry<String, CompoundTag> entry : players.tags().entrySet()) {
+            compressAndWrite(out, PresyncProtocol.TYPE_PLAYER, entry.getKey(), entry.getValue(), timing);
+        }
+    }
+
+    /** 压缩与通道背压独立计时；write 时间只代表本端写流，不等同于对端已落地。 */
+    private void compressAndWrite(DataOutputStream out, byte type, String key, CompoundTag tag,
+                                  SnapshotTiming timing) throws IOException {
+        long started = System.nanoTime();
+        byte[] gzip = ChunkUploadService.compress(tag);
+        if (timing != null) {
+            timing.compressNanos += System.nanoTime() - started;
+        }
+        if (gzip == null) {
+            return;
+        }
+        started = System.nanoTime();
+        PresyncProtocol.writeRecord(out, type, key, gzip);
+        if (timing != null) {
+            timing.writeNanos += System.nanoTime() - started;
+            timing.compressedBytes += gzip.length;
+            if (type == PresyncProtocol.TYPE_CHUNK) {
+                timing.chunks++;
+            } else {
+                timing.players++;
+            }
+        }
+    }
+
+    private record PlayerSnapshot(Map<String, CompoundTag> tags, long queueNanos, long captureNanos) {
+    }
+
+    /** 全部由单条预同步后台线程汇总，不需额外原子字段，也不产出逐区块噪声日志。 */
+    private static final class SnapshotTiming {
+        private int batches;
+        private int chunks;
+        private int players;
+        private long queueNanos;
+        private long captureNanos;
+        private long compressNanos;
+        private long writeNanos;
+        private long compressedBytes;
     }
 
     /** 摘取当前全部增量（锁内换出，锁外使用）。 */

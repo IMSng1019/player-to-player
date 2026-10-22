@@ -39,6 +39,17 @@ public final class PlayerDataFileStore {
     }
 
     /**
+     * 上行序号判定和实际替换必须使用与退出最终写入相同的玩家锁。
+     * 调用方先进入控制连接/退出屏障，再取得此锁，保持既有锁顺序，不能反向等待会话锁。
+     */
+    static boolean withPlayerWriteLock(UUID playerId, BooleanSupplier action) {
+        if (playerId == null || action == null) return false;
+        synchronized (WRITE_LOCKS[(playerId.hashCode() & Integer.MAX_VALUE) % WRITE_LOCKS.length]) {
+            return action.getAsBoolean();
+        }
+    }
+
+    /**
      * 按玩家串行执行“退出屏障检查 + 原子耐久替换”。检查与写入在同一锁内，
      * 保证退出最终写入之后排队的旧实时任务会重新看到屏障并被拒绝。
      */

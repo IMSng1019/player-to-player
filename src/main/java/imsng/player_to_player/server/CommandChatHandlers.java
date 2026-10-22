@@ -6,17 +6,20 @@ import com.mojang.brigadier.ParseResults;
 import com.mojang.brigadier.context.CommandContextBuilder;
 import com.mojang.brigadier.context.ParsedArgument;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
+import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.group.CommandFeedback;
 import imsng.player_to_player.group.CommandRouting;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.HandlerRegistry;
 import imsng.player_to_player.netproto.MessageType;
+import imsng.player_to_player.netproto.Protocol;
 import imsng.player_to_player.registry.ChunkKey;
 import imsng.player_to_player.registry.ChunkRegistry;
 import imsng.player_to_player.registry.PlayerTable;
 import imsng.player_to_player.util.JsonUtil;
 import imsng.player_to_player.util.TokenBucket;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.minecraft.commands.CommandSource;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
@@ -27,6 +30,7 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.rcon.RconConsoleSource;
 import net.minecraft.world.phys.Vec2;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
@@ -37,6 +41,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.StringJoiner;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * 指令与聊天路由（服务端，Phase 4；规范"服务器的指令处理"与"服务器的信息处理"）。
@@ -73,6 +80,10 @@ import java.util.UUID;
 public final class CommandChatHandlers {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("player_to_player/cmd-chat");
+
+    /** 只为当前物理服暴露控制台入口；实例身份校验阻止集成服或旧存档借用此路由器。 */
+    private static volatile CommandChatHandlers consoleHandlers;
+    private static boolean consoleLifecycleRegistered;
 
     /** 上送指令长度上限（入站不可信，防恶意大帧）。 */
     private static final int MAX_COMMAND_LENGTH = 256;
@@ -122,6 +133,153 @@ public final class CommandChatHandlers {
                 server, groups, players, registry, permissions);
         reg.on(MessageType.COMMAND_RELAY, handlers::handleCommandRelay);
         reg.on(MessageType.CHAT_RELAY, handlers::handleChatRelay);
+        publishConsoleHandlers(handlers);
+    }
+
+    private static synchronized void publishConsoleHandlers(CommandChatHandlers handlers) {
+        consoleHandlers = handlers;
+        if (!consoleLifecycleRegistered) {
+            consoleLifecycleRegistered = true;
+            ServerLifecycleEvents.SERVER_STOPPED.register(stopped -> {
+                CommandChatHandlers current = consoleHandlers;
+                if (current != null && current.server == stopped) {
+                    consoleHandlers = null;
+                }
+            });
+        }
+    }
+
+    /**
+     * 仅由 DedicatedServer.handleConsoleInputs 的调用点进入，返回 true 才取消原版执行。
+     * 普通玩家、命令方块、函数与内部转发都不经过这个入口，不会再次上链。
+     */
+    public static boolean routeConsoleInput(CommandSourceStack source, String command) {
+        CommandChatHandlers handlers = currentConsoleHandlers(source.getServer());
+        if (handlers == null || source.getEntity() != null) {
+            return false;
+        }
+        try {
+            CompletableFuture<String> response = handlers.dispatchConsole(source, command);
+            if (response == null) {
+                return false; // 管理命令与原版解析错误保持原入口执行。
+            }
+            response.whenComplete((text, error) -> handlers.server.execute(() ->
+                    source.sendSystemMessage(Component.literal(error == null
+                            ? text : "P2P 指令执行结果未确认: " + error.getMessage()))));
+        } catch (RuntimeException error) {
+            source.sendFailure(Component.literal("P2P 指令路由失败，未执行: " + error.getMessage()));
+            LOGGER.warn("控制台指令路由异常: /{}", command, error);
+        }
+        return true;
+    }
+
+    /**
+     * RCON 原入口会同步读取共享缓冲，直接异步发消息会漏回执或串到下次请求。
+     * 因此每次请求拥有独立 future，仅 RCON 线程等待；解析与路由仍调度到服务器线程。
+     * null 表示原版管理命令，交还原始 runCommand 执行，其权限与反馈路径保持不变。
+     */
+    public static String routeRconInput(MinecraftServer server, String command) {
+        CommandChatHandlers handlers = currentConsoleHandlers(server);
+        if (handlers == null) {
+            return null;
+        }
+        if (server.isSameThread()) {
+            // 原版 RCON 从专用连接线程调用；模组若在主线程程序化调用此 API，不能等网络。
+            return "P2P 控制台路由不能在服务器主线程等待远程执行，请从控制台或 RCON 连接发起";
+        }
+        CompletableFuture<String> response = new CompletableFuture<>();
+        server.execute(() -> {
+            if (response.isDone()) {
+                return; // 排队期间已经超时的请求不能在稍后突然执行。
+            }
+            try {
+                CommandSourceStack source = new RconConsoleSource(server).createCommandSourceStack();
+                CompletableFuture<String> routed = handlers.dispatchConsole(source, command);
+                if (routed == null) {
+                    response.complete(null);
+                } else {
+                    routed.whenComplete((text, error) -> response.complete(error == null
+                            ? text : "P2P 指令执行结果未确认: " + error.getMessage()));
+                }
+            } catch (RuntimeException error) {
+                response.complete("P2P 指令路由失败，未执行: " + error.getMessage());
+            }
+        });
+        try {
+            return response.get(Protocol.REQUEST_TIMEOUT_MILLIS + 5_000, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException timeout) {
+            String message = "P2P 指令等待超时，执行结果未确认";
+            response.complete(message);
+            return message;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            String message = "P2P 指令等待被中断，执行结果未确认";
+            response.complete(message);
+            return message;
+        } catch (Exception error) {
+            return "P2P 指令执行结果未确认: " + error.getMessage();
+        }
+    }
+
+    private static CommandChatHandlers currentConsoleHandlers(MinecraftServer server) {
+        CommandChatHandlers current = consoleHandlers;
+        return NodeContext.get().isServer() && current != null && current.server == server
+                && !server.isStopped() ? current : null;
+    }
+
+    /** 主线程生成一次计划，之后只向唯一目标组下发，反馈沿现有 request/回执聚合器返回。 */
+    private CompletableFuture<String> dispatchConsole(CommandSourceStack source, String command) {
+        String normalized = command.trim();
+        if (normalized.startsWith("/")) {
+            normalized = normalized.substring(1);
+        }
+        if ("list".equals(normalized)) {
+            return CompletableFuture.completedFuture(buildPlayerList());
+        }
+        String dimension = source.getLevel().dimension().location().toString();
+        ConsoleCommandRouting.Decision plan = ConsoleCommandRouting.plan(normalized,
+                server.getCommands().getDispatcher(), source, dimension,
+                players::byName, groups::groupOf, registry::ownerOf);
+        if (plan.kind() == ConsoleCommandRouting.Kind.LOCAL) {
+            return null;
+        }
+        if (plan.kind() == ConsoleCommandRouting.Kind.REJECT) {
+            return CompletableFuture.completedFuture("P2P 指令未执行: " + plan.message());
+        }
+        if (plan.command().length() > MAX_COMMAND_LENGTH) {
+            return CompletableFuture.completedFuture("P2P 指令展开后过长，未执行");
+        }
+        UUID primary = groups.primaryOf(plan.groupId());
+        ControlConnection target = primary == null ? null : HelloHandler.connectionOf(primary);
+        if (target == null || !target.isOpen() || !ConnectionIdentity.supportsCommandRouting(primary)) {
+            return CompletableFuture.completedFuture("目标玩家所在组当前不可执行指令，未执行");
+        }
+        JsonObject forward = new JsonObject();
+        forward.addProperty("execute", true);
+        forward.addProperty("command", plan.command());
+        forward.addProperty("sourceName", source.getTextName());
+        forward.addProperty("permissionLevel", FORWARD_PERMISSION_CAP);
+        forward.addProperty("origin", false); // console 始终无源实体，绝不能借用目标玩家充当 @s。
+        forward.addProperty("dimension", plan.dimension());
+        if (!plan.ownedChunks().isEmpty()) {
+            com.google.gson.JsonArray keys = new com.google.gson.JsonArray();
+            plan.ownedChunks().forEach(key -> keys.add(key.asString()));
+            forward.add("ownedChunks", keys);
+        }
+        CompletableFuture<String> response = new CompletableFuture<>();
+        CommandAggregator aggregator = new CommandAggregator(1, response::complete);
+        LOGGER.info("控制台指令下放: /{} -> 组 {}", normalized, plan.groupId());
+        target.request(ControlMessage.of(MessageType.COMMAND_RELAY, forward))
+                .whenComplete((reply, error) -> {
+                    boolean executed = error == null && reply != null
+                            && reply.type() == MessageType.COMMAND_RELAY
+                            && JsonUtil.getBoolean(reply.json(), "executed", false);
+                    String message = error != null ? "执行组未在规定时间内应答，执行结果未确认"
+                            : reply == null ? "执行组没有返回结果"
+                            : JsonUtil.getString(reply.json(), "message", "");
+                    aggregator.record(false, executed, message);
+                });
+        return response;
     }
 
     // ------------------------------------------------------------ 指令上链
@@ -278,15 +436,8 @@ public final class CommandChatHandlers {
      * 仅服务端才有的上下文）留在服务端执行。
      */
     private boolean isGroupExecutable(String command, CommandSourceStack realSource) {
-        CommandSourceStack capped = realSource.withPermission(FORWARD_PERMISSION_CAP);
-        ParseResults<CommandSourceStack> parse =
-                server.getCommands().getDispatcher().parse(command, capped);
-        try {
-            Commands.validateParseResults(parse);
-            return true;
-        } catch (CommandSyntaxException e) {
-            return false;
-        }
+        return ConsoleCommandRouting.isGroupExecutable(
+                command, server.getCommands().getDispatcher(), realSource);
     }
 
     /** 3/4 级指令的服务端执行（决策 3）：结果文案回给发起者，并刷新权限名单。 */

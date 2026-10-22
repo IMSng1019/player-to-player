@@ -25,6 +25,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 
 /**
  * 区块申请客户端（主客户端侧，Phase 2；规范"特殊的区块加载"）。
@@ -86,6 +87,16 @@ public final class ChunkClaimClient {
     /** 未决申请：每个 key 只有一个操作对象；它同时约束共享 future、在途请求和重试代次。 */
     private final Map<ChunkKey, ClaimOperation> pending = new ConcurrentHashMap<>();
 
+    /** 已授权但仍在拉取 NBT 的加载也属于本代运行时，迁移时必须一起终结。 */
+    private final Map<CompletableFuture<Optional<CompoundTag>>, ChunkKey> pendingFetches =
+            new ConcurrentHashMap<>();
+
+    /** 分离准备的旧玩家区域：仅阻止新增加载，已有区块仍保有写权直到正常卸载 ACK。 */
+    private Predicate<ChunkKey> splitDrainRegion;
+
+    /** 分离撤销后仍在确认未知授权/释放的 key，ACK 前不能让新 holder 复用同一份占用。 */
+    private final Set<ChunkKey> retiringLoads = new java.util.HashSet<>();
+
     /** 字段全部由 lifecycleLock 保护，不能用 future 是否完成代替网络在途状态。 */
     private static final class ClaimOperation {
         private final CompletableFuture<ClaimOutcome> future = new CompletableFuture<>();
@@ -94,6 +105,10 @@ public final class ChunkClaimClient {
         private boolean retryWaiting;
         private boolean wakeRequested;
         private UUID blockingGroup;
+        /** future 已对 ChunkMap 取消，但网络结果未明；必须追到明确拒绝或授予后可靠释放。 */
+        private boolean draining;
+        /** 请求发出但尚未得到明确拒绝；包括网络超时后的重试等待，不能遗忘服务端可能的授予。 */
+        private boolean allocationUncertain;
     }
 
     /** 已在锁内保留的一次唤醒；锁外发请求，generation 使重复事件与旧定时器无效。 */
@@ -167,6 +182,33 @@ public final class ChunkClaimClient {
 
     private volatile boolean shutdown;
 
+    /** 整组所有权已经由物理服提交转交；本实例永久失去写权限，不能再次启用。 */
+    private volatile boolean transferred;
+
+    /**
+     * 只表示已提交合并或已确认分离准备后的旧加载取消，不能使用 IOException 或空 NBT
+     * 表示：原版会把它们解释为可生成区块。ChunkMapMixin 将此信号转为 UNLOADED_CHUNK。
+     */
+    public static final class ChunkLoadRetiredException extends IllegalStateException {
+        private ChunkLoadRetiredException() {
+            super("组区块所有权已提交转交，旧运行时停止加载");
+        }
+
+        private ChunkLoadRetiredException(String reason) {
+            super(reason);
+        }
+    }
+
+    /** 仅展开 future 的包装异常，真实磁盘错误仍保留原版处理。 */
+    public static boolean isTransferredFailure(Throwable error) {
+        while ((error instanceof java.util.concurrent.CompletionException
+                || error instanceof java.util.concurrent.ExecutionException)
+                && error.getCause() != null && error.getCause() != error) {
+            error = error.getCause();
+        }
+        return error instanceof ChunkLoadRetiredException;
+    }
+
     /** EXIT_BEGIN 前准备：拒绝新 claim，但允许已经登记的普通 release 继续完成。 */
     private volatile boolean exitPreparing;
 
@@ -202,9 +244,15 @@ public final class ChunkClaimClient {
         ClaimOperation operation;
         boolean start = false;
         synchronized (lifecycleLock) {
+            if (transferred) {
+                return CompletableFuture.failedFuture(new ChunkLoadRetiredException());
+            }
             if (shutdown || exitPreparing || exitFrozen) {
                 return CompletableFuture.failedFuture(
                         new IllegalStateException("主客户端正在准备或提交退出事务"));
+            }
+            if (inSplitDrain(key) || retiringLoads.contains(key)) {
+                return CompletableFuture.failedFuture(splitLoadCancelled());
             }
             operation = pending.get(key);
             if (operation == null) {
@@ -268,6 +316,96 @@ public final class ChunkClaimClient {
         return Set.copyOf(claimed);
     }
 
+    /** 分离事务规划需要覆盖正在生成的外圈，不能只枚举已经授予的区块。 */
+    public Set<ChunkKey> trackedKeysSnapshot() {
+        synchronized (lifecycleLock) {
+            Set<ChunkKey> keys = new java.util.HashSet<>(claimed);
+            keys.addAll(pending.keySet());
+            keys.addAll(pendingFetches.values());
+            keys.addAll(releases.keySet());
+            keys.addAll(retiringLoads);
+            return Set.copyOf(keys);
+        }
+    }
+
+    /**
+     * 两阶段分离准备：关闭离组玩家区域的新加载，保留已加载区块的合法写权与正常卸载链。
+     * 在途申请不能直接丢弃：服务端可能已授予但 ACK 仍在路上，需保留 draining 操作并在
+     * 获得明确结果后释放，避免服务端留下没有本地 holder 的孤儿占用。
+     */
+    public void beginSplitDrain(Predicate<ChunkKey> region) {
+        Objects.requireNonNull(region, "region");
+        List<ClaimOperation> cancelled = new ArrayList<>();
+        Map<CompletableFuture<Optional<CompoundTag>>, ChunkKey> fetches = new java.util.HashMap<>();
+        synchronized (lifecycleLock) {
+            if (shutdown || exitPreparing || exitFrozen) {
+                throw new IllegalStateException("组运行时正在退出，不能准备分离");
+            }
+            if (splitDrainRegion != null) {
+                throw new IllegalStateException("已有分离区域正在排空");
+            }
+            splitDrainRegion = region;
+            pending.forEach((key, operation) -> {
+                if (!region.test(key)) return;
+                operation.draining = true;
+                cancelled.add(operation);
+                denials.remove(key);
+                if (!operation.inFlight && !operation.allocationUncertain) {
+                    // 明确被拒且只剩 timer 的申请没有在途授权，可以直接结束；旧 timer 的
+                    // 身份校验会失败。此前超时结果不明的 draining 重试不能走这个分支。
+                    pending.remove(key, operation);
+                } else {
+                    retiringLoads.add(key);
+                }
+            });
+            pendingFetches.forEach((future, key) -> {
+                if (region.test(key) && !future.isDone()) {
+                    fetches.put(future, key);
+                    pendingFetches.remove(future);
+                    retiringLoads.add(key);
+                }
+            });
+        }
+        cancelled.forEach(operation -> operation.future.completeExceptionally(splitLoadCancelled()));
+        fetches.forEach((future, key) -> {
+            future.completeExceptionally(splitLoadCancelled());
+            // 拉取尚未完成，原版还未读入/修改区块，权威数据仍在物理服，可以无数据释放。
+            // 已生成/已加载的区块不在这份集合内，仍由正常预卸载上传最终状态。
+            releaseWhenConfirmed(key, null);
+        });
+    }
+
+    /** 只有该区域的已授予占用、未知结果申请和数据拉取全部结束才允许提交分离。 */
+    public boolean isSplitDrained() {
+        synchronized (lifecycleLock) {
+            if (splitDrainRegion == null) return true;
+            return claimed.stream().noneMatch(splitDrainRegion)
+                    && pending.keySet().stream().noneMatch(splitDrainRegion)
+                    && pendingFetches.values().stream().noneMatch(splitDrainRegion)
+                    && releases.keySet().stream().noneMatch(splitDrainRegion)
+                    && retiringLoads.stream().noneMatch(splitDrainRegion);
+        }
+    }
+
+    /**
+     * 取消/结束分离围栏；已取消的 holder 不会复活，调用方必须先等它们卸载再允许玩家恢复。
+     * 尚不确定网络结果的 draining 申请继续追踪并释放，不能因取消事务而丢失所有权账目。
+     */
+    public void cancelSplitDrain() {
+        synchronized (lifecycleLock) {
+            splitDrainRegion = null;
+        }
+    }
+
+    /** 调用方持有 lifecycleLock。 */
+    private boolean inSplitDrain(ChunkKey key) {
+        return splitDrainRegion != null && splitDrainRegion.test(key);
+    }
+
+    private static ChunkLoadRetiredException splitLoadCancelled() {
+        return new ChunkLoadRetiredException("分离准备已撤销旧玩家区域加载，等待原版卸载");
+    }
+
     /**
      * 本地摘除占用记录（Phase 3 分离/合并：区块占用已在<b>服务端侧</b>迁移给
      * 其他组，本组不再拥有 —— 只清本地集合，不发 CHUNK_RELEASE：发了也会因
@@ -278,6 +416,7 @@ public final class ChunkClaimClient {
         ReleaseOperation release;
         synchronized (lifecycleLock) {
             claimed.remove(key);
+            retiringLoads.remove(key);
             serverDataKnown.remove(key);
             denials.remove(key);
             release = releases.remove(key);
@@ -288,16 +427,35 @@ public final class ChunkClaimClient {
         }
     }
 
-    /** 整体摘除全部本地占用记录（合并让出方在关停集成服务端前调用）。 */
+    /**
+     * 权威合并已提交后的整组退休（调用前必须已经确认所有权转交）。与 forgetLocal 不同，
+     * 这是不可恢复的代次终点：禁止新申请、终结未决加载/拉取/释放，并使所有旧重试失效。
+     * 不能等 SERVER_STOPPED 再关停，因为原版 Saving worlds 本身正在等待这些加载结束。
+     * 本方法不发 CHUNK_RELEASE；所有权已经属于新主，旧主无权释放或重新上传。
+     */
     public void forgetAllLocal() {
+        List<ClaimOperation> pendingClaims;
+        List<CompletableFuture<Optional<CompoundTag>>> fetches;
         Map<ChunkKey, ReleaseOperation> activeReleases;
         synchronized (lifecycleLock) {
+            transferred = true;
+            shutdown = true;
+            exitPreparing = true;
+            exitFrozen = true;
+            pendingClaims = new ArrayList<>(pending.values());
+            pending.clear();
+            fetches = new ArrayList<>(pendingFetches.keySet());
+            pendingFetches.clear();
             claimed.clear();
+            retiringLoads.clear();
             serverDataKnown.clear();
             denials.clear();
             activeReleases = new java.util.HashMap<>(releases);
             releases.clear();
         }
+        pendingClaims.forEach(operation ->
+                operation.future.completeExceptionally(new ChunkLoadRetiredException()));
+        fetches.forEach(future -> future.completeExceptionally(new ChunkLoadRetiredException()));
         activeReleases.values().forEach(operation -> operation.future().completeExceptionally(
                 new IllegalStateException("区块占用已由其他组接管")));
     }
@@ -338,6 +496,7 @@ public final class ChunkClaimClient {
                 return;
             }
             operation.inFlight = true;
+            operation.allocationUncertain = true;
             operation.retryWaiting = false;
             operation.wakeRequested = false;
             generation = ++operation.generation;
@@ -355,7 +514,8 @@ public final class ChunkClaimClient {
 
     /** 调用方持有 lifecycleLock；身份判断使退出/替换后的迟到回调彻底失效。 */
     private boolean activeClaim(ChunkKey key, ClaimOperation operation) {
-        return !shutdown && !exitPreparing && !exitFrozen && !operation.future.isDone()
+        return !shutdown && !exitPreparing && !exitFrozen
+                && (!operation.future.isDone() || operation.draining)
                 && pending.get(key) == operation;
     }
 
@@ -364,6 +524,8 @@ public final class ChunkClaimClient {
         ClaimOutcome outcome = null;
         UUID blocked = null;
         boolean wakeImmediately = false;
+        boolean drainGranted = false;
+        boolean drainDenied = false;
         long retryGeneration = generation;
         synchronized (lifecycleLock) {
             if (!activeClaim(key, operation) || !operation.inFlight
@@ -379,9 +541,20 @@ public final class ChunkClaimClient {
                 claimed.add(key);
                 denials.remove(key);
                 pending.remove(key, operation);
-                outcome = new ClaimOutcome(hasServerData);
+                if (operation.draining || inSplitDrain(key)) {
+                    drainGranted = true;
+                    retiringLoads.add(key);
+                }
+                else outcome = new ClaimOutcome(hasServerData);
             } else {
-                if (validReply) {
+                if (validReply) operation.allocationUncertain = false;
+                if (validReply && operation.draining) {
+                    // 服务端明确拒绝，证明本次未知授权已经收束；分离区域不再触发合并。
+                    pending.remove(key, operation);
+                    denials.remove(key);
+                    retiringLoads.remove(key);
+                    drainDenied = true;
+                } else if (validReply) {
                     String blockingGroupRaw = JsonUtil.getString(reply.json(), "blockingGroup", "");
                     String blockingChunkRaw = JsonUtil.getString(reply.json(), "blockingChunk", "?");
                     recordDenial(key, blockingGroupRaw, blockingChunkRaw);
@@ -405,12 +578,33 @@ public final class ChunkClaimClient {
                 }
             }
         }
+        if (drainGranted) {
+            operation.future.completeExceptionally(splitLoadCancelled());
+            releaseWhenConfirmed(key, null);
+            return;
+        }
+        if (drainDenied) return;
         if (outcome != null) {
-            operation.future.complete(outcome);
+            synchronized (lifecycleLock) {
+                // grant 的本地登记与 future 完成之间可能恰好收到 COMMIT；此时不得把
+                // “允许开始生成”的旧结果交给 ChunkMap，即使该 operation 已从 pending 摘除。
+                if (transferred) operation.future.completeExceptionally(new ChunkLoadRetiredException());
+                else if (inSplitDrain(key)) {
+                    retiringLoads.add(key);
+                    operation.future.completeExceptionally(splitLoadCancelled());
+                    // grant 已登记但还未交付原版，尚无任何生成/修改，可以安全撤销该占用。
+                    releaseWhenConfirmed(key, null);
+                }
+                else operation.future.complete(outcome);
+            }
             return;
         }
         if (blocked != null) {
-            MergeTriggers.onClaimBlocked(blocked, key);
+            boolean notifyMerge;
+            synchronized (lifecycleLock) {
+                notifyMerge = !operation.draining && !inSplitDrain(key) && !shutdown;
+            }
+            if (notifyMerge) MergeTriggers.onClaimBlocked(blocked, key);
         }
         if (wakeImmediately) {
             attemptClaim(key, operation, retryGeneration);
@@ -464,11 +658,29 @@ public final class ChunkClaimClient {
      * 擅自重新生成会在下次上行时覆盖服务端存档，属于数据丢失事故。
      */
     public CompletableFuture<Optional<CompoundTag>> fetchChunkData(ChunkKey key) {
-        CompoundTag staged = PresyncStore.take(key);
-        if (staged != null) {
-            return CompletableFuture.completedFuture(Optional.of(staged));
-        }
         CompletableFuture<Optional<CompoundTag>> future = new CompletableFuture<>();
+        synchronized (lifecycleLock) {
+            if (transferred) {
+                return CompletableFuture.failedFuture(new ChunkLoadRetiredException());
+            }
+            if (shutdown) {
+                return CompletableFuture.failedFuture(new IllegalStateException("组运行时已关停"));
+            }
+            if (inSplitDrain(key) || retiringLoads.contains(key)) {
+                // 可能在 claim 完成和 thenCompose 发起拉取之间进入分离准备。
+                if (claimed.contains(key)) {
+                    retiringLoads.add(key);
+                    releaseWhenConfirmed(key, null);
+                }
+                return CompletableFuture.failedFuture(splitLoadCancelled());
+            }
+            CompoundTag staged = PresyncStore.take(key);
+            if (staged != null) {
+                return CompletableFuture.completedFuture(Optional.of(staged));
+            }
+            pendingFetches.put(future, key);
+        }
+        future.whenComplete((result, error) -> pendingFetches.remove(future));
         attemptFetch(key, future, 0);
         return future;
     }
@@ -476,30 +688,47 @@ public final class ChunkClaimClient {
     /** 发起一次数据拉取；失败按次数决定快/慢重试。 */
     private void attemptFetch(ChunkKey key, CompletableFuture<Optional<CompoundTag>> future,
                               int attempt) {
-        if (shutdown) {
-            future.completeExceptionally(new IllegalStateException("组运行时已关停"));
-            return;
-        }
         JsonObject req = new JsonObject();
         req.addProperty("dimension", key.dimension());
         req.addProperty("x", key.x());
         req.addProperty("z", key.z());
-        conn.request(ControlMessage.of(MessageType.CHUNK_DATA_REQUEST, req))
-                .whenCompleteAsync((resp, err) -> {
+        CompletableFuture<ControlMessage> response;
+        synchronized (lifecycleLock) {
+            if (future.isDone()) return;
+            if (!pendingFetches.containsKey(future)) {
+                future.completeExceptionally(splitLoadCancelled());
+                return;
+            }
+            if (shutdown) {
+                future.completeExceptionally(transferred ? new ChunkLoadRetiredException()
+                        : new IllegalStateException("组运行时已关停"));
+                return;
+            }
+            try {
+                // 与退休共享临界区，保证退休返回后不会再开始新的 NBT 请求。
+                response = Objects.requireNonNull(conn.request(
+                        ControlMessage.of(MessageType.CHUNK_DATA_REQUEST, req)), "请求 future");
+            } catch (RuntimeException failure) {
+                response = CompletableFuture.failedFuture(failure);
+            }
+        }
+        response.whenCompleteAsync((resp, err) -> {
+                    if (future.isDone()) return;
                     if (shutdown) {
-                        future.completeExceptionally(new IllegalStateException("组运行时已关停"));
+                        future.completeExceptionally(transferred ? new ChunkLoadRetiredException()
+                                : new IllegalStateException("组运行时已关停"));
                         return;
                     }
                     if (resp != null && resp.type() == MessageType.CHUNK_DATA) {
                         try {
                             if (!JsonUtil.getBoolean(resp.json(), "exists", false)) {
-                                future.complete(Optional.empty()); // 服务端确认无数据 → 种子生成
+                                completeFetch(future, Optional.empty()); // 服务端确认无数据 → 种子生成
                                 return;
                             }
                             CompoundTag tag = NbtIo.readCompressed(
                                     new ByteArrayInputStream(resp.binary()),
                                     NbtAccounter.create(MAX_CHUNK_NBT_BYTES));
-                            future.complete(Optional.of(tag));
+                            completeFetch(future, Optional.of(tag));
                             return;
                         } catch (Exception e) {
                             LOGGER.warn("区块数据解析失败，重试: {}", key.asString(), e);
@@ -512,6 +741,17 @@ public final class ChunkClaimClient {
                     ThreadPools.scheduler().schedule(
                             () -> attemptFetch(key, future, attempt + 1), delay, TimeUnit.SECONDS);
                 }, ThreadPools.io()); // NBT 解压是重活，别占 Netty 事件循环
+    }
+
+    /** 解压可与 COMMIT 并行；交付结果时再验证代次，不能以迟到 NBT 恢复旧加载。 */
+    private void completeFetch(CompletableFuture<Optional<CompoundTag>> future,
+                               Optional<CompoundTag> result) {
+        synchronized (lifecycleLock) {
+            if (transferred) future.completeExceptionally(new ChunkLoadRetiredException());
+            else if (shutdown) future.completeExceptionally(new IllegalStateException("组运行时已关停"));
+            else if (!pendingFetches.containsKey(future)) future.completeExceptionally(splitLoadCancelled());
+            else future.complete(result);
+        }
     }
 
     // ------------------------------------------------------------ 释放
@@ -576,8 +816,13 @@ public final class ChunkClaimClient {
         req.addProperty("releaseId", operation.releaseId().toString());
         CompletableFuture<ControlMessage> responseFuture;
         try {
-            responseFuture = conn.request(ControlMessage.of(
-                    MessageType.CHUNK_RELEASE, req, operation.gzipNbt()));
+            synchronized (lifecycleLock) {
+                // 压缩/构造请求期间可能已提交迁移；在真实发送点再次线性化检查，
+                // 避免退休后继续向物理服释放已经属于新主的 key。
+                if (shutdown || releases.get(key) != operation) return;
+                responseFuture = conn.request(ControlMessage.of(
+                        MessageType.CHUNK_RELEASE, req, operation.gzipNbt()));
+            }
             if (responseFuture == null) {
                 throw new IllegalStateException("控制连接返回 null future");
             }
@@ -629,6 +874,7 @@ public final class ChunkClaimClient {
                 // 先在同一临界区摘除 claim 与基线，再完成 future；任何后续上传都会看到
                 // “已释放”并被过滤，迟到的 markServerDataKnown 也只能 replace 现有项。
                 claimed.remove(key);
+                retiringLoads.remove(key);
                 serverDataKnown.remove(key);
             }
         }
@@ -762,21 +1008,27 @@ public final class ChunkClaimClient {
     public void shutdown() {
         Map<ChunkKey, ClaimOperation> pendingClaims;
         Map<ChunkKey, ReleaseOperation> activeReleases;
+        List<CompletableFuture<Optional<CompoundTag>>> fetches;
         synchronized (lifecycleLock) {
             shutdown = true;
             exitPreparing = true;
             exitFrozen = true;
             pendingClaims = new java.util.HashMap<>(pending);
             pending.clear();
+            fetches = new ArrayList<>(pendingFetches.keySet());
+            pendingFetches.clear();
             activeReleases = new java.util.HashMap<>(releases);
             releases.clear();
             claimed.clear();
+            retiringLoads.clear();
             serverDataKnown.clear();
             denials.clear();
         }
         pendingClaims.values().forEach(operation -> operation.future.completeExceptionally(
                 new IllegalStateException("组运行时已关停")));
         activeReleases.values().forEach(operation -> operation.future().completeExceptionally(
+                new IllegalStateException("组运行时已关停")));
+        fetches.forEach(future -> future.completeExceptionally(
                 new IllegalStateException("组运行时已关停")));
     }
 }

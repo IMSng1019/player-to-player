@@ -18,6 +18,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.UUID;
 
 /**
  * 组客户端的集成服务端事件钩子（Phase 2，src/main —— 集成服务端类在 common 侧
@@ -74,11 +75,12 @@ public final class GroupServerHooks {
         // 玩家加入被接管的组世界（房主本地进入 / 副客户端经隧道进入）：① 按服务端下发的
         // ops 名单落权（名单常在角色指派阶段就到了，JOIN 是补落点）；② 补投切换窗口
         // （合并让出/退出事务）内暂存的指令回执 —— 那时集成服已不可用，回执投不出去；
-        // ③ 记录真实登录锚点（P0-4）：此刻 playerdata 已读取、addNewPlayer 已完成，
+        // ③ 记录真实登录锚点（P0-4）：此刻 playerdata 已读取，但玩家尚未登记进PlayerList，
         //    坐标就是权威位置，用于回归验收"不再从共享出生点开始申请"。
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
             if (GroupRuntime.isManagedServer(server)) {
-                LocalPermissions.applyScheduled(server);
+                // JOIN 尚未把玩家放入 PlayerList；直接给事件对象落权，并登记下一 tick 核验。
+                LocalPermissions.applyJoiningPlayer(server, handler.player);
                 CommandRelayClient.flushPendingFeedback(handler.player);
                 logLoginAnchor(handler.player);
             }
@@ -87,6 +89,9 @@ public final class GroupServerHooks {
         // 登录在 JOIN 前失败/断线：结束窗口，避免看门狗把后续正常加载当成登录同步等待
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
             if (GroupRuntime.isManagedServer(server) && handler.player != null) {
+                // Fabric DISCONNECT持有尚可序列化的玩家实体；先保存离组最终态，再清实例权限。
+                SplitMonitor.onPlayerDisconnect(server, handler.player);
+                LocalPermissions.onPlayerDisconnect(handler.player);
                 LoginLoadGuard.endLogin(handler.player.getUUID(), "DISCONNECT");
             }
         });
@@ -124,7 +129,10 @@ public final class GroupServerHooks {
                     () -> GroupRuntime.captureChunkSnapshot(level, chunk));
         });
 
-        ServerTickEvents.END_SERVER_TICK.register(GroupServerHooks::reportPositions);
+        ServerTickEvents.END_SERVER_TICK.register(server -> {
+            LocalPermissions.onServerTick(server);
+            reportPositions(server);
+        });
 
         LOGGER.info("组客户端事件钩子已注册");
     }
@@ -132,8 +140,8 @@ public final class GroupServerHooks {
     /**
      * JOIN 时记录真实登录锚点与首批区块申请（P0-4 验收证据）。
      * <p>
-     * 此时 {@code placeNewPlayer} 已执行完 {@code load(playerdata)} 与
-     * {@code addNewPlayer}，玩家坐标是权威位置；若日志里的 chunk 仍是世界共享出生点，
+     * 此时 {@code placeNewPlayer} 已执行完 {@code load(playerdata)}，
+     * 玩家坐标是权威位置；若日志里的 chunk 仍是世界共享出生点，
      * 说明登录锚点修复没有生效。{@code firstClaims} 由 {@link LoginLoadGuard}
      * 在构造器 → JOIN 窗口内收集（最多 20 个）。
      */
@@ -197,8 +205,11 @@ public final class GroupServerHooks {
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
             PlayerStateUploadService playerUploads = GroupRuntime.playerUploads();
             if (playerUploads != null && !GroupRuntime.isExitDraining()) {
-                playerUploads.offer(player.getUUID(),
-                        player.saveWithoutId(new CompoundTag()));
+                UUID canonical = LocalPermissions.canonicalMemberId(
+                        player.getUUID(), player.getGameProfile().getName());
+                if (canonical != null) {
+                    playerUploads.offer(canonical, player.saveWithoutId(new CompoundTag()));
+                }
             }
             JsonObject json = new JsonObject();
             json.addProperty("uuid", player.getUUID().toString());

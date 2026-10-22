@@ -65,12 +65,13 @@ public final class EnvironmentPathPolicy {
 
     /**
      * 判断相对路径是否属于环境文件。排除项既匹配自身，也匹配其全部子路径；
-     * 所有 {@code *.tmp} 文件一律排除，防止原子写中间文件进入清单或快照。
+     * 排除通用 {@code *.tmp} 和本模组实际使用的 {@code *.p2p-tmp}，防止
+     * 玩家状态原子替换的中间文件在扫描与复制之间消失，或触发无意义的环境更新。
      */
     public boolean includes(String relativePath) {
         String normalized = normalize(relativePath);
         String lower = normalized.toLowerCase(Locale.ROOT);
-        if (lower.isEmpty() || lower.endsWith(".tmp")) {
+        if (lower.isEmpty() || lower.endsWith(".tmp") || lower.endsWith(".p2p-tmp")) {
             return false;
         }
         for (String exclusion : exclusions) {

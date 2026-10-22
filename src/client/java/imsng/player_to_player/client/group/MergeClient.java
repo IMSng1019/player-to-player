@@ -188,8 +188,6 @@ public final class MergeClient {
             // 网络超时不能等同“服务端已取消”：提交结果未明确前保持冻结，防两端都写。
             merge.committed.join();
             merge.drained.join();
-            claims.forgetAllLocal();
-            GroupRuntime.suppressNextStopTeardown();
             NodeContext.get().setGroupId(merge.target);
             NodeContext.get().setClientRole(ClientRole.SECONDARY);
             GroupHost.reset();
@@ -277,6 +275,18 @@ public final class MergeClient {
         if (!merge.target.equals(group) || !merge.target.equals(primary)) return;
         merge.commitReceived = true;
         SwitchTelemetry.mark("ownership_committed");
+        if (merge.yielding) {
+            try {
+                // COMMIT 才是写权限终止点。不能等成员排空，更不能等 SERVER_STOPPED
+                // 才终结旧 claim：Saving worlds 正在依赖这些加载 future 收束。
+                GroupRuntime.retireAfterTransfer(merge.source);
+            } catch (RuntimeException retirementFailure) {
+                merge.committed.completeExceptionally(retirementFailure);
+                LOGGER.error("合并 {} 已提交，但旧运行时退休失败；保持冻结避免旧主继续写入",
+                        merge.id, retirementFailure);
+                return;
+            }
+        }
         merge.committed.complete(null);
         if (merge.receiving) {
             NodeContext.get().setGroupId(group);

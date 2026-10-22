@@ -229,16 +229,15 @@ public enum MessageType {
      */
     MERGE_COMMIT(84),
     /**
-     * C→S 分离申请（json: groupId, departingClientId, chunks[]）：
-     * 主客户端检测到某副客户端渲染区域与组内其他成员无交集持续达标（规范"分离"）
-     * 后发出；服务端把 chunks[] 的占用从原组迁移到新组（departingClient 自立门户），
-     * 以 {@link #SPLIT_ACK} 应答。
+     * C→S v7两阶段分离（json: groupId, splitId, phase）：prepare额外携带
+     * departingClientIds[]、regions[]，只预约边界并通知成员断开；源端排空旧区块、
+     * 最终玩家数据确认后发commit。cancel安全回滚，status消除应答丢失的不确定性。
      */
     SPLIT_REQUEST(85),
-    /** S→C 分离确认（json: granted, newGroupId, migratedChunks）。 */
+    /** S→C 分离状态（json: granted, splitId, phase, newGroupId, newPrimaryClientId）。 */
     SPLIT_ACK(86),
     /**
-     * C→S 玩家数据上行（json: playerUuid, playerName；binary: gzip 玩家 NBT）。
+     * C→S 玩家数据上行（json: playerUuid, playerName, uploadSequence；binary: gzip 玩家 NBT）。
      * 分离前主客户端上传离组玩家的最终数据；合并/退出时亦可用（Phase 3/4 玩家数据
      * 上行的收口）。服务端写入世界 playerdata/&lt;uuid&gt;.dat ——
      * {@code RoleAssignHandler} 的存档定位与环境同步天然消费同一份数据。
@@ -309,7 +308,13 @@ public enum MessageType {
     /** S→C 权威归属已变化；仅提示重试，绝不代表区块已经授予。v6。 */
     CHUNK_OWNERSHIP_CHANGED(109),
     /** S→C 原组其余成员已执行编排性断开，原主可以关闭旧 LAN。v6。 */
-    MERGE_DRAINED(110);
+    MERGE_DRAINED(110),
+    /** v7：离组成员先断开旧游戏连接，控制连接保留，等待旧区域耐久卸载。 */
+    SPLIT_PREPARE(111),
+    /** v7：源主取消分离准备；只有源排空/恢复屏障后才允许成员回原组。 */
+    SPLIT_ABORT(112),
+    /** v7：交接超时/源离线，离组端结束等待并显示明确错误，不能私自恢复旧写者。 */
+    SPLIT_FAILED(113);
 
     private final int id;
 

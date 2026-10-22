@@ -14,8 +14,9 @@ import org.slf4j.LoggerFactory;
  * 服务端侧端口同步（MC 自定义通道 {@code player_to_player:server_ports}）。
  * <p>
  * <b>触发时机</b>：{@link ServerPlayConnectionEvents#JOIN}，即玩家完成登录、
- * 进入 play 状态时。端口包排在 JoinGame 之后入队，客户端必然先触发自己的 JOIN
- * （{@code WorldSession.onJoin} 在这里开启等待），再处理端口包。
+ * 进入 play 状态时。端口包排在 JoinGame 之后入队，但 Fabric 的 legacy 接收器
+ * 可直接在客户端 Netty 线程执行，因此不能假设客户端 render 线程已触发 JOIN。
+ * 客户端在 play INIT 建立连接归属，并保留同连接在 JOIN 前收到的端口快照。
  * <p>
  * 这里<b>不</b>要求客户端先发送频道注册包：Fabric 的
  * {@code ServerPlayNetworking.send} 不检查 {@code canSend}，客户端按包 ID 直接

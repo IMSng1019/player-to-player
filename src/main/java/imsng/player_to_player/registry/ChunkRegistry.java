@@ -107,6 +107,10 @@ public final class ChunkRegistry {
     /** 仅发布已经耐久完成的释放/迁移事实；监听器不参与所有权判定或持久化成功条件。 */
     private volatile Consumer<UUID> ownershipChangeListener;
 
+    /** 分离期间仅预约空间，不改写现有 owner；源仍可完成最终写回与正常释放。 */
+    private record SplitReservation(UUID source, List<SplitRegion> regions) { }
+    private final Map<UUID, SplitReservation> splitReservations = new HashMap<>();
+
     public ChunkRegistry(RegistryStore store, RegionFileProbe probe) {
         this(store, probe, RegistryMutationJournal.disabled());
     }
@@ -139,6 +143,59 @@ public final class ChunkRegistry {
 
     // ------------------------------------------------------------ 申请与释放
 
+    public boolean reserveSplit(UUID splitId, UUID source, List<SplitRegion> regions) {
+        if (splitId == null || source == null || regions == null
+                || regions.isEmpty() || regions.size() > 64) return false;
+        List<SplitRegion> immutable = List.copyOf(regions);
+        synchronized (claimLock) {
+            if (exitFrozenGroups.contains(source)) return false;
+            SplitReservation previous = splitReservations.get(splitId);
+            if (previous != null) {
+                return previous.source().equals(source) && previous.regions().equals(immutable);
+            }
+            for (SplitReservation other : splitReservations.values()) {
+                if (other.source().equals(source) || immutable.stream().anyMatch(region ->
+                        other.regions().stream().anyMatch(region::overlaps))) return false;
+            }
+            // 预约不能侵入其他组正在使用的区块。先保持原组，交由正常合并解决冲突。
+            for (var entry : claims.entrySet()) {
+                if (!source.equals(entry.getValue().groupId())
+                        && immutable.stream().anyMatch(region -> region.protects(entry.getKey()))) {
+                    return false;
+                }
+            }
+            splitReservations.put(splitId, new SplitReservation(source, immutable));
+            return true;
+        }
+    }
+
+    /**
+     * 源端确认旧 holder 已卸载后，物理服仍在同一把 claim 锁下复核区域为空。
+     * 组表提交成功才撤销预约；任何失败都保留屏障，不提前允许新写者进入。
+     */
+    public boolean finishSplit(UUID splitId, UUID source, Runnable commitGroups) {
+        synchronized (claimLock) {
+            SplitReservation reservation = splitReservations.get(splitId);
+            if (reservation == null || !reservation.source().equals(source)) return false;
+            if (claims.keySet().stream().anyMatch(key -> reservation.regions().stream()
+                    .anyMatch(region -> region.protects(key)))) return false;
+            commitGroups.run();
+            splitReservations.remove(splitId);
+        }
+        notifyOwnershipChanged(source);
+        return true;
+    }
+
+    public boolean cancelSplit(UUID splitId, UUID source) {
+        synchronized (claimLock) {
+            SplitReservation reservation = splitReservations.get(splitId);
+            if (reservation == null || !reservation.source().equals(source)) return false;
+            splitReservations.remove(splitId);
+        }
+        notifyOwnershipChanged(source);
+        return true;
+    }
+
     /**
      * 申请加载区块：原子检查 目标 + 四邻 是否被其他组占用，全部空闲（或属本组）
      * 才授予（只登记目标区块本身；缓冲层不登记 —— 邻块仍可被本组后续申请）。
@@ -147,6 +204,16 @@ public final class ChunkRegistry {
         synchronized (claimLock) {
             if (exitFrozenGroups.contains(groupId)) {
                 return ClaimResult.rejected(key, groupId);
+            }
+            ClaimInfo currentOwner = claims.get(key);
+            // 旧 grant ACK 可能丢失：源端需要用幂等重试确认仍持有的占用，
+            // 然后才能提交无实体化区块的取消释放。预约只拒绝新增占用。
+            if (currentOwner == null || !groupId.equals(currentOwner.groupId())) {
+                for (SplitReservation reservation : splitReservations.values()) {
+                    if (reservation.regions().stream().anyMatch(region -> region.protects(key))) {
+                        return ClaimResult.rejected(key, reservation.source());
+                    }
+                }
             }
             ClaimResult blocked = checkBlockedLocked(key, groupId);
             if (blocked != null) {

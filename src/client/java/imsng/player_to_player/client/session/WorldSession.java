@@ -114,6 +114,85 @@ public final class WorldSession {
 
     // ------------------------------------------------------------------ 加入
 
+    /** 分离等待只属于当前物理服会话；迟到通知不能把其他世界切走。 */
+    private static volatile UUID pendingSplit;
+    private static volatile long pendingSplitDeadline;
+
+    private static void handleSplitPrepare(ControlConnection conn, ControlMessage message) {
+        if (!isCurrentConnection(conn)) return;
+        UUID id;
+        UUID source;
+        try {
+            id = UUID.fromString(JsonUtil.getString(message.json(), "splitId", ""));
+            source = UUID.fromString(JsonUtil.getString(message.json(), "groupId", ""));
+        } catch (IllegalArgumentException invalid) { return; }
+        Minecraft client = Minecraft.getInstance();
+        client.execute(() -> {
+            NodeContext context = NodeContext.get();
+            if (!isCurrentConnection(conn) || context.clientRole() != ClientRole.SECONDARY
+                    || !source.equals(context.groupId()) || id.equals(pendingSplit)) return;
+            pendingSplit = id;
+            pendingSplitDeadline = System.currentTimeMillis() + 180_000;
+            SwitchTelemetry.begin("split", id.toString());
+            // 全体离组成员都先关闭旧游戏连接（包括尚未指定的新副客户端），
+            // 这样原组的 PLAYER 票据才能撤销，避免等待新主就绪的循环依赖。
+            if (client.level != null) {
+                WorldSwitcher.markSwitching();
+                client.level.disconnect();
+                client.disconnect();
+            }
+            client.setScreen(new JoinProgressScreen());
+        });
+    }
+
+    /** 即使控制连接或服务端通知丢失，等待界面也有明确失败终点。 */
+    static void tickPendingSplit(Minecraft client) {
+        if (pendingSplit != null && System.currentTimeMillis() > pendingSplitDeadline) {
+            transitionFailed(null, "等待组世界交接超时，请稍后重新连接。");
+        }
+    }
+
+    public static void cancelWaiting() {
+        Minecraft client = Minecraft.getInstance();
+        pendingSplit = null;
+        teardownSession();
+        if (client.level != null) {
+            client.level.disconnect();
+            client.disconnect();
+        }
+        client.setScreen(new net.minecraft.client.gui.screens.TitleScreen());
+    }
+
+    /** 失败仅结束本客户端会话，不在提交结果不明时恢复旧世界写者。 */
+    public static void transitionFailed(ControlConnection conn, String reason) {
+        transitionFailed(conn, reason, generation);
+    }
+
+    /** 把失败绑定到发起操作的会话代数，排队期间重连也不得关闭新会话。 */
+    private static void transitionFailed(ControlConnection conn, String reason, long expectedGeneration) {
+        Minecraft client = Minecraft.getInstance();
+        client.execute(() -> {
+            if (expectedGeneration != generation) return;
+            if (conn != null && !isCurrentConnection(conn)) return;
+            // 已经进入目标世界后不接受迟到准备错误；实际断开错误由原版网络界面呈现。
+            ServerData currentServer = client.getCurrentServer();
+            boolean inGroupWorld = client.isLocalServer() || (currentServer != null
+                    && WorldSwitcher.isTunnelAddress(currentServer.ip));
+            if (client.level != null && inGroupWorld
+                    && !(client.screen instanceof JoinProgressScreen)) return;
+            pendingSplit = null;
+            teardownSession();
+            if (client.level != null) {
+                client.level.disconnect();
+                client.disconnect();
+            }
+            client.setScreen(new net.minecraft.client.gui.screens.DisconnectedScreen(
+                    new net.minecraft.client.gui.screens.TitleScreen(),
+                    net.minecraft.network.chat.Component.literal("无法完成世界交接"),
+                    net.minecraft.network.chat.Component.literal(reason)));
+        });
+    }
+
     /** 加入世界（客户端主线程回调；立即转后台）。 */
     public static void onJoin(Minecraft client) {
         // 单人/本地联机世界没有 P2P 服务端可连，直接忽略。
@@ -121,7 +200,10 @@ public final class WorldSession {
         // 早在加入物理服务端时就建立了，切换期间被切换旗标保住，无需重建。
         ServerData serverData = client.getCurrentServer();
         if (serverData == null || client.isLocalServer()) {
-            if (GroupRuntime.isArmedOrActive()) SwitchTelemetry.joined();
+            if (GroupRuntime.isArmedOrActive()) {
+                pendingSplit = null;
+                SwitchTelemetry.joined();
+            }
             LOGGER.info("单人或本地联机世界，P2P 会话不启动");
             return;
         }
@@ -129,6 +211,7 @@ public final class WorldSession {
         // 副客户端经 127.0.0.1 隧道口连接主客户端（Phase 2）：这是组内连接，
         // 与物理服务端的会话仍然活跃，绝不能对隧道口再开一个会话
         if (WorldSwitcher.isTunnelAddress(rawAddress)) {
+            pendingSplit = null;
             SwitchTelemetry.joined();
             LOGGER.info("经 P2P 隧道加入主客户端组世界，物理服务端会话保持");
             return;
@@ -150,6 +233,7 @@ public final class WorldSession {
         }
         PortSyncClient.beginJoin();
         SwitchTelemetry.begin("join", Long.toString(myGeneration));
+        client.setScreen(new JoinProgressScreen());
         // 加入流程是一条长工作流（环境同步/角色申请/本地存档准备，含 .join() 等待 io 池上的
         // 子任务）：走专用阻塞线程，避免"池内任务等池内任务"占用名额（见 ThreadPools#startBlocking）
         ThreadPools.startBlocking("join-flow", () -> openSession(myGeneration, rawAddress, playerId, playerName));
@@ -183,6 +267,7 @@ public final class WorldSession {
      */
     public static void teardownSession() {
         SwitchTelemetry.finish("session_closed");
+        pendingSplit = null;
         ControlClient cc;
         synchronized (SESSION_LOCK) {
             generation++; // 使仍在后台跑的建连/重试流程过期
@@ -201,6 +286,9 @@ public final class WorldSession {
         // 阻塞 receive 的 io 线程、keepalive 定时任务在离开世界后全部残留，
         // 多次进出世界会持续累积泄漏（P2PChannel/RelayClient 的 close 均幂等，重复关闭安全）
         GroupHost.reset(); // 先撤掉宿主接待面，防止 teardown 期间再接入新隧道
+        // 宿主实例重启保留提前收到的权限，但真正离开物理服会话必须清空，
+        // 包括一直作为副客户端、从未启动本地集成服的情况。
+        LocalPermissions.reset();
         P2PSessions.closeAll();
         RelayConnector.closeAll();
         MergeClient.reset(); // 合并触发面/预同步暂存不得跨会话残留
@@ -304,6 +392,8 @@ public final class WorldSession {
             if (!JsonUtil.getBoolean(ackJson, "accepted", false)) {
                 LOGGER.warn("服务端拒绝握手: {}", JsonUtil.getString(ackJson, "reason", "未知原因"));
                 closeLocalConnection(cc);
+                transitionFailed(null,
+                        "服务端拒绝连接：" + JsonUtil.getString(ackJson, "reason", "请检查两端版本与配置"), myGeneration);
                 return;
             }
             String worldName = JsonUtil.getString(ackJson, "worldName", "world");
@@ -357,6 +447,19 @@ public final class WorldSession {
             // 在连接层被 pending future 消费，永远不进处理器分发）
             cc.on(MessageType.ROLE_ASSIGN, (c, m) ->
                     handleUnsolicitedRoleAssign(conn, worldFolder, worldName, m));
+            cc.on(MessageType.SPLIT_PREPARE, (c, m) -> handleSplitPrepare(conn, m));
+            cc.on(MessageType.SPLIT_ABORT, (c, m) -> {
+                if (!isCurrentConnection(conn)) return;
+                try { imsng.player_to_player.group.SplitMonitor.requestCancel(
+                        UUID.fromString(JsonUtil.getString(m.json(), "splitId", ""))); }
+                catch (IllegalArgumentException ignored) { }
+            });
+            cc.on(MessageType.SPLIT_FAILED, (c, m) -> {
+                if (!isCurrentConnection(conn) || pendingSplit == null) return;
+                String id = JsonUtil.getString(m.json(), "splitId", "");
+                if (!id.isEmpty() && !pendingSplit.toString().equals(id)) return;
+                transitionFailed(conn, JsonUtil.getString(m.json(), "message", "分离交接失败"));
+            });
             String relayAddress = JsonUtil.getString(ackJson, "relayAddress", "");
             int relayPort = JsonUtil.getInt(ackJson, "relayPort", 0);
             // relayAddress 空串 = 服务端兼任中转：复用已知可达的服务端主机
@@ -374,6 +477,7 @@ public final class WorldSession {
             boolean synced = syncEnvironmentsWithRetry(conn, config, paths, worldFolder,
                     worldConfig, envHash, envReady, myGeneration, relayAddress, relayPort);
             if (!synced || myGeneration != generation) {
+                if (myGeneration == generation) transitionFailed(conn, "世界环境同步未完成，请检查日志后重试。");
                 return;
             }
 
@@ -385,6 +489,7 @@ public final class WorldSession {
             // 新会话的 controlClient（新会话自建实例），关闭不会误伤新会话；
             // 未过期时摘除发布引用再关闭，避免半初始化连接悬挂
             closeLocalConnection(cc);
+            transitionFailed(null, "连接或准备组世界失败，请检查日志后重试。", myGeneration);
         }
     }
 
@@ -554,9 +659,32 @@ public final class WorldSession {
      */
     private static void handleUnsolicitedRoleAssign(ControlConnection conn, Path worldFolder,
                                                     String worldName, ControlMessage msg) {
+        if (!isCurrentConnection(conn)) return;
         String role = JsonUtil.getString(msg.json(), "role", "");
+        if ("secondary".equals(role)) {
+            UUID primary;
+            UUID assignedGroup;
+            try {
+                primary = UUID.fromString(JsonUtil.getString(msg.json(), "primaryClientId", ""));
+                assignedGroup = UUID.fromString(JsonUtil.getString(msg.json(), "groupId", ""));
+            } catch (IllegalArgumentException invalid) { return; }
+            ThreadPools.startBlocking("split-follow", () -> {
+                try {
+                    if (!isCurrentConnection(conn)) return;
+                    NodeContext context = NodeContext.get();
+                    context.setGroupId(assignedGroup);
+                    context.setClientRole(ClientRole.SECONDARY);
+                    var prepared = SecondaryJoiner.prepare(conn, primary, UUID.randomUUID());
+                    SecondaryJoiner.activate(Minecraft.getInstance(), conn, primary, prepared, () -> { });
+                } catch (Exception failure) {
+                    LOGGER.error("分离副客户端连接失败", failure);
+                    transitionFailed(conn, "无法连接组内主客户端，请稍后重新连接。");
+                }
+            });
+            return;
+        }
         if (!"primary".equals(role)) {
-            return; // 主动推送目前只有"晋升为主"一种（降级走 MERGE_COMMIT）
+            return;
         }
         NodeContext ctx = NodeContext.get();
         if (ctx.clientRole() == ClientRole.PRIMARY) {
@@ -573,6 +701,7 @@ public final class WorldSession {
                 SwitchTelemetry.begin("split", groupId.toString());
                 LocalWorldLauncher.PreparedWorld prepared = prepareAuthoritativeWorld(
                         conn, worldFolder, worldName);
+                if (!isCurrentConnection(conn)) return;
                 ctx.setGroupId(groupId);
                 ctx.setClientRole(ClientRole.PRIMARY);
                 LOGGER.info("收到分离晋升指派: 本端成为组 {} 的主客户端，切换到本地组世界",
@@ -580,8 +709,8 @@ public final class WorldSession {
                 LocalWorldLauncher.launchPrepared(
                         Minecraft.getInstance(), conn, prepared, groupId);
             } catch (Exception e) {
-                LOGGER.error("分离晋升前准备权威玩家状态失败，保留当前世界连接", e);
-                showPrimarySwitchCancelled();
+                LOGGER.error("分离晋升前准备权威玩家状态失败", e);
+                transitionFailed(conn, "准备分离后的世界失败，请检查日志后重新连接。");
             }
         });
     }
@@ -605,8 +734,8 @@ public final class WorldSession {
      *   <li>primary → {@link LocalWorldLauncher}：构建本地存档并打开（集成服务端接管）；</li>
      *   <li>secondary → {@link SecondaryJoiner}：P2P 连接主客户端，经隧道加入其世界。</li>
      * </ul>
-     * 失败语义：任何失败只记日志，玩家留在物理服务端的（挂起演算的）世界里，
-     * 控制连接保持，重进世界可重试。
+     * 失败时结束当前准备会话并显示原因，避免永久停留在准备界面；
+     * 过期会话的失败不得影响新连接。
      */
     private static void requestRoleAndSwitch(ControlConnection conn, Path worldFolder,
                                              String worldName, long myGeneration) {
@@ -616,10 +745,8 @@ public final class WorldSession {
             // 必须在 ROLE_REQUEST 前完成：失败时服务端尚未创建组，玩家仍留在物理服。
             prepared = prepareAuthoritativeWorld(conn, worldFolder, worldName);
         } catch (Exception e) {
-            ctx.setGroupId(null);
-            ctx.setClientRole(ClientRole.UNASSIGNED);
             LOGGER.error("主客户端切换前无法取得或准备物理服务器权威玩家状态", e);
-            showPrimarySwitchCancelled();
+            transitionFailed(conn, "无法取得或准备服务器玩家状态，请稍后重新连接。", myGeneration);
             return;
         }
         if (myGeneration != generation) {
@@ -632,6 +759,7 @@ public final class WorldSession {
                     .get(Protocol.REQUEST_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
             if (assign.type() != MessageType.ROLE_ASSIGN) {
                 LOGGER.warn("角色申请被服务端拒绝: {}", assign.json());
+                transitionFailed(conn, "服务端拒绝角色分配，请检查日志后重新连接。", myGeneration);
                 return;
             }
             String role = JsonUtil.getString(assign.json(), "role", "");
@@ -656,23 +784,12 @@ public final class WorldSession {
                             groupId, primaryId);
                     SecondaryJoiner.join(minecraft, conn, primaryId);
                 }
-                default -> LOGGER.warn("未知角色指派: {}", role);
+                default -> transitionFailed(conn, "服务端返回未知角色，请确认各端版本一致。", myGeneration);
             }
         } catch (Exception e) {
-            LOGGER.error("角色申请失败（玩家留在物理服务端世界，重进可重试）", e);
+            LOGGER.error("角色申请失败", e);
+            transitionFailed(conn, "角色分配或组世界启动失败，请检查日志后重新连接。", myGeneration);
         }
-    }
-
-    /** 在客户端主线程提示失败；玩家已离开世界时 player 为 null，静默跳过即可。 */
-    private static void showPrimarySwitchCancelled() {
-        Minecraft minecraft = Minecraft.getInstance();
-        minecraft.execute(() -> {
-            if (minecraft.player != null) {
-                minecraft.player.displayClientMessage(Component.literal(
-                        "无法取得或准备物理服务器玩家状态，已取消主客户端切换，请稍后重新进入服务器"),
-                        false);
-            }
-        });
     }
 
     // ------------------------------------------------------------------ 工具

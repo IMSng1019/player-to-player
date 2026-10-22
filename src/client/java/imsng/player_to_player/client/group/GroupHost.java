@@ -220,7 +220,7 @@ public final class GroupHost {
         // 组世界可用后立刻按服务端下发的 ops 名单落权：本地权限位决定 F3+F4 的游戏模式
         // 切换、指令补全树与未被拦截的执行路径（告示牌/命令方块/第三方程序化调用）。
         // publishServer 内部已按"未开作弊"把本地玩家权限置 0，这里按真实等级纠正。
-        LocalPermissions.applyScheduled(server);
+        LocalPermissions.refreshScheduled(server);
         LOGGER.info("集成服务端已发布 LAN 端口 {}，等待副客户端经隧道加入", port);
         notifyGroupWorldReady();
     }
@@ -250,8 +250,9 @@ public final class GroupHost {
         // 先关闭端口可见性，再摘监听器；已提交到 IO 线程的旧回调也会读到 0 并拒绝桥接。
         lanPort = 0;
         HOST_LISTENER_REGISTRATION.clear();
-        // 权限名单不跨世界会话残留（集成服务端实例本身已随停服销毁，这里只清缓存）
-        LocalPermissions.reset();
+        // reset 同时用于宿主启动/角色切换，不能清掉比集成服更早到达的权威名单。
+        // 真正离开物理服务端的全量清理由 WorldSession 负责。
+        LocalPermissions.resetRuntime();
     }
 
     /** 接待一条新入站 P2P 会话（专用接待池线程，可阻塞）。名额在入口处已取得。 */

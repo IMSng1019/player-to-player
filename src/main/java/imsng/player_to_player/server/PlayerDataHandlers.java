@@ -7,6 +7,7 @@ import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.HandlerRegistry;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.util.JsonUtil;
+import imsng.player_to_player.util.Sha256;
 import imsng.player_to_player.util.ThreadPools;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.MinecraftServer;
@@ -23,7 +24,7 @@ import java.util.UUID;
  * 玩家数据面处理器（服务端，Phase 3；Phase 2 已知边界"玩家背包……不回传物理
  * 服务端"的收口）。
  * <ul>
- *   <li>{@link MessageType#PLAYER_DATA_UPLOAD}（json: playerUuid；binary: gzip
+ *   <li>{@link MessageType#PLAYER_DATA_UPLOAD}（json: playerUuid, uploadSequence；binary: gzip
  *       玩家 NBT）：合并让出方 / 分离原主上传玩家的最终数据，写入服务端存档
  *       {@code playerdata/<uuid>.dat} —— {@code RoleAssignHandler} 的存档定位、
  *       之后的环境同步都天然消费同一份文件，玩家跨组迁移后位置/背包连续；</li>
@@ -31,8 +32,8 @@ import java.util.UUID;
  *       新主客户端拉取组成员的玩家数据（预同步/接管时初始化其集成服务端的
  *       playerdata）。</li>
  * </ul>
- * <b>授权口径</b>：上传/请求方必须是该玩家本人，或该玩家当前所在组的主客户端
- * （组表查询）——防任意客户端覆盖/窥探他人存档。
+ * <b>授权口径</b>：上传方必须是该玩家当前所在组的主客户端，并在实际写盘时重新核验。
+ * 请求读取仍允许本人或当前组主客户端，供进入世界前准备存档。
  * <p>
  * 线程模型：handler 在 Netty 事件循环；在线玩家快照必须在服务器主线程调用
  * {@link ServerPlayer#saveWithoutId}，离线磁盘读取与上传写盘转 {@link ThreadPools#io()}；
@@ -45,6 +46,7 @@ public final class PlayerDataHandlers {
     private final MinecraftServer server;
     private final GroupTable groups;
     private final ExitTransactionHandlers exits;
+    private final PlayerUploadOrder uploadOrder = new PlayerUploadOrder();
 
     private PlayerDataHandlers(MinecraftServer server, GroupTable groups,
                                ExitTransactionHandlers exits) {
@@ -66,12 +68,13 @@ public final class PlayerDataHandlers {
     private void handleUpload(ControlConnection conn, ControlMessage msg) {
         UUID peer = conn.peerId();
         UUID playerId = parseUuid(JsonUtil.getString(msg.json(), "playerUuid", ""));
-        if (peer == null || playerId == null) {
-            conn.send(error(msg, "invalid_request", "playerUuid 缺失或未握手"));
+        long sequence = JsonUtil.getLong(msg.json(), "uploadSequence", 0);
+        if (peer == null || playerId == null || sequence <= 0) {
+            conn.send(error(msg, "invalid_request", "playerUuid/uploadSequence 缺失、非法或未握手"));
             return;
         }
-        if (!authorized(peer, playerId)) {
-            conn.send(error(msg, "not_authorized", "只能上传本人或本组成员的玩家数据"));
+        if (!PlayerUploadOrder.isAuthorized(groups, peer, playerId)) {
+            conn.send(error(msg, "not_authorized", "只有当前组主客户端可以上传玩家数据"));
             return;
         }
         byte[] gzipNbt = msg.binary();
@@ -82,18 +85,22 @@ public final class PlayerDataHandlers {
                     return;
                 }
                 Path dataDir = server.getWorldPath(LevelResource.PLAYER_DATA_DIR);
+                String digest = Sha256.hex(gzipNbt);
                 if (exits == null || !exits.writeRealtimeIfAllowed(conn,
-                        () -> PlayerDataFileStore.write(
-                                dataDir, playerId, gzipNbt))) {
+                        () -> PlayerDataFileStore.withPlayerWriteLock(playerId,
+                                () -> uploadOrder.write(conn, playerId, sequence, digest,
+                                        () -> PlayerUploadOrder.isAuthorized(groups, peer, playerId),
+                                        () -> PlayerDataFileStore.write(dataDir, playerId, gzipNbt))))) {
                     conn.send(error(msg, "invalid_data",
-                            "玩家数据校验、写回失败或退出已冻结"));
+                            "玩家上行已失去权限、序号冲突、写回失败或退出已冻结"));
                     return;
                 }
                 JsonObject out = new JsonObject();
                 out.addProperty("written", true);
+                out.addProperty("uploadSequence", sequence);
                 conn.send(msg.reply(MessageType.PLAYER_DATA, out, null));
-                LOGGER.info("玩家数据已写回: {} (上传方 {}, {} 字节压缩)",
-                        playerId, peer, gzipNbt.length);
+                LOGGER.info("玩家数据已确认: {} (上传方 {}, 序号 {}, {} 字节压缩)",
+                        playerId, peer, sequence, gzipNbt.length);
             } catch (Exception e) {
                 LOGGER.warn("玩家数据写回失败: {}", playerId, e);
                 conn.send(error(msg, "write_failed", e.toString()));

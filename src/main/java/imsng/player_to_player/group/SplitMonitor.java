@@ -7,24 +7,31 @@ import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.registry.ChunkKey;
+import imsng.player_to_player.registry.SplitRegion;
+import imsng.player_to_player.mixin.ChunkMapSplitAccess;
+import imsng.player_to_player.mixin.DistanceManagerAccess;
 import imsng.player_to_player.util.JsonUtil;
-import imsng.player_to_player.util.ThreadPools;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.Ticket;
+import net.minecraft.server.level.TicketType;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.chunk.ChunkStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.StringJoiner;
 import java.util.TreeSet;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * 分离监视器（Phase 3 单端分离，Phase 4 扩展为组分离；主客户端集成服务端侧）。
@@ -49,21 +56,17 @@ import java.util.UUID;
  * {@value #SPLIT_HOLD_MILLIS} ms 不变才触发（成员进出视为交集变化，计时归零），
  * 新组内的算力分配（选主）由服务端裁决（它握有算力表权威数据）。
  * <p>
- * 达标后的分离动作（io 线程）：
+ * 达标后的两阶段分离动作（主线程采样，网络请求异步）：
  * <ol>
- *   <li>上传每名离组玩家的最终数据（PLAYER_DATA_UPLOAD —— 新组的集成服务端经
- *       PLAYER_DATA_REQUEST 取回，位置/背包连续）；</li>
- *   <li>SPLIT_REQUEST（departingClientIds[] + 离组者渲染区内本组占用的区块）→
- *       服务端算力分配选主 + 组表分离 + 注册表定向迁移；新主直收
- *       ROLE_ASSIGN(primary)，其余成员的 ROLE_ASSIGN(secondary) 待新主
- *       GROUP_WORLD_READY 后冲刷（服务端 MergeCoordinator 暂存）；</li>
- *   <li>granted → 本地 {@link ChunkClaimClient#forgetLocal 摘除}已迁移区块 +
- *       {@link MergeTriggers#suppressFor 抑制}合并触发（防分离↔合并震荡）。</li>
+ *   <li>按实际已占用/未决区块构造完整加载岛；留组需求或特殊票据仍相连时延期；</li>
+ *   <li>prepare只预约边界，服务端通知所有离组成员断开游戏连接，控制连接仍保持；</li>
+ *   <li>DISCONNECT捕获最终玩家NBT并等待同一上行器的耐久确认；旧区块经过原版
+ *       卸载链逐块最终写回并释放，局部未决加载以UNLOADED收束；</li>
+ *   <li>确认玩家离线、所有权释放和旧holder移除后才commit；服务端此时改组并指派新主，
+ *       新主重新申请区块并读取最终数据，绝不在旧主仍演算时直接迁移注册表。</li>
  * </ol>
- * <b>Phase 3 简化（对规范"这 10s 期间副客户端进行预同步"）</b>：离组者的区块
- * 数据不走 P2P 预同步而由服务端供给 —— 主客户端的实时存盘上行保证服务端
- * 存档始终新鲜，离组者申请区块时从服务端拉取即可，数据一致性等价；代价是
- * 新主要经历一次本地世界加载（数秒），无缝接管留待影子实例成熟后收口。
+ * 本实现复用耐久写回与加载门控，因此会有明确的等待阶段；完整影子实例热备仍是
+ * 后续架构工作。超时不强制移交所有权，改走排空后回滚，避免旧副本继续写入。
  * <p>
  * 线程模型：{@link #tick} 在集成服务端主线程（GroupServerHooks 每秒驱动一次），
  * 只做矩形运算与计时；序列化在主线程（微秒级），上传/请求转 io 池。
@@ -78,14 +81,51 @@ public final class SplitMonitor {
     /** 膨胀边距（"周围4格的周围4格" = 四邻十字形扩张两次 = 曼哈顿距离 2）。 */
     private static final int MARGIN_CHUNKS = 2;
 
-    /** 分离执行后的合并触发抑制窗口（毫秒）。 */
-    private static final long MERGE_SUPPRESS_MILLIS = 30_000;
+    /** 源端准备过久时请求回滚；仍须排空旧holder后才能重连，服务端超时会展示明确失败界面。 */
+    private static final long DRAIN_TIMEOUT_MILLIS = 60_000;
 
     /** 候选计时：分量签名（成员 UUID 有序拼接）→ 首次检测到的时刻（仅主线程读写）。 */
     private static final Map<String, Long> candidates = new HashMap<>();
 
     /** 分离请求已在途的分量签名（防重复发送；主线程标记，io 完成后回主线程摘除）。 */
     private static final Set<String> inFlight = new HashSet<>();
+
+    /** 同一个宿主一次只处理一个分离事务，避免两个分量同时争用票据/所有权边界。 */
+    private static volatile SplitOperation activeSplit;
+
+    private static final class SplitOperation {
+        final UUID splitId = UUID.randomUUID();
+        final MinecraftServer server;
+        final ControlConnection connection;
+        final ChunkClaimClient claims;
+        final UUID groupId;
+        final String signature;
+        final Map<UUID, ServerPlayer> departing;
+        final List<SplitRegion> regions;
+        final Map<UUID, CompletableFuture<Void>> finalUploads = new HashMap<>();
+        final long started = System.currentTimeMillis();
+        volatile boolean cancelRequested;
+        boolean prepared;
+        boolean requestInFlight;
+        boolean resolveStatus;
+        long nextRequestAt;
+        long nextProgressAt;
+
+        SplitOperation(MinecraftServer server, ControlConnection connection, ChunkClaimClient claims,
+                       UUID groupId, String signature, Map<UUID, ServerPlayer> departing,
+                       List<SplitRegion> regions) {
+            this.server = server;
+            this.connection = connection;
+            this.claims = claims;
+            this.groupId = groupId;
+            this.signature = signature;
+            this.departing = Map.copyOf(departing);
+            this.regions = List.copyOf(regions);
+        }
+
+        // 与服务端预约一致，包括四邻边界；否则边缘晚到claim会让服务端永远拒绝commit。
+        boolean contains(ChunkKey key) { return regions.stream().anyMatch(region -> region.protects(key)); }
+    }
 
     private SplitMonitor() {
     }
@@ -94,6 +134,7 @@ public final class SplitMonitor {
     public static void reset() {
         candidates.clear();
         inFlight.clear();
+        activeSplit = null;
     }
 
     /**
@@ -101,6 +142,10 @@ public final class SplitMonitor {
      * 调用方已确认 server 是被接管的集成服务端）。
      */
     public static void tick(MinecraftServer server) {
+        if (activeSplit != null) {
+            advanceSplit(server);
+            return;
+        }
         ChunkClaimClient claims = GroupRuntime.claims();
         ControlConnection conn = GroupRuntime.conn();
         UUID groupId = GroupRuntime.activeGroupId();
@@ -112,7 +157,11 @@ public final class SplitMonitor {
             candidates.clear(); // 只剩主客户端本人，无从分离
             return;
         }
-        UUID hostId = NodeContext.get().clientId(); // 主客户端玩家（其分量留守原组）
+        UUID hostId = NodeContext.get().clientId(); // 主客户端的控制协议档案身份
+        if (players.stream().anyMatch(player -> canonicalId(player) == null)) {
+            candidates.clear(); // 名单尚未到达：不能凭离线UUID把玩家分到错误组。
+            return;
+        }
         int viewDistance = server.getPlayerList().getViewDistance();
         long now = System.currentTimeMillis();
 
@@ -125,7 +174,7 @@ public final class SplitMonitor {
         // 主客户端所在分量留守；其余每个分量都是独立的离组候选
         Set<String> currentSignatures = new HashSet<>();
         for (List<ServerPlayer> component : components) {
-            if (component.stream().anyMatch(p -> p.getUUID().equals(hostId))) {
+            if (component.stream().anyMatch(p -> hostId.equals(canonicalId(p)))) {
                 continue;
             }
             String signature = signatureOf(component);
@@ -138,6 +187,7 @@ public final class SplitMonitor {
                 candidates.remove(signature);
                 inFlight.add(signature);
                 initiateSplit(server, conn, claims, groupId, signature, component, viewDistance);
+                if (activeSplit != null) break;
             }
         }
         // 成员构成变化 / 分量消失：对应计时归零
@@ -217,87 +267,249 @@ public final class SplitMonitor {
 
     // ------------------------------------------------------------ 执行
 
-    /** 一名离组成员的主线程快照（NBT 生成后不可变，跨线程只读安全）。 */
-    private record DepartingSnapshot(UUID playerId, String playerName, CompoundTag playerTag) {
-    }
-
-    /** 触发一次（组）分离（主线程：序列化玩家 NBT + 收集区块；网络转 io）。 */
+    /** 规划完整占用岛后预约，直到旧玩家、最终上行、claim和holder全部排空才允许提交。 */
     private static void initiateSplit(MinecraftServer server, ControlConnection conn,
                                       ChunkClaimClient claims, UUID groupId, String signature,
                                       List<ServerPlayer> component, int viewDistance) {
-        LOGGER.info("组分离触发: {} 名玩家的渲染区域与组 {} 其他成员无交集已持续 {}s",
-                component.size(), groupId, SPLIT_HOLD_MILLIS / 1000);
+        List<SplitRegion> departingDemand = new ArrayList<>();
+        List<SplitRegion> remainingDemand = new ArrayList<>();
+        Map<UUID, ServerPlayer> departing = new HashMap<>();
+        // 实际claim岛覆盖已发生的依赖，额外需求矩形覆盖准备消息在途时尚未补齐的世代边缘。
+        int radius = viewDistance + ChunkStatus.maxDistance() + 2;
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            SplitRegion demand = playerDemand(player, radius);
+            if (component.contains(player)) {
+                UUID id = canonicalId(player);
+                if (id == null) { inFlight.remove(signature); return; }
+                departing.put(id, player);
+                departingDemand.add(demand);
+            } else {
+                remainingDemand.add(demand);
+            }
+        }
+        java.util.Optional<List<SplitRegion>> planned;
+        try {
+            planned = SplitRegionPlan.plan(claims.trackedKeysSnapshot(), departingDemand,
+                    remainingDemand, specialTicketRegions(server));
+        } catch (IllegalArgumentException | IllegalStateException unsafeTickets) {
+            inFlight.remove(signature);
+            LOGGER.warn("分离延期：无法安全规划特殊票据范围: {}", unsafeTickets.toString());
+            return;
+        }
+        if (planned.isEmpty()) {
+            inFlight.remove(signature);
+            LOGGER.info("分离延期：完整加载岛仍与留组需求或特殊票据相连，保持当前组");
+            return;
+        }
+        SplitOperation operation = new SplitOperation(server, conn, claims, groupId,
+                signature, departing, planned.get());
+        // 必须在发prepare前登记：离组端收到服务端通知后可能比prepared应答更早断线。
+        activeSplit = operation;
+        LOGGER.info("分离开始准备: split={} 离组人数={} 完整区域={}",
+                operation.splitId, departing.size(), operation.regions);
+        sendPhase(operation, "prepare");
+    }
 
-        // 主线程序列化每名离组玩家的最终数据 + 收集渲染区内本组占用的区块并集
-        List<DepartingSnapshot> snapshots = new ArrayList<>(component.size());
-        Set<ChunkKey> migrating = new LinkedHashSet<>();
-        for (ServerPlayer player : component) {
-            snapshots.add(new DepartingSnapshot(player.getUUID(),
-                    player.getGameProfile().getName(),
-                    player.saveWithoutId(new CompoundTag())));
-            String dimension = player.serverLevel().dimension().location().toString();
-            int cx = player.chunkPosition().x;
-            int cz = player.chunkPosition().z;
-            for (int x = cx - viewDistance; x <= cx + viewDistance; x++) {
-                for (int z = cz - viewDistance; z <= cz + viewDistance; z++) {
-                    ChunkKey key = new ChunkKey(dimension, x, z);
-                    if (claims.isClaimed(key)) {
-                        migrating.add(key);
-                    }
+    private static UUID canonicalId(ServerPlayer player) {
+        return LocalPermissions.canonicalMemberId(player.getUUID(), player.getGameProfile().getName());
+    }
+
+    private static SplitRegion playerDemand(ServerPlayer player, int radius) {
+        ChunkPos pos = player.chunkPosition();
+        return new SplitRegion(player.serverLevel().dimension().location().toString(),
+                pos.x - radius, pos.x + radius, pos.z - radius, pos.z + radius);
+    }
+
+    /**
+     * 只放行PLAYER和加载管线自己的LIGHT/UNKNOWN短期票据。PORTAL、FORCED、DRAGON
+     * 以及任何模组自定义票据都保守视为独立加载需求，不能在没有迁移这些票据时拆走。
+     * 票据影响随距离递增；33为FULL门槛，另外加maxDistance覆盖世代依赖边缘。
+     */
+    private static List<SplitRegion> specialTicketRegions(MinecraftServer server) {
+        List<SplitRegion> result = new ArrayList<>();
+        for (ServerLevel level : server.getAllLevels()) {
+            var tickets = ((DistanceManagerAccess) level.getChunkSource().chunkMap
+                    .getDistanceManager()).player_to_player$tickets();
+            for (var entry : tickets.long2ObjectEntrySet()) {
+                for (Ticket<?> ticket : entry.getValue()) {
+                    TicketType<?> type = ticket.getType();
+                    if (type == TicketType.PLAYER || type == TicketType.LIGHT || type == TicketType.UNKNOWN) continue;
+                    ChunkPos pos = new ChunkPos(entry.getLongKey());
+                    int radius = Math.max(0, 33 - ticket.getTicketLevel()) + ChunkStatus.maxDistance() + 2;
+                    // 超大自定义票据保守保护整组，不尝试构造无界预约范围。
+                    if (radius > 128) throw new IllegalStateException("特殊票据影响范围过大，不能安全分离");
+                    result.add(new SplitRegion(level.dimension().location().toString(),
+                            pos.x - radius, pos.x + radius, pos.z - radius, pos.z + radius));
                 }
             }
         }
+        return result;
+    }
 
-        ThreadPools.io().execute(() -> {
-            try {
-                // 1. 逐人上传最终数据（新组的集成服务端从服务端取回）
-                for (DepartingSnapshot snapshot : snapshots) {
-                    byte[] gzip = ChunkUploadService.compress(snapshot.playerTag());
-                    if (gzip != null) {
-                        JsonObject up = new JsonObject();
-                        up.addProperty("playerUuid", snapshot.playerId().toString());
-                        up.addProperty("playerName", snapshot.playerName());
-                        conn.send(ControlMessage.of(MessageType.PLAYER_DATA_UPLOAD, up, gzip));
-                    }
-                }
-                // 2. 分离申请（多成员数组；服务端算力分配选新主）
-                JsonObject req = new JsonObject();
-                req.addProperty("groupId", groupId.toString());
-                JsonArray departingIds = new JsonArray();
-                for (DepartingSnapshot snapshot : snapshots) {
-                    departingIds.add(snapshot.playerId().toString());
-                }
-                req.add("departingClientIds", departingIds);
-                JsonArray chunks = new JsonArray();
-                for (ChunkKey key : migrating) {
-                    chunks.add(key.asString());
-                }
-                req.add("chunks", chunks);
-                ControlMessage ack = conn.request(
-                                ControlMessage.of(MessageType.SPLIT_REQUEST, req))
-                        .get(30, java.util.concurrent.TimeUnit.SECONDS);
-                boolean granted = ack.type() == MessageType.SPLIT_ACK
-                        && JsonUtil.getBoolean(ack.json(), "granted", false);
-                server.execute(() -> inFlight.remove(signature));
-                if (!granted) {
-                    LOGGER.warn("分离申请被拒: {} 名成员（保持现组）", snapshots.size());
-                    return;
-                }
-                // 3. 本地摘除已迁移区块 + 抑制合并触发（防震荡）。
-                //    离组玩家的隧道会随其客户端切换/重定向自然断开。
-                for (ChunkKey key : migrating) {
-                    claims.forgetLocal(key);
-                }
-                MergeTriggers.suppressFor(MERGE_SUPPRESS_MILLIS);
-                LOGGER.info("组分离完成: {} 名成员自立新组 {}（新主 {}，迁移 {} 个区块）",
-                        snapshots.size(),
-                        JsonUtil.getString(ack.json(), "newGroupId", "?"),
-                        JsonUtil.getString(ack.json(), "newPrimaryClientId", "?"),
-                        JsonUtil.getInt(ack.json(), "migratedChunks", 0));
-            } catch (Exception e) {
-                server.execute(() -> inFlight.remove(signature));
-                LOGGER.warn("分离流程失败（下轮检测重试）: {} 名成员", snapshots.size(), e);
+    /** DISCONNECT仍持有有效实体，在原版移除玩家前捕获真正最后的状态，而不是10秒前快照。 */
+    public static void onPlayerDisconnect(MinecraftServer server, ServerPlayer player) {
+        SplitOperation operation = activeSplit;
+        if (operation == null || operation.server != server) return;
+        for (Map.Entry<UUID, ServerPlayer> departing : operation.departing.entrySet()) {
+            if (departing.getValue() != player) continue;
+            PlayerStateUploadService uploads = GroupRuntime.playerUploads();
+            if (uploads == null) {
+                operation.cancelRequested = true;
+                return;
             }
+            ChunkKey location = new ChunkKey(player.serverLevel().dimension().location().toString(),
+                    player.chunkPosition().x, player.chunkPosition().z);
+            if (!operation.contains(location)) operation.cancelRequested = true;
+            try {
+                CompletableFuture<Void> saved = uploads.offerConfirmed(departing.getKey(),
+                        player.saveWithoutId(new CompoundTag()));
+                operation.finalUploads.put(departing.getKey(), saved);
+                saved.whenComplete((ignored, failure) -> {
+                    if (failure != null) operation.cancelRequested = true;
+                });
+            } catch (RuntimeException snapshotFailure) {
+                // 模组玩家NBT/执行器失败不能从DISCONNECT钩子抛出并打断原版移除玩家。
+                operation.cancelRequested = true;
+                LOGGER.error("离组最终玩家快照失败，分离转安全回滚: split={} 玩家={}",
+                        operation.splitId, departing.getKey(), snapshotFailure);
+            }
+            return;
+        }
+    }
+
+    /** 服务端超时只请求取消；在源holder排空前仍保留fence，不提前恢复旧写者。 */
+    public static void requestCancel(UUID splitId) {
+        SplitOperation operation = activeSplit;
+        if (operation != null && operation.splitId.equals(splitId)) operation.cancelRequested = true;
+    }
+
+    /** 主线程每秒推进，无主线程等待网络。网络失败转status，绝不把未知commit结果当作回滚。 */
+    private static void advanceSplit(MinecraftServer server) {
+        SplitOperation operation = activeSplit;
+        if (operation == null || operation.server != server) return;
+        long now = System.currentTimeMillis();
+        if (now - operation.started > DRAIN_TIMEOUT_MILLIS) operation.cancelRequested = true;
+        if (operation.requestInFlight || now < operation.nextRequestAt) return;
+        if (operation.resolveStatus) { sendPhase(operation, "status"); return; }
+        if (!operation.prepared) return;
+        boolean playersGone = server.getPlayerList().getPlayers().stream().noneMatch(player -> {
+            UUID id = canonicalId(player);
+            return operation.departing.containsValue(player)
+                    || (id != null && operation.departing.containsKey(id));
         });
+        boolean claimsGone = operation.claims.isSplitDrained();
+        boolean holdersGone = holdersDrained(operation);
+        boolean playersSaved = operation.finalUploads.size() == operation.departing.size()
+                && operation.finalUploads.values().stream()
+                .allMatch(future -> future.isDone() && !future.isCompletedExceptionally());
+        if (playersGone && claimsGone && holdersGone && (playersSaved || operation.cancelRequested)) {
+            // 回滚的ROLE_ASSIGN可能经另一条连接先于本端cancel ACK到达。只有旧holder已全清
+            // 才在发cancel前解除本地fence；服务端预约此刻仍阻止旧组提前重占，安全性不变。
+            if (operation.cancelRequested) operation.claims.cancelSplitDrain();
+            sendPhase(operation, operation.cancelRequested ? "cancel" : "commit");
+        } else if (now >= operation.nextProgressAt) {
+            operation.nextProgressAt = now + 5_000;
+            LOGGER.info("分离排空等待: split={} 玩家离线={} 最终玩家写回={} 占用释放={} 旧holder卸载={} 取消={}",
+                    operation.splitId, playersGone, playersSaved, claimsGone, holdersGone, operation.cancelRequested);
+        }
+    }
+
+    private static boolean holdersDrained(SplitOperation operation) {
+        for (ServerLevel level : operation.server.getAllLevels()) {
+            String dimension = level.dimension().location().toString();
+            ChunkMapSplitAccess chunks = (ChunkMapSplitAccess) level.getChunkSource().chunkMap;
+            for (var holder : chunks.player_to_player$updatingChunks().values()) {
+                ChunkPos pos = holder.getPos();
+                if (operation.contains(new ChunkKey(dimension, pos.x, pos.z))) return false;
+            }
+            for (var holder : chunks.player_to_player$pendingUnloads().values()) {
+                ChunkPos pos = holder.getPos();
+                if (operation.contains(new ChunkKey(dimension, pos.x, pos.z))) return false;
+            }
+        }
+        return true;
+    }
+
+    private static void sendPhase(SplitOperation operation, String phase) {
+        if (activeSplit != operation || operation.requestInFlight) return;
+        operation.requestInFlight = true;
+        JsonObject request = new JsonObject();
+        request.addProperty("phase", phase);
+        request.addProperty("splitId", operation.splitId.toString());
+        request.addProperty("groupId", operation.groupId.toString());
+        if ("prepare".equals(phase)) {
+            JsonArray members = new JsonArray();
+            operation.departing.keySet().forEach(id -> members.add(id.toString()));
+            request.add("departingClientIds", members);
+            JsonArray regions = new JsonArray();
+            operation.regions.forEach(region -> regions.add(region.toJson()));
+            request.add("regions", regions);
+        }
+        try {
+            operation.connection.request(ControlMessage.of(MessageType.SPLIT_REQUEST, request))
+                    .whenComplete((reply, failure) -> operation.server.execute(() ->
+                            receivePhase(operation, phase, reply, failure)));
+        } catch (RuntimeException failure) {
+            receivePhase(operation, phase, null, failure);
+        }
+    }
+
+    private static void receivePhase(SplitOperation operation, String sentPhase,
+                                     ControlMessage reply, Throwable failure) {
+        if (activeSplit != operation || !GroupRuntime.isManagedServer(operation.server)) return;
+        operation.requestInFlight = false;
+        if (reply != null && reply.type() == MessageType.ERROR) {
+            String code = JsonUtil.getString(reply.json(), "code", "?");
+            if (!operation.prepared && ("prepare".equals(sentPhase)
+                    || ("status".equals(sentPhase) && "unknown_split".equals(code)))) {
+                // 服务端明确拒绝prepare时未创建事务/暂停玩家，和网络超时的未知结果不同。
+                LOGGER.info("分离准备被拒，保持原组: split={} code={}", operation.splitId, code);
+                finishSplit(operation, false);
+                return;
+            }
+            if ("commit".equals(sentPhase)) {
+                // 有明确错误应答就没有提交；先回滚，不能把not_drained等错误当成功移交。
+                operation.cancelRequested = true;
+                operation.resolveStatus = false;
+                operation.nextRequestAt = System.currentTimeMillis() + 1_000;
+                LOGGER.warn("分离提交被拒，等待安全排空后回滚: split={} code={}", operation.splitId, code);
+                return;
+            }
+        }
+        if (failure != null || reply == null || reply.type() != MessageType.SPLIT_ACK) {
+            operation.resolveStatus = true;
+            operation.nextRequestAt = System.currentTimeMillis() + 2_000;
+            LOGGER.warn("分离{}结果未知，查询服务端事务状态而不提前解锁: split={}", sentPhase, operation.splitId);
+            return;
+        }
+        String phase = JsonUtil.getString(reply.json(), "phase", "");
+        operation.resolveStatus = false;
+        if ("committed".equals(phase)) {
+            finishSplit(operation, true);
+        } else if ("cancelled".equals(phase) || "rollback".equals(phase)
+                || (!JsonUtil.getBoolean(reply.json(), "granted", false) && "prepare".equals(sentPhase))) {
+            finishSplit(operation, false);
+        } else if ("prepared".equals(phase) || "cancel_requested".equals(phase)) {
+            if (!operation.prepared) {
+                // prepared证明服务器预约已生效，此后才使局部未决claim以UNLOADED完成。
+                operation.claims.beginSplitDrain(operation::contains);
+                operation.prepared = true;
+            }
+            if ("cancel_requested".equals(phase)) operation.cancelRequested = true;
+            operation.nextRequestAt = System.currentTimeMillis() + 1_000;
+        } else {
+            // 不认识的状态不改变所有权；持续status由服务端TTL给离组端显示明确失败。
+            operation.resolveStatus = true;
+            operation.nextRequestAt = System.currentTimeMillis() + 2_000;
+        }
+    }
+
+    private static void finishSplit(SplitOperation operation, boolean committed) {
+        if (operation.prepared) operation.claims.cancelSplitDrain();
+        activeSplit = null;
+        inFlight.remove(operation.signature);
+        candidates.clear();
+        LOGGER.info("分离事务{}: split={} 离组人数={}（旧区块经最终写回释放，无直接所有权迁移）",
+                committed ? "提交完成" : "已回滚", operation.splitId, operation.departing.size());
     }
 }

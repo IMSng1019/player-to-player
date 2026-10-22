@@ -179,8 +179,15 @@ public final class ChunkPreUnloadService {
             }
 
             payloadFuture.thenCompose(payload -> {
-                CompletableFuture<Void> release = releaser.apply(key, payload);
-                return Objects.requireNonNull(release, "区块释放 future 为空");
+                synchronized (lock) {
+                    // 已提交的迁移会主动结束旧屏障；迟到的快照/压缩结果只能被丢弃，
+                    // 不能再对新主拥有的区块发送旧 release。
+                    if (barriers.get(key) != barrier || shutdown || exitFrozen) {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                    CompletableFuture<Void> release = releaser.apply(key, payload);
+                    return Objects.requireNonNull(release, "区块释放 future 为空");
+                }
             }).whenComplete((ignored, error) -> {
                 if (error == null) {
                     completeSuccessfully(key, barrier);
@@ -311,6 +318,20 @@ public final class ChunkPreUnloadService {
         if (quiescent != null) {
             quiescent.complete(null);
         }
+    }
+
+    /** 仅在权威迁移 COMMIT 之后放行旧实例的保存依赖，不发送普通 release。 */
+    public void retireAfterTransfer() {
+        Map<ChunkKey, CompletableFuture<Void>> active;
+        synchronized (lock) {
+            // 全部区块已经交给新主，无需也无权再走普通 release；原版本地保存/移除
+            // 仍需继续，故成功结束依赖。普通关服绝不能调用这个接口跳过耐久写回。
+            exitPreparing = true;
+            freezeRequested = true;
+            exitFrozen = true;
+            active = new HashMap<>(barriers);
+        }
+        active.forEach(this::completeSuccessfully);
     }
 
     /** 解除运行时接管时终止本地状态；正常路径应先由退出事务完成全部屏障。 */

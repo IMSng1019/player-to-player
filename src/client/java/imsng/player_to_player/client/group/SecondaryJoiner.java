@@ -51,6 +51,7 @@ public final class SecondaryJoiner {
                 prepared.close();
                 SwitchTelemetry.finish("switch_failed");
                 LOGGER.error("预建隧道激活后的原版切换失败", failure);
+                WorldSession.transitionFailed(conn, "无法完成组世界连接，请稍后重新连接。");
             }
         });
     }
@@ -64,6 +65,7 @@ public final class SecondaryJoiner {
             if (prepared != null) prepared.close();
             SwitchTelemetry.finish("transport_failed");
             LOGGER.error("加入组世界准备失败，保持当前世界连接", failure);
+            WorldSession.transitionFailed(conn, "无法连接组内主客户端，请检查网络后重试。");
         }
     }
 }

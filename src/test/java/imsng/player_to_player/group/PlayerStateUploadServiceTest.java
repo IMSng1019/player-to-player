@@ -16,6 +16,8 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PlayerStateUploadServiceTest {
 
@@ -55,6 +57,91 @@ class PlayerStateUploadServiceTest {
                 connection.lastRequest.binary());
         assertEquals(9.0, uploaded.getList("Pos", 6).getDouble(0), 0.0);
         assertEquals(2, connection.requests);
+    }
+
+    @Test
+    void finalSnapshotWaitsForWorkerAndDurableAcknowledgement() {
+        FakeConnection connection = new FakeConnection();
+        connection.responses.add(success());
+        Queue<Runnable> tasks = new ArrayDeque<>();
+        PlayerStateUploadService service = new PlayerStateUploadService(connection, tasks::add, ignored -> { });
+        CompletableFuture<Void> durable = service.offerConfirmed(PLAYER_ID, playerAt(9.0));
+        assertFalse(durable.isDone(), "分离不能把已入队当作已经写盘确认");
+        tasks.remove().run();
+        assertTrue(durable.isDone());
+        assertFalse(durable.isCompletedExceptionally());
+    }
+
+    @Test
+    void shutdownFailsUnconfirmedFinalSnapshotAndPreventsQueuedSend() {
+        FakeConnection connection = new FakeConnection();
+        Queue<Runnable> tasks = new ArrayDeque<>();
+        PlayerStateUploadService service = new PlayerStateUploadService(connection, tasks::add, ignored -> { });
+        CompletableFuture<Void> durable = service.offerConfirmed(PLAYER_ID, playerAt(9.0));
+        service.shutdown();
+        tasks.remove().run();
+        assertTrue(durable.isCompletedExceptionally());
+        assertEquals(0, connection.requests);
+    }
+
+    @Test
+    void uploadSequenceSurvivesHostInstanceReplacementAndRetry() {
+        FakeConnection connection = new FakeConnection();
+        connection.responses.add(CompletableFuture.failedFuture(new java.io.IOException("timeout")));
+        connection.responses.add(success());
+        connection.responses.add(success());
+        Queue<Runnable> retry = new ArrayDeque<>();
+        PlayerStateUploadService oldHost = new PlayerStateUploadService(connection, Runnable::run, retry::add);
+        oldHost.offer(PLAYER_ID, playerAt(1));
+        long first = imsng.player_to_player.util.JsonUtil.getLong(connection.lastRequest.json(), "uploadSequence", 0);
+        assertTrue(first > 0, "每个真实上行都必须携带有效序号");
+        retry.remove().run();
+        assertEquals(first, imsng.player_to_player.util.JsonUtil.getLong(connection.lastRequest.json(), "uploadSequence", 0));
+        oldHost.shutdown();
+        PlayerStateUploadService newHost = new PlayerStateUploadService(connection, Runnable::run, ignored -> { });
+        newHost.offer(PLAYER_ID, playerAt(2));
+        long next = imsng.player_to_player.util.JsonUtil.getLong(connection.lastRequest.json(), "uploadSequence", 0);
+        assertTrue(next > first, "同控制连接主副切换后不能从1重新编号");
+    }
+
+    @Test
+    void finalReturnToConfirmedValueStillSendsBarrierAfterIntermediateTimeout() {
+        FakeConnection connection = new FakeConnection();
+        connection.responses.add(success());
+        connection.responses.add(CompletableFuture.failedFuture(new java.util.concurrent.TimeoutException("旧B仍可能在服务端队列")));
+        connection.responses.add(success());
+        Queue<Runnable> tasks = new ArrayDeque<>();
+        PlayerStateUploadService service = new PlayerStateUploadService(connection, tasks::add, ignored -> { });
+        service.offer(PLAYER_ID, playerAt(1));
+        tasks.remove().run();
+        service.offer(PLAYER_ID, playerAt(2));
+        tasks.remove().run();
+        long uncertainSequence = imsng.player_to_player.util.JsonUtil.getLong(connection.lastRequest.json(), "uploadSequence", 0);
+
+        CompletableFuture<Void> finalAck = service.offerConfirmed(PLAYER_ID, playerAt(1));
+        assertFalse(finalAck.isDone());
+        tasks.remove().run();
+
+        assertEquals(3, connection.requests, "最终A虽然等于旧confirmed，但必须用新序号挡住超时B");
+        assertTrue(imsng.player_to_player.util.JsonUtil.getLong(connection.lastRequest.json(), "uploadSequence", 0) > uncertainSequence);
+        assertTrue(finalAck.isDone());
+        assertFalse(finalAck.isCompletedExceptionally());
+    }
+
+    @Test
+    void ordinaryReturnToConfirmedValueAlsoResendsAfterIntermediateTimeout() {
+        FakeConnection connection = new FakeConnection();
+        connection.responses.add(success());
+        connection.responses.add(CompletableFuture.failedFuture(new java.util.concurrent.TimeoutException("未知写入结果")));
+        connection.responses.add(success());
+        PlayerStateUploadService service = new PlayerStateUploadService(connection, Runnable::run, ignored -> { });
+        service.offer(PLAYER_ID, playerAt(1));
+        service.offer(PLAYER_ID, playerAt(2));
+        service.offer(PLAYER_ID, playerAt(1));
+
+        assertEquals(3, connection.requests, "实时回到A也不能以旧confirmed去重");
+        service.offer(PLAYER_ID, playerAt(1));
+        assertEquals(3, connection.requests, "最新A收到ACK后可恢复正常去重");
     }
 
     private static CompletableFuture<ControlMessage> success() {

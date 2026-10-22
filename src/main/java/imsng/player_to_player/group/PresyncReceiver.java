@@ -76,9 +76,14 @@ public final class PresyncReceiver {
         DataOutputStream out = new DataOutputStream(channel.outputStream());
         int chunks = 0;
         int players = 0;
+        long compressedBytes = 0;
+        long readNanos = 0;
+        long chunkStageNanos = 0;
+        long playerStoreNanos = 0;
         progress.accept("presync_started");
         while (true) {
             requireActive();
+            long readStarted = System.nanoTime();
             byte type;
             try {
                 type = in.readByte();
@@ -89,25 +94,41 @@ public final class PresyncReceiver {
                 case PresyncProtocol.TYPE_CHUNK -> {
                     String rawKey = in.readUTF();
                     byte[] gzip = PresyncProtocol.readPayload(in);
+                    readNanos += System.nanoTime() - readStarted;
+                    compressedBytes += gzip.length;
+                    long stageStarted = System.nanoTime();
                     stageChunk(rawKey, gzip);
+                    chunkStageNanos += System.nanoTime() - stageStarted;
                     chunks++;
                 }
                 case PresyncProtocol.TYPE_PLAYER -> {
                     String rawUuid = in.readUTF();
                     byte[] gzip = PresyncProtocol.readPayload(in);
+                    readNanos += System.nanoTime() - readStarted;
+                    compressedBytes += gzip.length;
+                    long storeStarted = System.nanoTime();
                     writePlayerData(rawUuid, gzip);
+                    playerStoreNanos += System.nanoTime() - storeStarted;
                     players++;
                 }
                 case PresyncProtocol.TYPE_SNAPSHOT_DONE -> {
+                    readNanos += System.nanoTime() - readStarted;
                     PresyncProtocol.writeMarker(out, PresyncProtocol.TYPE_ACK_SNAPSHOT);
                     progress.accept("snapshot_done");
-                    LOGGER.info("预同步 {} 快照已入库: {} 区块 / {} 玩家，等待增量",
-                            label, chunks, players);
+                    // read_wait 含发送方采集/压缩空隙与网络等待，不能当作纯链路传输耗时。
+                    // 区块计时包含解压、合法性校验与暂存；玩家计时另外包含原子文件写入。
+                    LOGGER.info("预同步 {} 快照已入库: {} 区块 / {} 玩家 gzip_bytes={}"
+                                    + " read_wait_ms={} chunk_decode_stage_ms={} player_decode_store_ms={}，等待增量",
+                            label, chunks, players, compressedBytes, readNanos / 1_000_000,
+                            chunkStageNanos / 1_000_000, playerStoreNanos / 1_000_000);
                 }
                 case PresyncProtocol.TYPE_TAIL_DONE -> {
+                    readNanos += System.nanoTime() - readStarted;
                     PresyncProtocol.writeMarker(out, PresyncProtocol.TYPE_ACK_TAIL);
-                    LOGGER.info("预同步 {} 完成: 共 {} 区块 / {} 玩家（含尾部最终态）",
-                            label, chunks, players);
+                    LOGGER.info("预同步 {} 完成: 共 {} 区块 / {} 玩家（含尾部最终态）gzip_bytes={}"
+                                    + " read_wait_ms={} chunk_decode_stage_ms={} player_decode_store_ms={}",
+                            label, chunks, players, compressedBytes, readNanos / 1_000_000,
+                            chunkStageNanos / 1_000_000, playerStoreNanos / 1_000_000);
                     return;
                 }
                 default -> throw new IOException("预同步协议错误: 未知记录类型 " + type);

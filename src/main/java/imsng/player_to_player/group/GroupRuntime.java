@@ -243,7 +243,7 @@ public final class GroupRuntime {
         serverConn = null;
         groupId = null;
         localWorldIdentity = null; // 身份结论不跨接管残留（下次 arm 重新携带）
-        LocalPermissions.reset(); // 权限名单同理：不跨接管残留（条目随集成服务端实例销毁）
+        LocalPermissions.resetRuntime(); // 只结束当前实例的应用记录，会话名单供下一次角色切换复用
         managedServer = null;
         setTickFrozen(false); // 记录完整冻结时长（包含尾部后等待提交及原版停服）
         LoginLoadGuard.reset("集成服务端停止"); // 登录窗口/诊断不得跨世界残留
@@ -308,6 +308,29 @@ public final class GroupRuntime {
     /** 置位"下一次停止不拆会话"旗标（合并让出方在关闭集成服务端前调用）。 */
     public static void suppressNextStopTeardown() {
         suppressNextStopTeardown = true;
+    }
+
+    /**
+     * 整组合并已由物理服提交后的旧写者退休。必须在等待成员排空/断开旧世界之前调用：
+     * 区块所有权此刻已属于目标主客户端，旧申请重试、普通释放和实时上传均不得继续。
+     * 保留 managedServer/claims 引用直到原版真正停止，使所有 Mixin 继续识别旧代次，
+     * 拒绝新加载而非因“运行时为空”错误回落到原版无授权生成。
+     */
+    public static void retireAfterTransfer(UUID sourceGroup) {
+        ChunkClaimClient claims = claimClient;
+        ChunkUploadService uploads = uploadService;
+        ChunkPreUnloadService preUnloads = preUnloadService;
+        PlayerStateUploadService playerUploads = playerUploadService;
+        if (managedServer == null || claims == null || !sourceGroup.equals(groupId)) {
+            throw new IllegalStateException("合并提交与当前组运行时不匹配，拒绝退休其他实例");
+        }
+        suppressNextStopTeardown = true;
+        if (uploads != null) uploads.shutdown();
+        if (playerUploads != null) playerUploads.shutdown();
+        // 先撤销本地占用，再放行预卸载屏障；迟到的 release 回调也会看到无权写入。
+        claims.forgetAllLocal();
+        if (preUnloads != null) preUnloads.retireAfterTransfer();
+        LOGGER.info("合并提交后旧组运行时已退休: groupId={}，未决加载结束，等待原版停服", sourceGroup);
     }
 
     // ------------------------------------------------------------ tick 冻结

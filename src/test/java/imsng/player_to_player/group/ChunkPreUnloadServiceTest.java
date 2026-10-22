@@ -107,6 +107,27 @@ class ChunkPreUnloadServiceTest {
     }
 
     @Test
+    void committedTransferReleasesSaveDependencyWithoutSendingLateSnapshot() {
+        CompletableFuture<CompoundTag> snapshot = new CompletableFuture<>();
+        AtomicInteger releaseCalls = new AtomicInteger();
+        AtomicInteger forgotten = new AtomicInteger();
+        ChunkPreUnloadService service = service(false, false, true,
+                releaseCalls, new AtomicReference<>(), new CompletableFuture<>(), forgotten);
+        CompletableFuture<Void> barrier = service.begin(KEY, true, () -> snapshot);
+        assertFalse(barrier.isDone());
+
+        service.retireAfterTransfer();
+
+        assertTrue(barrier.isDone(), "COMMIT后旧所有者不应再阻塞原版保存依赖");
+        assertFalse(barrier.isCompletedExceptionally());
+        assertEquals(1, forgotten.get());
+        snapshot.complete(snapshot());
+        assertEquals(0, releaseCalls.get(), "COMMIT后的迟到快照无权再释放新主占用");
+        assertTrue(service.begin(KEY, true, this::snapshotFuture).isDone());
+        assertEquals(0, releaseCalls.get());
+    }
+
+    @Test
     void localSnapshotFailureKeepsBarrierAndRetriesWithFreshSnapshot() {
         AtomicInteger snapshots = new AtomicInteger();
         AtomicInteger releases = new AtomicInteger();

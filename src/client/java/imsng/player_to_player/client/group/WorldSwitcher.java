@@ -110,6 +110,9 @@ public final class WorldSwitcher {
         // 置了也无人消费，会残留到下一次真实退出把会话拆除误吞掉）
         if (minecraft.level != null) {
             SWITCHING.set(true);
+            // 对齐原版退出顺序：先关闭游戏连接，再由 Minecraft 清理世界并等待本地服停止。
+            // 只调用 Minecraft.disconnect 会让旧主继续等待本地玩家心跳超时（约20秒）。
+            minecraft.level.disconnect();
             minecraft.disconnect();
         }
         // 原版"选择世界界面打开存档"的同款入口（签名已 javap 核实）；
@@ -139,6 +142,8 @@ public final class WorldSwitcher {
         SwitchTelemetry.mark("disconnect_begin");
         if (minecraft.level != null) {
             SWITCHING.set(true);
+            // 主→副切换同样必须先断开旧游戏连接，否则集成服务端不知道本地房主已离开。
+            minecraft.level.disconnect();
             minecraft.disconnect();
         }
         ServerData data = new ServerData("P2P 组世界（主客户端: " + primaryName + "）",

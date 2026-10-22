@@ -31,7 +31,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *   <li>指令补全树（原版按权限过滤 {@code Commands.sendCommands} 下发）；</li>
  *   <li>未被拦截的执行路径（告示牌/命令方块/第三方程序化调用）按真实等级执行。</li>
  * </ul>
- * 等级取服务端核出的<b>原值</b>（不钳制）—— 这是 2026-10-15 的定稿口径；跨组广播执行
+ * 等级取服务端核出的<b>真实值</b>（仅限制在原版合法范围 0..4）；跨组广播执行
  * 的权限另有一道钳制（{@code CommandChatHandlers.FORWARD_PERMISSION_CAP}），两者
  * 作用面不同：本地权限位决定"这台客户端本地能看到/能做什么"。
  *
@@ -46,7 +46,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@code ServerOpList} 内部是非并发 Map，落权必须在集成服务端主线程；
  * {@link #applyScheduled} 负责"同线程直跑、异线程 execute"，与
  * {@code GroupRuntime.beginChunkPreUnload} 同一范式。名单缓存本身是并发的
- * （写入在 Netty 线程，读取在服务器主线程）。
+ * （写入在 Netty 线程，读取在服务器主线程）。JOIN 的二次核验通过服务器 tick 事件，
+ * 不把 {@code server.execute} 误当成“下一 tick”—— 同线程调用可能立即执行。
  */
 public final class LocalPermissions {
 
@@ -56,14 +57,13 @@ public final class LocalPermissions {
     record Member(String name, int level) {
     }
 
-    /** 名单所属组（与 {@link GroupRuntime#activeGroupId()} 不符时视为陈旧帧）。 */
-    private static volatile UUID groupId;
+    /** 权威名单和玩家实例的应用记录分别管理，不能由宿主启动一起清空。 */
+    private static final LocalPermissionState STATE = new LocalPermissionState();
 
-    /** 玩家 UUID → 权限档（服务端下发的权威值）。 */
-    private static volatile Map<UUID, Member> members = Map.of();
+    private record JoinRecheck(MinecraftServer server, ServerPlayer player, int joinedAtTick) { }
 
-    /** 本会话已落地的等级（uuid → level），避免重复 add/send。 */
-    private static final Map<UUID, Integer> applied = new ConcurrentHashMap<>();
+    /** JOIN 后只跨 tick 核验一次；按 UUID 替换并校验对象，防止旧连接影响同 UUID 重连。 */
+    private static final Map<UUID, JoinRecheck> JOIN_RECHECKS = new ConcurrentHashMap<>();
 
     private LocalPermissions() {
     }
@@ -91,8 +91,7 @@ public final class LocalPermissions {
         if (group == null || next == null) {
             return; // 入站数据不可信：缺字段直接忽略，保持旧名单
         }
-        groupId = group;
-        members = next;
+        STATE.replace(group, next);
         LOGGER.info("收到权限名单: 组 {} → {} 名成员", group, next.size());
         applyScheduled(GroupRuntime.server());
     }
@@ -128,21 +127,40 @@ public final class LocalPermissions {
 
     /** 会话拆除时清缓存（条目本身随集成服务端实例销毁，无需文件清理）。 */
     public static void reset() {
-        groupId = null;
-        members = Map.of();
-        applied.clear();
+        STATE.resetSession();
+        JOIN_RECHECKS.clear();
+    }
+
+    /** 集成服实例结束/重建：权限名单仍属于当前物理服务端会话，必须留给新实例使用。 */
+    public static void resetRuntime() {
+        STATE.resetRuntime();
+        JOIN_RECHECKS.clear();
+    }
+
+    /** 分离/玩家上行使用物理服名单中的规范身份，避免把离线派生UUID提交给服务端。 */
+    public static UUID canonicalMemberId(UUID playerId, String playerName) {
+        return STATE.memberIdFor(GroupRuntime.activeGroupId(), playerId, playerName);
     }
 
     /** 任意线程：把当前名单落到该集成服务端（不为本组/未接管时静默跳过）。 */
     public static void applyScheduled(MinecraftServer server) {
+        applyScheduled(server, false);
+    }
+
+    /** LAN 发布会重置本地客户端权限位；发布完成后即使等级未变也必须重发事件包/指令树。 */
+    public static void refreshScheduled(MinecraftServer server) {
+        applyScheduled(server, true);
+    }
+
+    private static void applyScheduled(MinecraftServer server, boolean forceSend) {
         if (server == null) {
             return;
         }
         try {
             if (server.isSameThread()) {
-                applyNow(server);
+                applyNow(server, forceSend);
             } else {
-                server.execute(() -> applyNow(server));
+                server.execute(() -> applyNow(server, forceSend));
             }
         } catch (RuntimeException e) {
             // 服务端正在停止：名单本来就会随实例销毁，无需补救
@@ -150,43 +168,84 @@ public final class LocalPermissions {
         }
     }
 
-    /** 落权实现（必须在集成服务端主线程）。 */
-    private static void applyNow(MinecraftServer server) {
-        UUID active = GroupRuntime.activeGroupId();
-        Map<UUID, Member> table = members;
-        if (active == null || groupId == null || !active.equals(groupId) || table.isEmpty()) {
-            return; // 未接管 / 名单不是本组的 / 名单为空：什么都不做
+    /**
+     * Fabric JOIN 早于 PlayerList.players.add，必须使用事件持有的玩家对象直接落权。
+     * 原版此后还会发送一次权限包；这里先写 ops，确保原版再次发送时也读到正确等级。
+     */
+    public static void applyJoiningPlayer(MinecraftServer server, ServerPlayer player) {
+        if (player == null || !GroupRuntime.isManagedServer(server)) {
+            return;
         }
-        PlayerList playerList = server.getPlayerList();
-        for (Map.Entry<UUID, Member> entry : table.entrySet()) {
-            ServerPlayer player = playerList.getPlayer(entry.getKey());
-            if (player == null) {
-                player = playerList.getPlayerByName(entry.getValue().name());
+        applyToPlayer(server, player, true);
+        JOIN_RECHECKS.put(player.getUUID(), new JoinRecheck(server, player, server.getTickCount()));
+    }
+
+    /** END_SERVER_TICK 调用，明确等到与 JOIN 不同的 tick 后才核验，且不重复写相同 ops。 */
+    public static void onServerTick(MinecraftServer server) {
+        if (!GroupRuntime.isManagedServer(server) || JOIN_RECHECKS.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<UUID, JoinRecheck> entry : JOIN_RECHECKS.entrySet()) {
+            JoinRecheck recheck = entry.getValue();
+            if (recheck.server() != server || recheck.joinedAtTick() == server.getTickCount()) {
+                continue;
             }
-            if (player == null) {
-                continue; // 还没进本组世界：JOIN 事件会再触发一次
+            if (!JOIN_RECHECKS.remove(entry.getKey(), recheck)) {
+                continue;
             }
-            applyOne(server, playerList, player, entry.getValue().level());
+            // 同 UUID 已换连接/已断线时，绝不能把补发包送给旧玩家对象。
+            if (server.getPlayerList().getPlayer(entry.getKey()) == recheck.player()) {
+                applyToPlayer(server, recheck.player(), true);
+            }
         }
     }
 
-    /** 给单个玩家落权限位（等级 0 = 撤权，避免把普通人标成 op）。 */
-    private static void applyOne(MinecraftServer server, PlayerList playerList,
-                                 ServerPlayer player, int level) {
-        UUID playerId = player.getUUID();
-        Integer previous = applied.get(playerId);
-        if (previous != null && previous == level) {
-            return; // 已落地且未变化
+    /** 玩家离开只清该连接记录；旧连接迟到的退出事件不能影响重连实例。 */
+    public static void onPlayerDisconnect(ServerPlayer player) {
+        STATE.forget(player.getUUID(), player);
+        JOIN_RECHECKS.computeIfPresent(player.getUUID(),
+                (id, recheck) -> recheck.player() == player ? null : recheck);
+    }
+
+    /** 遍历在线玩家而非名单：整表移除成员也必须落实撤权。只在服务器主线程调用。 */
+    private static void applyNow(MinecraftServer server, boolean forceSend) {
+        if (!GroupRuntime.isManagedServer(server)) {
+            return;
         }
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            applyToPlayer(server, player, forceSend);
+        }
+    }
+
+    /** 给单个玩家落权限位（等级 0 = 撤权；未知/不同组的名单不会修改当前权限）。 */
+    private static void applyToPlayer(MinecraftServer server, ServerPlayer player, boolean forceSend) {
+        UUID playerId = player.getUUID();
+        Integer level = STATE.levelFor(GroupRuntime.activeGroupId(), playerId,
+                player.getGameProfile().getName());
+        if (level == null) {
+            LOGGER.debug("等待本组权限名单: 玩家={} 组={}",
+                    player.getGameProfile().getName(), GroupRuntime.activeGroupId());
+            return;
+        }
+        PlayerList playerList = server.getPlayerList();
         GameProfile profile = player.getGameProfile();
+        ServerOpListEntry existing = playerList.getOps().get(profile);
+        boolean opsChanged = level >= 1
+                ? existing == null || existing.getLevel() != level
+                : existing != null;
+        if (!forceSend && !opsChanged && !STATE.needsApply(playerId, player, level)) {
+            return;
+        }
         if (level >= 1) {
-            playerList.getOps().add(new ServerOpListEntry(profile, level, false));
-        } else {
+            if (opsChanged) {
+                playerList.getOps().add(new ServerOpListEntry(profile, level, false));
+            }
+        } else if (opsChanged) {
             playerList.getOps().remove(profile);
         }
         // 同一次调用既发权限事件包（客户端 hasPermissions 闸门），也重发指令树（补全）
         playerList.sendPlayerPermissionLevel(player);
-        applied.put(playerId, level);
+        STATE.markApplied(playerId, player, level);
         LOGGER.info("本地权限位已落地: {} → 等级 {}（服务端 ops 名单口径）",
                 player.getGameProfile().getName(), level);
     }

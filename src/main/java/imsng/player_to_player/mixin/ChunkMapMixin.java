@@ -8,6 +8,7 @@ import imsng.player_to_player.group.LoginAnchorPolicy;
 import imsng.player_to_player.group.LoginLoadGuard;
 import imsng.player_to_player.group.PresyncStore;
 import imsng.player_to_player.registry.ChunkKey;
+import com.mojang.datafixers.util.Either;
 import net.minecraft.Util;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.level.ChunkHolder;
@@ -118,6 +119,21 @@ public abstract class ChunkMapMixin {
     }
 
     // ------------------------------------------------- 注入点二：加载门控
+
+    /**
+     * 合并 COMMIT 或分离准备主动取消的加载必须作为“未加载”收束。原版失败处理会对普通
+     * future 异常创建空 ProtoChunk；直接 exceptionally(empty) 同样会继续按种子生成，
+     * 导致旧主在已失去所有权后写区块。本入口只识别本模组的明确迁移信号，返回原版
+     * ChunkLoadingFailure，让依赖它的世代/保存链自然结束；其他异常仍执行原版逻辑。
+     */
+    @Inject(method = "handleChunkLoadFailure", at = @At("HEAD"), cancellable = true)
+    private void player_to_player$finishTransferredLoad(
+            Throwable error, ChunkPos pos,
+            CallbackInfoReturnable<Either<ChunkAccess, ChunkHolder.ChunkLoadingFailure>> cir) {
+        if (ChunkClaimClient.isTransferredFailure(error)) {
+            cir.setReturnValue(ChunkHolder.UNLOADED_CHUNK);
+        }
+    }
 
     @Inject(method = "readChunk", at = @At("RETURN"), cancellable = true)
     private void player_to_player$gateChunkLoad(
