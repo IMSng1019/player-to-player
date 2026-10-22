@@ -198,9 +198,16 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
   `entityManager.tick()` 两个服务面调用**（区块发包/加载与实体装载），玩家可正常登录。
   （1.20.4 中区块发包、DistanceManager ticket 更新与实体分区加载都在 `tick` 内部，
   整体取消会让玩家永久卡在 "Loading terrain"，故必须保留这两个调用。）
-- **出生点常加载禁用**：覆盖两条入口：
+- **出生点常加载禁用**：覆盖三条入口：
   1. `MinecraftServer.prepareLevels`（启动预热，`MinecraftServerMixin`）；
-  2. `ServerPlayer.fudgeSpawnLocation`（每次登录，`ServerPlayerMixin`，受管组世界直接取消）。
+  2. `ServerPlayer.fudgeSpawnLocation`（每次登录，`ServerPlayerMixin`，受管组世界直接取消）；
+  3. `ServerLevel.setDefaultSpawnPos`（`/setworldspawn` 或模组修改出生点，`ServerLevelMixin`）；
+     只阻止新增永久 `START` 票据，保留旧票据移除、坐标/朝向保存及广播。
+  启动与运行期常驻票据共用 `SpawnChunkPolicy`：服务端和中转服务端按
+  `disableSpawnChunks` 配置禁用，受管组世界从 `arm` 阶段始终禁用，普通单人世界保持原版。
+  首次建图寻找安全出生位置的短期加载，以及玩家真实出生、重生、视距所需加载仍保留；
+  这些加载不等同于永久 `START` 票据。跳过整个 `prepareLevels` 仍会跳过其尾部的
+  已保存 `/forceload` 区块恢复，这是既有行为；本次不改动运行中的显式强制加载。
   **登录锚点 = 权威 playerdata 的真实位置**：`PlayerList.placeNewPlayer` 先
   `load(playerdata)` 再 `addNewPlayer`（区块 ticket），取消 fudge 后无需重排原版顺序。
   登录期区块加载有看门狗：5 秒 WARN（区块/阻塞组/调用栈）：60 秒且同一登录窗口
@@ -208,6 +215,8 @@ byte[...]        # 可选二进制附件（文件块、区块数据等），长�
   （`LoginLoadGuard`）。不能用 IOException：原版 `ChunkMap.scheduleChunkLoad` 会把
   IOException 当作读盘失败并生成空 ProtoChunk，随后按种子生成（可能覆盖其他组数据）；
   非 IOException 的 CompletionException 才走原版“标记失败 + rethrow”分支。
+  构造器 HEAD 的看门狗处理器为静态方法：此注入点早于 `super()`，不能使用尚未初始化的
+  `this`；构造器正常返回即关闭防御窗口，实际登录窗口由 `placeNewPlayer` 重新开启。
 - 日志收集：主客户端定期上传，存 `player-to-player/logs/<玩家名>-latest.log`。
 
 ## 9. 线程模型

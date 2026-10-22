@@ -40,7 +40,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * <h2>注入点二：{@code <init>} @HEAD — 开启登录看门狗窗口</h2>
  * 构造器早于 playerdata 读取，也就早于所有登录期区块加载（含 fudge）。在这里
  * 开启 {@link LoginLoadGuard} 窗口，5 秒 WARN / 60 秒硬超时才能覆盖登录全链路。
- * 窗口由 {@code GroupServerHooks} 的 JOIN 回调结束。
+ * 构造器窗口在 RETURN 结束；真正登录时由 {@code PlayerListMixin} 重新开启窗口，
+ * 再由 {@code GroupServerHooks} 的 JOIN 回调结束。
  */
 @Mixin(ServerPlayer.class)
 public abstract class ServerPlayerMixin {
@@ -87,13 +88,15 @@ public abstract class ServerPlayerMixin {
      * 这条防御路径。若 fudge 真的被阻塞，构造器不会返回，窗口保持有效，看门狗可兜底；
      * 正常返回后窗口立即结束，死亡重生（同样走构造器、不走 JOIN）不会留下 120 秒假窗口。
      * 真正的登录窗口由 {@code PlayerListMixin} 在 placeNewPlayer HEAD 开启。
+     * <p>HEAD 位于父类构造器调用之前，此时 JVM 尚未初始化 this；Mixin 要求处理器
+     * 必须是 static。这里只读取构造器参数和静态运行期状态，不访问玩家实例。
      */
     @Inject(
             method = "<init>(Lnet/minecraft/server/MinecraftServer;Lnet/minecraft/server/level/ServerLevel;"
                     + "Lcom/mojang/authlib/GameProfile;Lnet/minecraft/server/level/ClientInformation;)V",
             at = @At("HEAD")
     )
-    private void player_to_player$beginConstructorWindow(MinecraftServer server, ServerLevel level,
+    private static void player_to_player$beginConstructorWindow(MinecraftServer server, ServerLevel level,
                                                          GameProfile profile,
                                                          ClientInformation clientInformation,
                                                          CallbackInfo ci) {

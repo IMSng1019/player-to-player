@@ -3,6 +3,7 @@ package imsng.player_to_player.mixin;
 import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.group.GroupRuntime;
+import imsng.player_to_player.world.SpawnChunkPolicy;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.progress.ChunkProgressListener;
 import org.slf4j.Logger;
@@ -19,19 +20,21 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * <p>
  * <b>覆盖范围</b>：本 mixin 只负责<b>启动预热</b>这一条入口（{@code prepareLevels}）。
  * 每次登录还会经过 {@code ServerPlayer.fudgeSpawnLocation} 同步加载共享出生点区块，
- * 该入口由 {@code ServerPlayerMixin} 取消——两处必须同时存在，否则登录路径仍会
- * 触发原点 23×23 依赖区块的跨组 claim。
+ * 受管组世界的该入口由 {@code ServerPlayerMixin} 取消，避免读取玩家存档前加载无关的
+ * 共享出生点。运行时 {@code /setworldspawn} 重新添加 START 票据的入口则由
+ * {@code ServerLevelMixin} 拦截；三处分别保护启动、登录和出生点变更路径。
  * <p>
  * <b>注入点选择理由</b>：{@code MinecraftServer.prepareLevels(ChunkProgressListener)}
  * 是原版启动流程中唯一负责"出生点预热"的方法：它给出生点挂 START 级 ticket
  * （常加载来源）、阻塞等待周边区块全部就绪、再启动强制区块（forced chunks）。
- * 在 HEAD 直接取消即可一并跳过这三件事——本模组下所有区块的加载权都由客户端经
- * 区块注册表申领，服务端不应自行加载任何区块。相比之下若去改
+ * 在 HEAD 直接取消即可一并跳过这三件事，避免与玩家实际位置无关的常驻出生区块。
+ * 玩家真实出生、重生和视距所需的加载仍由各自路径处理。相比之下若去改
  * DistanceManager/TicketType 等更深层结构，侵入面大且版本脆弱。
  * <p>
- * <b>配置门控</b>：仅当 SERVER 模式且 {@link GlobalConfig#disableSpawnChunks} 为 true
- * 时取消；把 {@code player-to-player/config.json} 中 {@code disableSpawnChunks}
- * 设为 false 即恢复原版出生点常加载。config 为 null（极早期调用）时放行原版行为。
+ * <b>配置门控</b>：SERVER / PROXY_SERVER 模式且
+ * {@link GlobalConfig#disableSpawnChunks} 为 true 时取消；这两种模式可通过关闭该配置
+ * 恢复原版行为，配置尚未装载时也放行。CLIENT 模式下，组世界从预置阶段起始终跳过
+ * 预热，普通单人世界不受影响；具体判定与运行期入口共用 {@link SpawnChunkPolicy}。
  * <p>
  * <b>已知风险</b>：
  * <ul>
@@ -62,24 +65,20 @@ public abstract class MinecraftServerMixin {
     )
     private void player_to_player$skipSpawnPreparation(ChunkProgressListener listener, CallbackInfo ci) {
         NodeContext ctx = NodeContext.get();
-        GlobalConfig config = ctx.config();
-        // 配置尚未装载（理论上 prepareLevels 晚于模组初始化，此处仅作防御）时放行原版。
-        if (config == null) {
+        // GroupRuntime 在打开组世界前 arm，早于 SERVER_STARTED 的实际接管；不能只
+        // 检查 isManagedLevel，否则启动窗口内仍会留下原版 START 常驻票据。
+        if (!SpawnChunkPolicy.shouldDisable(ctx.mode(), GroupRuntime.isArmedOrActive(), ctx.config())) {
             return;
         }
-        if (ctx.isServer() && config.disableSpawnChunks) {
-            player_to_player$LOGGER.info(
-                    "已跳过出生点常加载区块的预热与等待（disableSpawnChunks=true）："
-                            + "区块加载全部交由客户端经区块注册表申领");
-            ci.cancel();
-        }
-        // Phase 2：主客户端的集成服务端同样跳过出生点预热 —— 出生点往往离玩家
-        // 很远，预热会立刻触发 17×17 个远端区块的占用申请与数据拉取，既拖慢
-        // 启动又抢占其他组的区块；组客户端语义下只加载玩家周边（申请授予的）区块。
-        // GroupRuntime 在打开本地世界前 arm，此时序保证 prepareLevels 处判定可靠。
-        if (ctx.isClient() && GroupRuntime.isArmedOrActive()) {
+        if (ctx.isClient()) {
+            // 1.20.4 原版会挂半径 11 的 START 票据并等待 441（21×21）个 ticking
+            // 区块生成完成；跳过整段预热，避免无关远端区块在玩家实际登录前被加载。
             player_to_player$LOGGER.info("组客户端集成服务端：已跳过出生点常加载区块预热");
-            ci.cancel();
+        } else {
+            player_to_player$LOGGER.info(
+                    "已跳过出生点常加载区块的预热与等待（mode={}，disableSpawnChunks=true）",
+                    ctx.mode().id());
         }
+        ci.cancel();
     }
 }

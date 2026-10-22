@@ -1,10 +1,15 @@
 package imsng.player_to_player.mixin;
 
+import com.llamalad7.mixinextras.injector.v2.WrapWithCondition;
 import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.group.GroupRuntime;
+import imsng.player_to_player.world.SpawnChunkPolicy;
+import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.TicketType;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.entity.PersistentEntitySectionManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -81,6 +86,29 @@ public abstract class ServerLevelMixin {
     @Shadow
     @Final
     private PersistentEntitySectionManager<Entity> entityManager;
+
+    /**
+     * 原版修改世界出生点时会移除旧 START 票据，再为新位置添加永久 START 票据。
+     * 因此只取消 prepareLevels 不能覆盖 /setworldspawn 或其他模组调用此方法的情况。
+     * <p>
+     * 这里只给“新增 START”这一调用加条件：出生点坐标与朝向保存、旧票据移除、
+     * 给玩家广播新出生点仍由原版完成。WrapWithCondition 可与其他同类包装组合，
+     * 不替换整个方法，也不拦截 PLAYER、PORTAL、FORCED 等正常加载票据。
+     */
+    @WrapWithCondition(
+            method = "setDefaultSpawnPos(Lnet/minecraft/core/BlockPos;F)V",
+            at = @At(value = "INVOKE", target = "Lnet/minecraft/server/level/ServerChunkCache;"
+                    + "addRegionTicket(Lnet/minecraft/server/level/TicketType;"
+                    + "Lnet/minecraft/world/level/ChunkPos;ILjava/lang/Object;)V"),
+            require = 1
+    )
+    private boolean player_to_player$allowSpawnTicket(ServerChunkCache chunks, TicketType<?> type,
+                                                      ChunkPos pos, int radius, Object argument) {
+        NodeContext ctx = NodeContext.get();
+        // arm 早于实际接管，也覆盖其他模组在世界启动阶段设置出生点的调用。
+        return type != TicketType.START
+                || !SpawnChunkPolicy.shouldDisable(ctx.mode(), GroupRuntime.isArmedOrActive(), ctx.config());
+    }
 
     /**
      * 在 ServerLevel.tick 头部按配置挂起世界演算，但保留区块与实体服务面。
