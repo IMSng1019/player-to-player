@@ -38,12 +38,15 @@ public final class P2PBootstrap {
 
     /** 模组主入口（ModInitializer.onInitialize）调用，双端均执行。 */
     public static void onCommonInit() {
+        if (imsng.player_to_player.runtime.WorkerBootstrap.initializeIfWorker()) return;
         FabricLoader loader = FabricLoader.getInstance();
         EnvType envType = loader.getEnvironmentType();
         Path gameDir = loader.getGameDir();
 
         // 1. 目录骨架：没有 player-to-player 文件夹则创建（规范要求）
-        P2PPaths paths = new P2PPaths(gameDir);
+        String sharedRoot = System.getProperty("player_to_player.dataRoot", "");
+        P2PPaths paths = envType == EnvType.CLIENT && !sharedRoot.isBlank()
+                ? P2PPaths.atRoot(Path.of(sharedRoot)) : new P2PPaths(gameDir);
         try {
             paths.ensureBaseDirs();
         } catch (IOException e) {
@@ -80,6 +83,7 @@ public final class P2PBootstrap {
                 // MC 频道端口同步：玩家加入时下发本机实际绑定的 controlPort/relayPort。
                 // 必须在任何玩家可能加入之前注册（模组初始化早于 SERVER_STARTED）。
                 PortSyncServer.register();
+                imsng.player_to_player.server.EnvironmentPreflightServer.registerLogin();
                 // 服务端主服务在 MC 服务器完全启动后再启动（需要注册表/世界目录就绪）
                 ServerLifecycleEvents.SERVER_STARTED.register(P2PServerService::start);
                 ServerLifecycleEvents.SERVER_STOPPING.register(server -> P2PServerService.stop());

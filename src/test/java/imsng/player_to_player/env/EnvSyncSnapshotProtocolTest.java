@@ -75,12 +75,49 @@ class EnvSyncSnapshotProtocolTest {
                     ControlMessage.of(MessageType.ENV_FILE_REQUEST, fileRequest), connection);
             ControlMessage fileResponse = connection.take();
 
-            assertEquals(7, Protocol.VERSION);
+            assertEquals(8, Protocol.VERSION);
             assertFalse(snapshotId.isBlank());
             assertEquals(snapshotId,
                     fileResponse.json().get("snapshotId").getAsString());
             assertArrayEquals("snapshot-bytes".getBytes(StandardCharsets.UTF_8),
                     fileResponse.binary());
+        } finally {
+            manager.stop();
+        }
+    }
+
+    @Test
+    void manifestRequestCanReadRetainedVersionAfterCurrentVersionChanges() throws Exception {
+        Path source = tempDir.resolve("pinned-source");
+        Files.createDirectories(source.resolve("config"));
+        Files.writeString(source.resolve("config/value.txt"), "old");
+        EnvironmentSnapshotManager manager = new EnvironmentSnapshotManager(source,
+                tempDir.resolve("pinned-repository"), List.of(),
+                Duration.ofMillis(20), Duration.ofSeconds(30), Duration.ofMinutes(10));
+        try {
+            manager.start();
+            await(() -> manager.current() != null);
+            EnvironmentSnapshot old = manager.current();
+            Files.writeString(source.resolve("config/value.txt"), "new");
+            manager.requestRefresh();
+            await(() -> !manager.current().snapshotId().equals(old.snapshotId()));
+            FakeRegistry registry = new FakeRegistry();
+            EnvSyncServerHandlers.register(registry, manager, new GlobalConfig());
+            FakeConnection connection = new FakeConnection();
+            JsonObject request = new JsonObject();
+            request.addProperty("snapshotId", old.snapshotId());
+            registry.handle(MessageType.ENV_MANIFEST_REQUEST,
+                    ControlMessage.of(MessageType.ENV_MANIFEST_REQUEST, request), connection);
+            ControlMessage response = connection.take();
+            assertEquals(old.snapshotId(), response.json().get("snapshotId").getAsString());
+            assertEquals(old.manifest().globalHash(), response.json().get("filteredHash").getAsString());
+
+            request.addProperty("snapshotId", "missing-version");
+            registry.handle(MessageType.ENV_MANIFEST_REQUEST,
+                    ControlMessage.of(MessageType.ENV_MANIFEST_REQUEST, request), connection);
+            response = connection.take();
+            assertEquals(MessageType.ERROR, response.type());
+            assertEquals("snapshot_not_found", response.json().get("code").getAsString());
         } finally {
             manager.stop();
         }

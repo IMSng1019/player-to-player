@@ -104,6 +104,12 @@ public final class GlobalConfig {
      */
     public List<String> nonEnvironmentPaths = new ArrayList<>();
 
+    /** 主客户端允许回传的环境路径树。默认仅配置；世界数据不走此通道。 */
+    public List<String> environmentUploadPaths = new ArrayList<>(List.of("config"));
+
+    /** 单个环境配置上传上限；大文件应由管理员发布，避免控制面被大包长期占用。 */
+    public int environmentUploadMaxBytes = 8 * 1024 * 1024;
+
     /**
      * 环境文件传输分块大小（字节）。加载时被 clamp 到
      * [{@link #MIN_ENV_FILE_CHUNK_BYTES}, {@link #MAX_ENV_FILE_CHUNK_BYTES}]：

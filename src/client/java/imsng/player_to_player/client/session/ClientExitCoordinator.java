@@ -5,8 +5,8 @@ import imsng.player_to_player.client.mixin.PauseScreenAccessor;
 import imsng.player_to_player.group.ExitBundle;
 import imsng.player_to_player.group.ExitManifest;
 import imsng.player_to_player.group.ExitTransactionClient;
-import imsng.player_to_player.group.GroupRuntime;
 import imsng.player_to_player.util.ThreadPools;
+import imsng.player_to_player.runtime.WorkerProcess;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.ProgressScreen;
 import net.minecraft.client.gui.screens.PauseScreen;
@@ -102,7 +102,7 @@ public final class ClientExitCoordinator {
         return ACTIVE.get();
     }
 
-    /** GroupRuntime 在 SERVER_STOPPED 后调用；可能位于 IO 线程。 */
+    /** 子进程在 SERVER_STOPPED 后完成最终本机尾部文件，父进程从IO线程通知。 */
     public static void onExitBundle(ExitBundle bundle) {
         CompletableFuture<ExitBundle> future = bundleFuture;
         if (future == null || !future.complete(bundle)) {
@@ -112,7 +112,7 @@ public final class ClientExitCoordinator {
 
     private static boolean isManagedWorld(Minecraft minecraft) {
         return minecraft != null
-                && GroupRuntime.isManagedServer(minecraft.getSingleplayerServer());
+                && WorkerProcess.isManagedWorld();
     }
 
     private static void start(Minecraft minecraft, Screen sourceScreen,
@@ -148,7 +148,7 @@ public final class ClientExitCoordinator {
             ExitTransactionClient.BeginOutcome begin =
                     transaction.beginUntilAccepted(local);
             long beginMillis = elapsedMillis(phaseStarted);
-            GroupRuntime.adoptExitManifest(begin.manifest());
+            WorkerProcess.adoptExitManifest(begin.manifest());
             LOGGER.info("物理服务端已确认退出保护意图: shutdownId={} ownedChunks={} players={} "
                             + "exit.prepare_ms={} exit.begin_ms={}",
                     shutdownId, begin.manifest().chunks().size(),
@@ -179,6 +179,10 @@ public final class ClientExitCoordinator {
                 }
             });
             disconnected.join();
+
+            // 游戏连接断开不再隐式停止集成服：显式通知独立计算进程保存并停服。
+            // finalBundle只有子服SERVER_STOPPED之后的耐久本机尾部就绪事件才能完成。
+            WorkerProcess.stopForExit().join();
 
             phaseStarted = System.nanoTime();
             ExitBundle bundle = finalBundle.join();
@@ -226,7 +230,7 @@ public final class ClientExitCoordinator {
         while (true) {
             attempt++;
             try {
-                return GroupRuntime.beginExitDrain(shutdownId).get();
+                return WorkerProcess.beginExitDrain(shutdownId).get();
             } catch (Exception e) {
                 LOGGER.warn("固定本地退出清单失败（第 {} 次），继续重试: {}",
                         attempt, e.toString());

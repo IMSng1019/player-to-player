@@ -65,7 +65,7 @@ public final class PresyncSender {
     private static final int SNAPSHOT_BATCH_CHUNKS = 32;
     private static final long SNAPSHOT_BATCH_NANOS = TimeUnit.MILLISECONDS.toNanos(2);
 
-    private final ReliableChannel channel;
+    private final PresyncChannel channel;
     private final SnapshotSource source;
     private final String label;
     /** 进度回调（阶段名；MergeClient 转成 MERGE_PROGRESS 上报服务端）。 */
@@ -81,13 +81,13 @@ public final class PresyncSender {
         }
     };
 
-    public PresyncSender(ReliableChannel channel, MinecraftServer server,
+    public PresyncSender(PresyncChannel channel, MinecraftServer server,
                          ChunkClaimClient claims, String label, Consumer<String> progress) {
         this(channel, new MinecraftSnapshotSource(server, claims), label, progress);
     }
 
     /** 世界读取和传输分离，使同一真实协议流程可以验证悬置区块与尾部覆盖顺序。 */
-    PresyncSender(ReliableChannel channel, SnapshotSource source,
+    PresyncSender(PresyncChannel channel, SnapshotSource source,
                   String label, Consumer<String> progress) {
         this.channel = channel;
         this.source = source;

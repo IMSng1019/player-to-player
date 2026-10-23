@@ -43,6 +43,39 @@ test {
 	useJUnitPlatform()
 }
 
+// 独立计算服务端使用 Loom 的真实 server 运行配置；不能借用客户端的 named/client-only
+// 类路径，也不能让远端下发的脚本决定本机开发进程的启动参数。描述只写入生成目录。
+def workerLaunchSpec = layout.buildDirectory.file('p2p/worker-launch.json')
+tasks.register('writeWorkerLaunchSpec') {
+	group = 'fabric'
+	description = 'Exports the local Loom server launch configuration for isolated P2P workers.'
+	dependsOn tasks.named('configureLaunch'), tasks.named('classes')
+	outputs.file(workerLaunchSpec)
+	doLast {
+		def launch = tasks.named('runServer').get()
+		def destination = workerLaunchSpec.get().asFile
+		destination.parentFile.mkdirs()
+		destination.setText(groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson([
+			classpath: launch.classpath.asPath,
+			mainClass: launch.mainClass.get(),
+			jvmArguments: launch.allJvmArgs
+		])), 'UTF-8')
+	}
+}
+tasks.named('runClient') {
+	dependsOn tasks.named('writeWorkerLaunchSpec')
+	jvmArgs '-Dp2p.worker.developmentSpec=' + workerLaunchSpec.get().asFile.absolutePath
+}
+
+// 显式开启的真实子进程冒烟；正常单元测试不会额外启动 Minecraft。
+if (providers.gradleProperty('p2pWorkerSmoke').isPresent()) {
+	tasks.named('test') {
+		dependsOn tasks.named('writeWorkerLaunchSpec')
+		systemProperty 'p2p.worker.smoke', 'true'
+		systemProperty 'p2p.worker.developmentSpec', workerLaunchSpec.get().asFile.absolutePath
+	}
+}
+
 processResources {
 	// Gradle 进程使用系统原生编码时，资源模板仍固定按 UTF-8 读取，避免中文内容损坏。
 	filteringCharset = "UTF-8"

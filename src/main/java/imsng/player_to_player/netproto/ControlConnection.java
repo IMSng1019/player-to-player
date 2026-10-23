@@ -38,6 +38,11 @@ public interface ControlConnection {
     /** 设置对端身份（仅握手处理器调用）。 */
     void setPeerId(UUID peerId);
 
+    /** 登录前专用下载连接：没有玩家身份，限制为环境读取，不能升级成控制会话。 */
+    default void restrictToEnvironment() {
+        throw new UnsupportedOperationException("此连接不支持登录前环境下载");
+    }
+
     /** 连接是否仍然可用。 */
     boolean isOpen();
 

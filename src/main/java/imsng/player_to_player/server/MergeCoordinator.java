@@ -206,6 +206,12 @@ public final class MergeCoordinator {
             conn.send(error(msg, "target_offline", "目标组不在线: " + targetGroup));
             return;
         }
+        // 不能把两个不同启动环境的NBT/注册表合并；只认角色准入时固定的版本证据，
+        // 不认同UUID后来重新HELLO的声明，也不以动态存档snapshotId判定静态环境。
+        if (!EnvironmentAdmissionGate.SERVER.sameRuntime(requester, targetPrimary)) {
+            conn.send(error(msg, "environment_version_mismatch", "两组运行环境版本不同，禁止合并，请安全退出旧版本组后重新连接。"));
+            return;
+        }
         // 冷却：同组对短期内只允许一次尝试（失败风暴防护）
         String pairKey = pairKey(requesterGroup, targetGroup);
         long now = System.currentTimeMillis();
@@ -387,6 +393,11 @@ public final class MergeCoordinator {
     private synchronized void commit(MergeSession session) {
         if (session.state == State.COMMITTED || session.state == State.ABORTED) {
             return; // 幂等（重复 switched 回报 / 与超时中止竞态）
+        }
+        if (!EnvironmentAdmissionGate.SERVER.sameRuntime(
+                groups.primaryOf(session.groupA), groups.primaryOf(session.groupB))) {
+            abort(session, "合并提交前运行环境版本已变化或版本证据缺失");
+            return;
         }
         if (!session.readiness.tryCommit()) return;
         Set<UUID> preparedSource = new HashSet<>(session.preparingMembers);

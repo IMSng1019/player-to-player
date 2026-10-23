@@ -67,7 +67,7 @@ public final class EnvSyncServerHandlers {
     // ------------------------------------------------------------ ENV_MANIFEST
 
     /**
-     * ENV_MANIFEST_REQUEST（json: target）→ ENV_MANIFEST。
+     * ENV_MANIFEST_REQUEST（json: target, 可选 snapshotId）→ ENV_MANIFEST。
      * <p>
      * 应答字段：
      * <ul>
@@ -80,9 +80,12 @@ public final class EnvSyncServerHandlers {
      */
     private static void handleManifestRequest(ControlConnection conn, ControlMessage msg,
                                               EnvironmentSnapshotManager snapshots) {
-        EnvironmentSnapshot snapshot = snapshots.current();
+        // 双角色以及预检后的正式同步必须能读取同一旧版本；不能无视请求 ID 回最新版。
+        String requestedId = JsonUtil.getString(msg.json(), "snapshotId", "");
+        EnvironmentSnapshot snapshot = requestedId.isBlank() ? snapshots.current() : snapshots.find(requestedId);
         if (snapshot == null) {
-            conn.send(error(msg, "env_not_ready", "环境清单尚未就绪（扫描中或扫描失败）"));
+            conn.send(error(msg, requestedId.isBlank() ? "env_not_ready" : "snapshot_not_found",
+                    requestedId.isBlank() ? "环境清单尚未就绪（扫描中或扫描失败）" : "环境快照不存在或已过期: " + requestedId));
             return;
         }
         EnvironmentManifest full = snapshot.manifest();

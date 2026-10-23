@@ -55,7 +55,14 @@ final class NettyControlConnection extends SimpleChannelInboundHandler<ControlMe
      */
     private static final Set<MessageType> PRE_AUTH_TYPES = EnumSet.of(
             MessageType.HELLO, MessageType.PING, MessageType.PONG,
-            MessageType.ERROR, MessageType.RELAY_REGISTER);
+            MessageType.ERROR, MessageType.RELAY_REGISTER, MessageType.ENV_PREFLIGHT);
+
+    /** 环境预检不建立玩家身份，且只能访问这一组只读操作。 */
+    private static final Set<MessageType> ENVIRONMENT_READ_TYPES = EnumSet.of(
+            MessageType.ENV_PREFLIGHT, MessageType.ENV_MANIFEST_REQUEST,
+            MessageType.ENV_FILE_REQUEST, MessageType.MOD_LIST_REQUEST,
+            MessageType.PING, MessageType.PONG, MessageType.ERROR);
+    private volatile boolean environmentOnly;
 
     /** 消息类型 → 处理器（由 ControlServer/客户端连接器共享持有，本类只读）。 */
     private final Map<MessageType, MessageHandler> handlers;
@@ -89,6 +96,12 @@ final class NettyControlConnection extends SimpleChannelInboundHandler<ControlMe
     private volatile Channel channel;
     /** 对端身份（HELLO/RELAY_REGISTER 处理器设置）。 */
     private volatile UUID peerId;
+
+    @Override
+    public void restrictToEnvironment() {
+        if (peerId != null) throw new IllegalStateException("玩家会话不能改为环境预检会话");
+        environmentOnly = true;
+    }
 
     /** request() 的 _rid 发号器（每连接独立；实际编号 = {@link #ridBase} + 本计数器）。 */
     private final AtomicLong ridCounter = new AtomicLong();
@@ -209,7 +222,9 @@ final class NettyControlConnection extends SimpleChannelInboundHandler<ControlMe
         // 3. 握手门控（仅服务端/中转端接受的连接）：未认证（peerId 未设置）时只放行
         //    白名单类型，其余一律回 ERROR 不进处理器分发 —— 否则未握手连接可伪造
         //    groupId 申请区块、下载环境文件（各业务处理器天然受保护，无需逐个加守卫）
-        if (requireHandshake && peerId == null && !PRE_AUTH_TYPES.contains(msg.type())) {
+        if (requireHandshake && (environmentOnly
+                ? !ENVIRONMENT_READ_TYPES.contains(msg.type())
+                : peerId == null && !PRE_AUTH_TYPES.contains(msg.type()))) {
             LOGGER.warn("未握手连接 {} 发来 {}，已拒绝", remoteAddress(), msg.type());
             JsonObject err = new JsonObject();
             err.addProperty("code", "not_authenticated");

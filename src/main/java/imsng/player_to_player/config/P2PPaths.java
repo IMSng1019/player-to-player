@@ -39,6 +39,15 @@ public final class P2PPaths {
         this.root = gameDir.resolve(ROOT_DIR_NAME);
     }
 
+    private P2PPaths(Path path, boolean alreadyRoot) {
+        this.root = path.toAbsolutePath().normalize();
+    }
+
+    /** 隔离游戏实例仍复用原世界缓存根，避免每次重启在新 gameDir 下递归创建实例。 */
+    public static P2PPaths atRoot(Path root) {
+        return new P2PPaths(root, true);
+    }
+
     /** player-to-player 根目录。 */
     public Path root() {
         return root;

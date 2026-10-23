@@ -66,6 +66,7 @@ public final class P2PServerService {
 
     /** 实时环境快照管理器；首轮不可变快照发布前 HELLO 返回 envReady=false。 */
     private static volatile EnvironmentSnapshotManager environmentSnapshots;
+    private static volatile AutoCloseable environmentUpdates;
 
     private static volatile ControlServer controlServer;
     private static volatile ChunkRegistry chunkRegistry;
@@ -166,6 +167,13 @@ public final class P2PServerService {
         control.on(MessageType.HELLO,
                 new HelloHandler(config, computes, snapshots, worldName, players, permissions));
         EnvSyncServerHandlers.register(control, snapshots, config);
+        // 使用实际磁盘存档路径；显示名可能与 level-name 完全不同。
+        String worldRelativePath = serverRoot.toAbsolutePath().normalize()
+                .relativize(worldRoot.toAbsolutePath().normalize()).toString().replace('\\', '/');
+        EnvironmentPreflightServer.install(control, snapshots, worldName, worldRelativePath,
+                EnvironmentPreflightServer.readGameSettings(serverRoot), control::boundPort);
+        environmentUpdates = EnvironmentUpdateServer.register(control, snapshots, serverRoot,
+                groups, config, worldRelativePath);
         // 区块数据面（Phase 2）：CHUNK_DATA_REQUEST 下发 / CHUNK_DATA_UPLOAD 实时上行；
         // 返回的写回接口交给 RegistryHandlers 处理 CHUNK_RELEASE 携带的最终数据
         ChunkDataHandlers chunkData = ChunkDataHandlers.register(
@@ -635,6 +643,13 @@ public final class P2PServerService {
             return;
         }
         running = false;
+        EnvironmentPreflightServer.clear();
+        AutoCloseable updates = environmentUpdates;
+        environmentUpdates = null;
+        if (updates != null) {
+            try { updates.close(); }
+            catch (Exception error) { LOGGER.warn("关闭环境更新服务失败", error); }
+        }
 
         OwnershipChangeBroadcaster ownershipBroadcaster = ownershipChanges;
         ownershipChanges = null;

@@ -6,11 +6,13 @@ import imsng.player_to_player.config.P2PPaths;
 import imsng.player_to_player.config.WorldConfig;
 import imsng.player_to_player.core.ClientRole;
 import imsng.player_to_player.core.NodeContext;
-import imsng.player_to_player.group.GroupRuntime;
 import imsng.player_to_player.group.PlayerStateFiles;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.world.LocalSaveGuard;
 import imsng.player_to_player.world.WorldIdentity;
+import imsng.player_to_player.runtime.WorkerProcess;
+import imsng.player_to_player.client.env.EnvironmentPreflightClient;
+import imsng.player_to_player.util.ThreadPools;
 import net.minecraft.client.Minecraft;
 import net.minecraft.nbt.CompoundTag;
 import org.slf4j.Logger;
@@ -21,7 +23,7 @@ import java.nio.file.Path;
 import java.util.UUID;
 
 /**
- * 本地组世界启动器（主客户端，Phase 2；规范"主客户端……作为它这个组客户端的服务端"）。
+ * 本地组世界启动器：准备权威存档和冻结环境，后台启动独立 Fabric 服务端 JVM。
  * <p>
  * 被指派为主客户端前后分为两个阶段：
  * <ol>
@@ -29,12 +31,11 @@ import java.util.UUID;
  *       data/ 等 —— 服务端扫描时只排除了 region/poi/entities/DIM* 维度数据）带到
  *       {@code environment/primary/<世界名>/}；首次启动复制世界骨架，随后每次都用
  *       物理服务器权威玩家 NBT 同时覆盖 UUID 玩家文件与 level.dat 内嵌玩家；</li>
- *   <li><b>预置组运行时</b>（{@link GroupRuntime#arm}）：集成服务端一启动即被接管
- *       （申请门控、上行捕获、出生点跳过全部就位 —— arm 必须先于世界打开）；</li>
- *   <li><b>主线程切换</b>：编排性断开物理服务端 → 原版管线打开本地存档；</li>
- *   <li>接管完成回调里由 {@link GroupHost} 发布 LAN 端口并开始接待副客户端。</li>
+ *   <li>由子进程在世界打开前预置区块申请门控、上行捕获与出生点禁用；</li>
+ *   <li>父进程核对实际加载证明后，编排性断开旧游戏连接，走原版网络登录加入子服；</li>
+ *   <li>{@link GroupHost} 将同组成员的 P2P 连接桥接到这个服务端，身份经 IPC 精确绑定。</li>
  * </ol>
- * 任何一步失败：{@link GroupRuntime#disarm} + 会话拆除，玩家回到标题屏
+ * 任何一步失败都会停止失败实例并拆除会话，玩家回到标题屏
  * （日志给出可操作的原因），不会留下半初始化状态。
  */
 public final class LocalWorldLauncher {
@@ -52,7 +53,8 @@ public final class LocalWorldLauncher {
      *                      此时本地存档是从骨架重建的全新副本，仍属"已对齐"，但不得
      *                      从旧的本地磁盘缓存回退读
      */
-    public record PreparedWorld(Path savesRoot, String saveName, String worldIdentity) {
+    public record PreparedWorld(Path savesRoot, String saveName, String worldIdentity,
+                                Path worldFolder, Path environment, String worldPath) {
     }
 
     /**
@@ -70,36 +72,50 @@ public final class LocalWorldLauncher {
         String saveName = P2PPaths.sanitize(worldName);
         Path savesRoot = paths.dataDir(worldFolder, ClientRole.PRIMARY);
         Path saveDir = savesRoot.resolve(saveName);
-        Path envWorldDir = paths.environmentDir(worldFolder, ClientRole.PRIMARY).resolve(worldName);
+        Path environment = paths.environmentDir(worldFolder, ClientRole.PRIMARY);
+        String worldPath = EnvironmentPreflightClient.worldPath();
+        if (worldPath == null || worldPath.isBlank()) throw new IOException("环境预检未提供权威世界路径");
+        Path envWorldDir = environment.resolve(worldPath).normalize();
+        if (!envWorldDir.startsWith(environment.normalize())) throw new IOException("世界路径越过环境目录");
 
         String identity = prepareSave(envWorldDir, saveDir);
+        imsng.player_to_player.env.WorldEnvironmentResources.sync(envWorldDir, saveDir);
         PlayerStateFiles.installAuthoritative(saveDir, playerId, playerState);
         LOGGER.info("物理服务器权威玩家状态已安装到本地主缓存: {} (世界身份={})",
                 saveDir, WorldIdentity.shortId(identity));
         WorldConfig.updateWorldIdentity(paths.worldConfig(worldFolder), identity);
         SwitchTelemetry.mark("local_save_prepared");
-        return new PreparedWorld(savesRoot, saveName, identity);
+        return new PreparedWorld(savesRoot, saveName, identity, worldFolder, environment, worldPath);
     }
 
     /**
-     * 打开已经准备完成的本地组世界；本方法不再执行任何磁盘 IO。
+     * 后台安装并启动已经准备完成的组世界；渲染线程只执行最终游戏连接切换。
      */
     public static void launchPrepared(Minecraft minecraft, ControlConnection conn,
                                       PreparedWorld world, UUID groupId) {
-        NodeContext ctx = NodeContext.get();
-        // 预置组运行时：必须在世界打开前 —— MinecraftServerMixin 在 prepareLevels
-        // 阶段就要读到 isArmedOrActive，ChunkMapMixin 在首个区块加载前要拿到申请客户端。
-        // 同时把"本地存档身份已对齐"这一事实带进 main 源集：区块加载门控用它决定
-        // 能否回退读本地磁盘（未对齐时读到的是旧世界，见 ChunkMapMixin）。
-        GroupRuntime.arm(new GroupRuntime.GroupPlan(groupId, conn,
-                world.worldIdentity(), ctx.config().chunkClaimRetrySeconds, GroupHost::start));
-
-        minecraft.execute(() -> WorldSwitcher.switchToLocalWorld(
-                minecraft, world.savesRoot(), world.saveName(), () -> {
-            // 打开失败/被玩家取消：撤销预置并拆除会话（半初始化状态不可留）
-            GroupRuntime.disarm();
-            WorldSession.teardownSession();
-        }));
+        // 独立JVM加载同步来的Fabric服务端环境；启动和IO不占渲染线程。
+        // 子服READY之前保留当前游戏连接，失败时不会先把玩家移入半启动世界。
+        ThreadPools.startBlocking("worker-launch", () -> {
+            try {
+                if (!WorldSession.isCurrentConnection(conn)) return;
+                int gamePort = WorkerProcess.start(world.worldFolder(), world.environment(), world.worldPath(),
+                        world.savesRoot(), world.saveName(), world.worldIdentity(), groupId, conn,
+                        WorldSession.runtimeProperties(),
+                        EnvironmentPreflightClient.prepared().environments().primaryManifest(),
+                        EnvironmentPreflightClient.prepared().info().runtimeHash());
+                if (!WorldSession.isCurrentConnection(conn)) { WorkerProcess.closeSession(); return; }
+                GroupHost.startWorker(gamePort, conn, groupId);
+                int bridgePort = WorkerProcess.openLocalPlayerBridge();
+                minecraft.execute(() -> {
+                    if (!WorldSession.isCurrentConnection(conn)) { WorkerProcess.closeSession(); return; }
+                    WorldSwitcher.markTunnelPort(bridgePort);
+                    WorldSwitcher.switchToTunnel(minecraft, bridgePort, NodeContext.get().playerName());
+                });
+            } catch (Exception error) {
+                LOGGER.error("独立计算服务端启动失败", error);
+                WorldSession.transitionFailed(conn, "独立计算服务端启动失败，请查看该世界runtime目录下的日志。");
+            }
+        });
     }
 
     /**

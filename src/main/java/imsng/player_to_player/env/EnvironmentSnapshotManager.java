@@ -18,9 +18,11 @@ import java.util.List;
 import java.util.ArrayList;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
+import java.util.function.Consumer;
 
 /**
  * 环境快照实时管理器。
@@ -43,6 +45,7 @@ public final class EnvironmentSnapshotManager {
     private final Object stateLock = new Object();
     private final Map<String, EnvironmentSnapshot> snapshots = new ConcurrentHashMap<>();
     private final Map<WatchKey, Path> watchDirectories = new ConcurrentHashMap<>();
+    private final List<Consumer<EnvironmentSnapshot>> publicationListeners = new CopyOnWriteArrayList<>();
 
     private volatile EnvironmentSnapshot current;
     private volatile boolean running;
@@ -91,11 +94,7 @@ public final class EnvironmentSnapshotManager {
         try {
             Files.createDirectories(sourceRoot);
             snapshots.putAll(store.loadSnapshots());
-            watchService = FileSystems.getDefault().newWatchService();
-            registerAllDirectories(sourceRoot);
-            watchThread = ThreadPools.namedFactory("p2p-env-watch")
-                    .newThread(this::watchLoop);
-            watchThread.start();
+            startWatcher();
             scheduleBuild(0L);
             maintenanceTask = ThreadPools.scheduler().scheduleWithFixedDelay(
                     this::runMaintenance,
@@ -113,6 +112,17 @@ public final class EnvironmentSnapshotManager {
             snapshot.touch();
         }
         return snapshot;
+    }
+
+    /**
+     * 订阅后续发布的不同版本，不补发当前版本；调用方可先订阅再读取 current()。
+     * 回调在构建 IO 线程执行，应只排队广播/更新任务；单个监听器异常不影响发布或
+     * 其他监听器。关闭订阅后不再接收新一轮发布，已经执行中的回调可能仍会完成。
+     */
+    public AutoCloseable onPublished(Consumer<EnvironmentSnapshot> listener) {
+        java.util.Objects.requireNonNull(listener, "listener");
+        publicationListeners.add(listener);
+        return () -> publicationListeners.remove(listener);
     }
 
     /** 按 ID 查找仍在保留期内的快照。 */
@@ -167,6 +177,11 @@ public final class EnvironmentSnapshotManager {
                 debounceTask.cancel(false);
                 debounceTask = null;
             }
+            if (sourceUpdateDepth == 1) {
+                // Windows WatchService 的目录句柄会阻止根目录重命名。事务安装前必须
+                // 关闭监听而不仅是取消构建；失败恢复或成功安装后都重新注册新目录。
+                closeWatcher();
+            }
         }
     }
 
@@ -183,6 +198,12 @@ public final class EnvironmentSnapshotManager {
             }
             sourceUpdateDepth--;
             if (sourceUpdateDepth == 0) {
+                if (running) {
+                    try { startWatcher(); }
+                    catch (IOException error) {
+                        LOGGER.warn("重建环境目录监听失败，暂由周期校验追赶", error);
+                    }
+                }
                 dirty = publish;
                 if (running && publish) {
                     scheduleBuildLocked(0L);
@@ -258,11 +279,18 @@ public final class EnvironmentSnapshotManager {
             EnvironmentSnapshot built = store.buildSnapshot();
             String fingerprintAfter = store.sourceFingerprint();
             if (running) {
+                EnvironmentSnapshot previous = current;
                 snapshots.put(built.snapshotId(), built);
                 current = built;
                 publishedSourceFingerprint = fingerprintAfter;
                 LOGGER.info("环境快照已发布: id={} 文件数={}",
                         built.snapshotId(), built.manifest().files().size());
+                if (previous == null || !previous.snapshotId().equals(built.snapshotId())) {
+                    for (Consumer<EnvironmentSnapshot> listener : publicationListeners) {
+                        try { listener.accept(built); }
+                        catch (RuntimeException error) { LOGGER.warn("环境发布监听器执行失败", error); }
+                    }
+                }
                 if (!fingerprintBefore.equals(fingerprintAfter)) {
                     // 构建窗口内源目录又变化：当前版本仍然内部一致，但需立即追赶最新状态。
                     requestRefresh();
@@ -337,10 +365,11 @@ public final class EnvironmentSnapshotManager {
         store.cleanupStaging(cutoff);
     }
 
-    private void watchLoop() {
+    /** 每个监听线程只使用创建时的 watcher，避免旧线程在关闭时误接管新 watcher。 */
+    private void watchLoop(WatchService watcher) {
         while (running) {
             try {
-                WatchKey key = watchService.take();
+                WatchKey key = watcher.take();
                 Path directory = watchDirectories.get(key);
                 if (directory == null) {
                     key.reset();
@@ -384,6 +413,29 @@ public final class EnvironmentSnapshotManager {
                 }
             }
         }
+    }
+
+    private void startWatcher() throws IOException {
+        WatchService watcher = FileSystems.getDefault().newWatchService();
+        watchService = watcher;
+        try {
+            registerAllDirectories(sourceRoot);
+            watchThread = ThreadPools.namedFactory("p2p-env-watch").newThread(() -> watchLoop(watcher));
+            watchThread.start();
+        } catch (IOException error) {
+            closeWatcher();
+            throw error;
+        }
+    }
+
+    private void closeWatcher() {
+        WatchService watcher = watchService;
+        watchService = null;
+        if (watcher != null) {
+            try { watcher.close(); }
+            catch (IOException error) { LOGGER.warn("关闭环境目录监听器失败", error); }
+        }
+        watchDirectories.clear();
     }
 
     private void registerAllDirectories(Path start) throws IOException {

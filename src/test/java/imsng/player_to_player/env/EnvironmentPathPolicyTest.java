@@ -10,6 +10,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class EnvironmentPathPolicyTest {
 
     @Test
+    void excludesRegenerableFabricCachesButKeepsServerRuntimeDependencies() {
+        EnvironmentPathPolicy policy = EnvironmentPathPolicy.create(List.of());
+        assertFalse(policy.includes(".fabric/processedMods/nested.jar"));
+        assertFalse(policy.includes(".fabric/remappedJars/minecraft/server-intermediary.jar"));
+        assertFalse(policy.includes(".fabric/tmp/remap.jar"));
+        assertTrue(policy.includes(".fabric/server/fabric-server-launch.jar"));
+    }
+
+    @Test
     void includesStableEnvironmentAndWorldBootstrapFiles() {
         EnvironmentPathPolicy policy = EnvironmentPathPolicy.create(List.of());
 

@@ -47,6 +47,8 @@ public final class ControlServer implements HandlerRegistry {
     private static final Logger LOGGER = LoggerFactory.getLogger("player_to_player/netproto");
 
     private final int port;
+    /** 子进程 IPC 仅绑定回环地址；普通控制端口保持原先的全接口监听语义。 */
+    private final String bindAddress;
     /** 消息类型 → 处理器；start 前注册完毕，运行期只读。 */
     private final Map<MessageType, MessageHandler> handlers = new ConcurrentHashMap<>();
     /** 断连监听器（P2PServerService/RelayCore 清理状态用）。 */
@@ -64,7 +66,12 @@ public final class ControlServer implements HandlerRegistry {
      *             中转面 {@code GlobalConfig.relayPort}）
      */
     public ControlServer(int port) {
+        this(null, port);
+    }
+
+    public ControlServer(String bindAddress, int port) {
         this.port = port;
+        this.bindAddress = bindAddress;
     }
 
     /** {@inheritDoc} 必须在 {@link #start} 之前调用。 */
@@ -121,7 +128,8 @@ public final class ControlServer implements HandlerRegistry {
                                             Protocol.RID_BASE_ACCEPTOR));
                         }
                     });
-            serverChannel = bootstrap.bind(port).syncUninterruptibly().channel();
+            serverChannel = (bindAddress == null ? bootstrap.bind(port)
+                    : bootstrap.bind(bindAddress, port)).syncUninterruptibly().channel();
             bossGroup = boss;
             workerGroup = worker;
             LOGGER.info("控制服务器已监听端口 {}", boundPort());

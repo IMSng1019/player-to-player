@@ -22,13 +22,13 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 /**
- * 组运行时（Phase 2）：主客户端"集成服务端接管"的静态桥梁。
+ * 组运行时：运行世界主线程的计算 JVM 中，区块所有权与Minecraft服务器实例的桥梁。
  * <p>
- * 主客户端在本机启动一个集成服务端来运算世界主线程（规范"主客户端……作为它这个
- * 组客户端的服务端"）。参与方分散在两个源集：
+ * 主客户端在本机启动独立Fabric服务端来运算世界主线程。父进程只负责网络编排，
+ * 本类和全部世界对象始终留在同一计算JVM，不能通过静态字段跨进程访问：
  * <ul>
- *   <li><b>src/client</b>（编排方）：{@code LocalWorldLauncher} 在启动本地世界<b>前</b>
- *       调用 {@link #arm} 预置组计划；</li>
+ *   <li>{@code runtime.WorkerBootstrap} 在初始化阶段、打开世界<b>前</b>
+ *       调用 {@link #arm}，控制连接是经过认证的父进程IPC代理；</li>
  *   <li><b>src/main</b>（执行方）：{@code GroupServerHooks} 在 SERVER_STARTED 事件里
  *       {@link #tryAttach}（集成服务端类在 common 侧可见，事件处理器不必放 client
  *       源集）；Mixin（区块申请门控/上行捕获）经 {@link #isManagedLevel} 判定生效范围。</li>

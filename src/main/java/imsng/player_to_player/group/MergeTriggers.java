@@ -66,4 +66,9 @@ public final class MergeTriggers {
             }
         }
     }
+
+    /** 父进程收到经过认证的子服阻塞事件后，复用同一抑制/合并请求门控。 */
+    public static void trigger(UUID blockingGroup, ChunkKey blockedChunk) {
+        onClaimBlocked(blockingGroup, blockedChunk);
+    }
 }

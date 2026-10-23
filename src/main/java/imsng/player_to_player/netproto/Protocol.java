@@ -21,7 +21,8 @@ public final class Protocol {
     // v6 增加撮合 sessionId 应答、预建隧道握手及合并准备/提交屏障。
     // v5 无法遵守新时序，因此服务端、中转端与客户端统一升级。
     // v7 将分离改为 prepare→旧区域卸载及耐久释放→commit，旧端的直接改挂不再兼容。
-    public static final int VERSION = 7;
+    // v8 增加登录前只读环境会话、固定版本安装与独立计算进程；所有节点统一升级。
+    public static final int VERSION = 8;
 
     /** 单帧最大长度（16 MB）：超限视为恶意/损坏连接，立即断开。环境文件按块传输不会超过它。 */
     public static final int MAX_FRAME_BYTES = 16 * 1024 * 1024;

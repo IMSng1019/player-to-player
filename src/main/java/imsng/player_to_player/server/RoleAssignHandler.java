@@ -113,7 +113,15 @@ public final class RoleAssignHandler implements MessageHandler {
             }
             boolean current = HelloHandler.withCurrentSession(conn, () -> {
                 try {
-                    assignRole(conn, msg, peer);
+                    // 退出恢复可能等待另一任务的组表清理，必须先于环境准入/组表事务锁。
+                    abandonExitBeforeAdmission(peer);
+                    ChunkKey target = locatePlayerChunk(peer);
+                    String refused = EnvironmentAdmissionGate.SERVER.admit(groups, peer,
+                            HelloHandler.runtimeHashOf(peer), () -> {
+                                var info = EnvironmentPreflightServer.currentInfo();
+                                return info == null ? "" : info.runtimeHash();
+                            }, () -> assignRole(conn, msg, peer, target));
+                    if (!refused.isEmpty()) conn.send(error(msg, "environment_version_blocked", refused));
                 } catch (Exception e) {
                     LOGGER.error("角色指派失败: {}", peer, e);
                     conn.send(error(msg, "assign_failed", e.toString()));
@@ -126,16 +134,18 @@ public final class RoleAssignHandler implements MessageHandler {
         });
     }
 
-    /** 角色决策主流程（io 线程）。 */
-    private void assignRole(ControlConnection conn, ControlMessage msg, UUID peer) {
+    /** 在组表写事务前完成旧退出恢复，避免等待清理future时反向持有清理所需的组表锁。 */
+    private void abandonExitBeforeAdmission(UUID peer) {
         int abandoned = abandonPendingExitNow != null
                 ? abandonPendingExitNow.applyAsInt(peer) : 0;
         if (abandoned > 0) {
             LOGGER.warn("客户端 {} 正常重进，已按强杀回退结束 {} 个旧退出事务，"
                     + "保留最后一次实时确认数据", peer, abandoned);
         }
-        // ---- 1. 目标区块：玩家存档位置，无存档用主世界出生点 ----
-        ChunkKey target = locatePlayerChunk(peer);
+    }
+
+    /** 角色决策主流程（io线程，环境版本与组表共用准入事务；磁盘读取已在锁外完成）。 */
+    private void assignRole(ControlConnection conn, ControlMessage msg, UUID peer, ChunkKey target) {
 
         // ---- 2. 查目标区块 + 四邻的占用组（规范：检查该区块以及周围四个区块）----
         UUID owningGroup = findOwningGroup(target, peer);

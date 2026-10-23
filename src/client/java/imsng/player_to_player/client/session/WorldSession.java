@@ -8,6 +8,8 @@ import imsng.player_to_player.client.group.MergeClient;
 import imsng.player_to_player.client.group.SecondaryJoiner;
 import imsng.player_to_player.client.group.WorldSwitcher;
 import imsng.player_to_player.client.net.PortSyncClient;
+import imsng.player_to_player.client.env.EnvironmentPreflightClient;
+import imsng.player_to_player.runtime.WorkerProcess;
 import imsng.player_to_player.compute.ComputeScore;
 import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.config.P2PPaths;
@@ -85,7 +87,7 @@ public final class WorldSession {
     private static final Object SESSION_LOCK = new Object();
 
     /** 当前活跃会话的控制客户端；null = 无会话。读写均在 {@link #SESSION_LOCK} 内。 */
-    private static ControlClient controlClient;
+    private static volatile ControlClient controlClient;
 
     /** 退出事务断线重连所需的物理服会话身份；均在 SESSION_LOCK 内读写。 */
     private static String sessionHost;
@@ -93,6 +95,10 @@ public final class WorldSession {
     private static int sessionControlPort;
     private static UUID sessionPlayerId;
     private static String sessionPlayerName;
+    /** 由登录预检绑定版本的中心游戏设置，只供独立 worker 生成受控 server.properties。 */
+    private static volatile java.util.Map<String, String> runtimeProperties = java.util.Map.of();
+
+    public static java.util.Map<String, String> runtimeProperties() { return runtimeProperties; }
 
     /**
      * 会话代数：快速离开再加入时，旧的后台建连/重试流程据此发现自己已过期。
@@ -106,10 +112,10 @@ public final class WorldSession {
 
     /** 后台准备任务在投递切换前后均验证连接，旧世界迟到任务不得切走新世界。 */
     public static boolean isCurrentConnection(ControlConnection conn) {
-        synchronized (SESSION_LOCK) {
-            return conn != null && conn.isOpen() && controlClient != null
-                    && controlClient.connection() == conn;
-        }
+        // 合并处理器可能持有 MergeClient.class 调用此方法；只读volatile快照，
+        // 避免与拆除期间 SESSION_LOCK→MergeClient.reset 的锁顺序形成环。
+        ControlClient active = controlClient;
+        return conn != null && conn.isOpen() && active != null && active.connection() == conn;
     }
 
     // ------------------------------------------------------------------ 加入
@@ -200,7 +206,7 @@ public final class WorldSession {
         // 早在加入物理服务端时就建立了，切换期间被切换旗标保住，无需重建。
         ServerData serverData = client.getCurrentServer();
         if (serverData == null || client.isLocalServer()) {
-            if (GroupRuntime.isArmedOrActive()) {
+            if (WorkerProcess.isRunning()) {
                 pendingSplit = null;
                 SwitchTelemetry.joined();
             }
@@ -214,6 +220,11 @@ public final class WorldSession {
             pendingSplit = null;
             SwitchTelemetry.joined();
             LOGGER.info("经 P2P 隧道加入主客户端组世界，物理服务端会话保持");
+            return;
+        }
+        // 普通/旧版服务器没有环境登录查询，不能猜测其 25580 端口，更不能盖住正常游戏界面。
+        if (EnvironmentPreflightClient.preparedFor(rawAddress) == null) {
+            LOGGER.debug("此连接没有 P2P 环境预检票据，保留普通服务器行为");
             return;
         }
         // 玩家身份：clientId 使用玩家 UUID（规范；服务端/中转端才用随机 UUID）
@@ -251,10 +262,15 @@ public final class WorldSession {
             LOGGER.info("主客户端耐久退出进行中，P2P 会话等待最终提交确认");
             return;
         }
+        if (WorkerProcess.isStarting()) {
+            // 玩家在进程准备期间离开必须立即撤销本次意图；不能等待迟到READY再把玩家切回世界。
+            teardownSession();
+            return;
+        }
         // 主客户端退出本地组世界：DISCONNECT 事件先于集成服务端完全停止，
         // 而停服 saveAll 的区块上行还要走控制连接 —— 延迟到 SERVER_STOPPED
         // 后由 GroupRuntime 的停止回调（ClientBootstrap 挂接）执行拆除
-        if (GroupRuntime.isArmedOrActive()) {
+        if (WorkerProcess.isRunning()) {
             LOGGER.info("集成服务端仍在停止流程中，P2P 会话延迟拆除（等待最终区块上行）");
             return;
         }
@@ -266,40 +282,43 @@ public final class WorldSession {
      * 全部 P2P 会话、中转连接，清空组上下文。
      */
     public static void teardownSession() {
-        SwitchTelemetry.finish("session_closed");
-        pendingSplit = null;
-        ControlClient cc;
+        teardownSession(null);
+    }
+
+    /** 停止回调只可拆除其来源会话；身份核对、失效、全局资源清理与新连接发布同锁串行。 */
+    public static void teardownSession(ControlConnection expected) {
         synchronized (SESSION_LOCK) {
+            if (expected != null && (controlClient == null || controlClient.connection() != expected)) return;
+            SwitchTelemetry.finish("session_closed");
+            EnvironmentLiveUpdates.stop();
+            WorkerProcess.closeSession();
+            pendingSplit = null;
             generation++; // 使仍在后台跑的建连/重试流程过期
-            cc = controlClient;
+            ControlClient cc = controlClient;
             controlClient = null;
             sessionHost = null;
             sessionControlPort = 0;
             sessionPlayerId = null;
             sessionPlayerName = null;
+            runtimeProperties = java.util.Map.of();
+            if (cc != null) {
+                cc.close();
+                LOGGER.info("P2P 世界会话已关闭");
+            }
+            // 全局子系统也在发布锁内清理，不能在释放锁后把新会话的P2P/分组状态一起清掉。
+            GroupHost.reset();
+            LocalPermissions.reset();
+            P2PSessions.closeAll();
+            RelayConnector.closeAll();
+            MergeClient.reset();
+            CommandRelayClient.reset();
+            PearlHandoff.reset();
+            PortalPreloader.reset();
+            WorldSwitcher.markTunnelPort(0);
+            NodeContext ctx = NodeContext.get();
+            ctx.setGroupId(null);
+            ctx.setClientRole(ClientRole.UNASSIGNED);
         }
-        if (cc != null) {
-            cc.close();
-            LOGGER.info("P2P 世界会话已关闭");
-        }
-        // P2P 直连/中转会话独立于控制连接，必须整体关闭 —— 否则打洞成功的 UDP socket、
-        // 阻塞 receive 的 io 线程、keepalive 定时任务在离开世界后全部残留，
-        // 多次进出世界会持续累积泄漏（P2PChannel/RelayClient 的 close 均幂等，重复关闭安全）
-        GroupHost.reset(); // 先撤掉宿主接待面，防止 teardown 期间再接入新隧道
-        // 宿主实例重启保留提前收到的权限，但真正离开物理服会话必须清空，
-        // 包括一直作为副客户端、从未启动本地集成服的情况。
-        LocalPermissions.reset();
-        P2PSessions.closeAll();
-        RelayConnector.closeAll();
-        MergeClient.reset(); // 合并触发面/预同步暂存不得跨会话残留
-        // Phase 4 各子系统的限速/在途状态同样不得跨会话残留（全部幂等）
-        CommandRelayClient.reset();
-        PearlHandoff.reset();
-        PortalPreloader.reset();
-        WorldSwitcher.markTunnelPort(0); // 清除隧道口登记，防旧端口误匹配下次加入
-        NodeContext ctx = NodeContext.get();
-        ctx.setGroupId(null);
-        ctx.setClientRole(ClientRole.UNASSIGNED);
     }
 
     // ------------------------------------------------------------ 会话主流程
@@ -318,14 +337,16 @@ public final class WorldSession {
         ctx.setPlayerName(playerName); // 日志上传等落盘命名用（Phase 4）
 
         // ---- 1. 解析服务端主机（地址可能是 "host:MC端口"，控制端口独立于 MC 端口）----
-        String host = stripPort(rawAddress);
+        EnvironmentPreflightClient.Prepared preflight = EnvironmentPreflightClient.preparedFor(rawAddress);
+        if (preflight == null) return;
+        String host = preflight.host();
         if (host.isEmpty()) {
             LOGGER.warn("服务器地址为空，P2P 会话不启动");
             return;
         }
 
         // ---- 2. 解析控制端口（优先服务端经 MC 通道同步）+ 连接 + HELLO 握手 ----
-        ResolvedPorts ports = resolvePorts(config);
+        ResolvedPorts ports = new ResolvedPorts(preflight.info().controlPort(), preflight.info().relayPort(), true);
         if (myGeneration != generation) {
             // 等待端口期间玩家已离开/重进：旧 join-flow 绝不能再用旧 host 建连，
             // 更不能改写 RelayConnector —— 新会话可能已经用新端口建立了自己的配置。
@@ -397,6 +418,9 @@ public final class WorldSession {
                 return;
             }
             String worldName = JsonUtil.getString(ackJson, "worldName", "world");
+            if (!worldName.equals(preflight.info().worldName()))
+                throw new IOException("服务器世界在预检后发生变化，请重新连接");
+            runtimeProperties = preflight.info().worldProperties();
             String envHash = JsonUtil.getString(ackJson, "envHash", "");
             boolean envReady = JsonUtil.getBoolean(ackJson, "envReady", false);
             LOGGER.info("握手成功: 世界={} envReady={} 中转={}:{}", worldName, envReady,
@@ -410,10 +434,10 @@ public final class WorldSession {
                     ? "支持（全量上链）" : "不支持（保持原版本地执行语义）");
 
             // ---- 3. 世界文件夹（<IP>+<世界名>）与世界配置 ----
-            Path worldFolder = paths.worldFolder(host, worldName);
+            Path worldFolder = preflight.worldFolder();
             paths.ensureWorldDirs(worldFolder);
             WorldConfig worldConfig = WorldConfig.loadOrCreate(
-                    paths.worldConfig(worldFolder), host, worldName);
+                    paths.worldConfig(worldFolder), preflight.address(), worldName);
             worldConfig.lastJoinedEpochMillis = System.currentTimeMillis();
             worldConfig.save(paths.worldConfig(worldFolder));
 
@@ -423,25 +447,8 @@ public final class WorldSession {
             // 合并/分离客户端（Phase 3）：MERGE_PLAN/ABORT/COMMIT 处理器 +
             // 区块拒绝触发面（服务端可能在角色指派后的任意时刻下发合并计划）
             MergeClient.register(cc, conn);
-            cc.on(MessageType.CHUNK_OWNERSHIP_CHANGED, (c, msg) -> {
-                if (!isCurrentConnection(conn)) return;
-                var claims = GroupRuntime.claims();
-                if (claims == null || !msg.json().has("changedGroups")
-                        || !msg.json().get("changedGroups").isJsonArray()) return;
-                for (var group : msg.json().getAsJsonArray("changedGroups")) {
-                    try { claims.wakeBlockedClaims(UUID.fromString(group.getAsString())); }
-                    catch (IllegalArgumentException | IllegalStateException ignored) { }
-                }
-            });
-            // Phase 4 逐级路由入站面：其他组指令的转发执行、跨组聊天/私聊重放、
-            // 末影珍珠交接/落点回报（处理器内部按"是否有被接管集成服务端"门控，
-            // 副客户端收到这些推送时 GroupRuntime.server()==null，安全忽略）
-            CommandRelayClient.register(cc);
-            ChatRelay.register(cc);
-            PearlHandoff.register(cc);
-            // 权限下发（Phase 4 收口）：服务端按 ops 名单核出的真实等级 →
-            // 本机集成服务端落权（F3+F4 / 补全 / 未拦截路径），见 LocalPermissions
-            LocalPermissions.register(cc);
+            // 世界逻辑消息由实际运行独立服务端的 worker 消费，渲染进程仅持有中心会话。
+            WorkerProcess.registerForwarders(cc, conn);
             // 分离晋升（Phase 3）：服务端主动推送的 ROLE_ASSIGN（不带 _rid，
             // 不会与 requestRoleAndSwitch 的 reply 路径冲突 —— 带 _rid 的应答
             // 在连接层被 pending future 消费，永远不进处理器分发）
@@ -450,7 +457,7 @@ public final class WorldSession {
             cc.on(MessageType.SPLIT_PREPARE, (c, m) -> handleSplitPrepare(conn, m));
             cc.on(MessageType.SPLIT_ABORT, (c, m) -> {
                 if (!isCurrentConnection(conn)) return;
-                try { imsng.player_to_player.group.SplitMonitor.requestCancel(
+                try { WorkerProcess.cancelSplit(
                         UUID.fromString(JsonUtil.getString(m.json(), "splitId", ""))); }
                 catch (IllegalArgumentException ignored) { }
             });
@@ -465,21 +472,13 @@ public final class WorldSession {
             // relayAddress 空串 = 服务端兼任中转：复用已知可达的服务端主机
             RelayConnector.configure(relayAddress.isEmpty() ? host : relayAddress, relayPort);
 
-            // ---- 5. 环境同步：每次加入都做真实校验 ----
-            // 规范要求"校验本地环境是否与服务端的环境的哈希值相同"——校验对象是本地环境的
-            // 真实状态。不再用 worldConfig.lastEnvironmentHash 缓存短路：玩家在两次加入之间
-            // 改/删过本地环境文件时，缓存哈希与服务端 envHash 相等并不代表本地真实一致。
-            // EnvSyncClient 内部本来就是"拉清单→本地扫描→diff→零差异零下载"，
-            // 本地一致时的代价只是一次目录扫描。缓存哈希降级为日志提示。
-            if (!envHash.isEmpty() && envHash.equals(worldConfig.lastEnvironmentHash)) {
-                LOGGER.info("环境哈希与上次同步记录一致，仍执行本地真实校验（防本地文件被改动）");
-            }
-            boolean synced = syncEnvironmentsWithRetry(conn, config, paths, worldFolder,
-                    worldConfig, envHash, envReady, myGeneration, relayAddress, relayPort);
-            if (!synced || myGeneration != generation) {
-                if (myGeneration == generation) transitionFailed(conn, "世界环境同步未完成，请检查日志后重试。");
-                return;
-            }
+            // ---- 5. 接续已经完成的登录前环境校验，并挂接运行期更新服务 ----
+            // 登录前已经下载并完整校验两套目录。这里复用其同一 snapshot，绝不在通过
+            // 模组/注册表校验后再换一套新环境；静态更新由后台 pending 目录等待重连生效。
+            if (myGeneration != generation) return;
+            worldConfig.lastEnvironmentHash = preflight.environments().snapshotId();
+            worldConfig.save(paths.worldConfig(worldFolder));
+            EnvironmentLiveUpdates.start(cc, conn, worldFolder, preflight.info(), preflight.environments());
 
             // ---- 6. 角色申请与世界切换（Phase 2）----
             requestRoleAndSwitch(conn, worldFolder, worldName, myGeneration);
@@ -500,6 +499,8 @@ public final class WorldSession {
         hello.addProperty("clientId", playerId.toString());
         hello.addProperty("playerName", playerName);
         hello.addProperty("mode", ctx.mode().id());
+        // 环境版本贯穿正式控制会话，服务端选主/合并只能组合实际运行同一静态版本的节点。
+        hello.addProperty("runtimeHash", EnvironmentPreflightClient.activeRuntimeHash());
         // 指令路由能力位：服务端据此决定是否按"全量上链"语义处理上送
         //（缺省 0 = 老客户端语义；新服务端会忽略未声明的上送，避免重复执行）
         hello.addProperty("commandRouting", 1);

@@ -10,6 +10,7 @@ import imsng.player_to_player.netproto.*;
 import imsng.player_to_player.p2p.*;
 import imsng.player_to_player.util.JsonUtil;
 import imsng.player_to_player.util.ThreadPools;
+import imsng.player_to_player.runtime.WorkerProcess;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.level.storage.LevelResource;
 import org.slf4j.Logger;
@@ -37,7 +38,6 @@ public final class MergeClient {
         final CompletableFuture<Void> drained = new CompletableFuture<>();
         volatile PreparedTunnel tunnel;
         volatile ReliableChannel sync;
-        volatile PresyncReceiver receiver;
         volatile boolean commitReceived;
 
         ActiveMerge(UUID id, UUID target, UUID source, UUID self) {
@@ -50,7 +50,7 @@ public final class MergeClient {
             aborted.set(true);
             if (tunnel != null) tunnel.close();
             if (sync != null) sync.abort();
-            if (receiver != null) receiver.cancel();
+            if (yielding || receiving) WorkerProcess.cancelPresync();
             committed.completeExceptionally(new IllegalStateException("合并已取消"));
             drained.completeExceptionally(new IllegalStateException("合并已取消"));
         }
@@ -81,7 +81,7 @@ public final class MergeClient {
         if (previous != null) previous.cancel();
         MergeTriggers.setConsumer(null);
         GroupHost.setPresyncHandler(null);
-        PresyncStore.clear();
+        WorkerProcess.cancelPresync();
         lastTriggerAt = 0;
     }
 
@@ -166,12 +166,10 @@ public final class MergeClient {
             ReliableChannel channel = merge.sync;
             if (merge.aborted.get() || channel == null || !channel.isOpen())
                 throw new IllegalStateException("预建传输已失效");
-            var server = GroupRuntime.server();
-            var claims = GroupRuntime.claims();
-            if (server == null || claims == null || merge.aborted.get())
+            if (!WorkerProcess.isManagedWorld() || merge.aborted.get())
                 throw new IllegalStateException("原组运行时已失效");
-            new PresyncSender(channel, server, claims, merge.id.toString(),
-                    phase -> progress(conn, merge, phase, true)).run();
+            WorkerProcess.runPresync(channel, merge.id.toString(), true,
+                    phase -> progress(conn, merge, phase, true));
             if (merge.aborted.get()) return;
             // 接收器已读完 TAIL_DONE，同一流随后只交给游戏隧道准备协议。
             PreparedTunnel tunnel = PreparedTunnel.prepare(channel, merge.id.toString());
@@ -188,6 +186,10 @@ public final class MergeClient {
             // 网络超时不能等同“服务端已取消”：提交结果未明确前保持冻结，防两端都写。
             merge.committed.join();
             merge.drained.join();
+            // 独立子服不随Minecraft.disconnect停止。先消费编排断开旗标，再明确停掉已
+            // 退休的旧写者；整个过程仍保留中心控制连接和预建目标隧道。
+            WorldSwitcher.disconnectForSwitch(Minecraft.getInstance()).get();
+            WorkerProcess.stopRetired();
             NodeContext.get().setGroupId(merge.target);
             NodeContext.get().setClientRole(ClientRole.SECONDARY);
             GroupHost.reset();
@@ -209,6 +211,7 @@ public final class MergeClient {
         GroupHost.setPresyncHandler((header, channel, terminated) -> {
             synchronized (MergeClient.class) {
                 if (active != merge || !merge.id.equals(uuid(header, "mergeId")) || merge.aborted.get()
+                        || !merge.source.equals(uuid(header, "_peerClientId"))
                         || !WorldSession.isCurrentConnection(conn)
                         || !merge.started.compareAndSet(false, true)) {
                     channel.abort();
@@ -216,25 +219,21 @@ public final class MergeClient {
                     return;
                 }
                 merge.sync = channel;
-                var server = GroupRuntime.server();
-                if (server == null) {
+                if (!WorkerProcess.isManagedWorld()) {
                     channel.abort();
                     terminated.run();
                     return;
                 }
-                merge.receiver = new PresyncReceiver(channel,
-                        server.getWorldPath(LevelResource.PLAYER_DATA_DIR), merge.id.toString(), phase -> { });
             }
             ThreadPools.startBlocking("presync-receive", () -> {
                 boolean handedOff = false;
                 try {
-                    var server = GroupRuntime.server();
-                    if (server == null || merge.aborted.get()) throw new IllegalStateException("接管组运行时已停止");
+                    if (!WorkerProcess.isManagedWorld() || merge.aborted.get()) throw new IllegalStateException("接管组运行时已停止");
                     JsonObject ready = new JsonObject();
                     ready.addProperty("op", "presync_ready");
                     ready.addProperty("mergeId", merge.id.toString());
                     TcpTunnel.writeHeader(channel, ready.toString());
-                    merge.receiver.run();
+                    WorkerProcess.runPresync(channel, merge.id.toString(), false, phase -> { });
                     if (merge.aborted.get()) return;
                     progress(conn, merge, "caught_up", true);
                     JsonObject tunnelHeader = JsonUtil.parseObject(TcpTunnel.readHeader(channel, 15));
@@ -242,7 +241,8 @@ public final class MergeClient {
                             || !merge.id.equals(uuid(tunnelHeader, "transactionId")))
                         throw new java.io.IOException("预同步后的隧道事务不匹配");
                     handedOff = true;
-                    PreparedTunnel.accept(channel, tunnelHeader, GroupHost::currentPort, terminated);
+                    PreparedTunnel.accept(channel, tunnelHeader, GroupHost::currentPort, terminated,
+                            socket -> WorkerProcess.authorizeGameSocket(socket, merge.source));
                 } catch (Exception error) {
                     LOGGER.error("合并 {} 预同步接收失败", merge.id, error);
                     progress(conn, merge, "failed", false);
@@ -261,8 +261,8 @@ public final class MergeClient {
         ActiveMerge merge = matching(msg);
         if (merge == null || merge.commitReceived) return;
         merge.cancel();
-        if (merge.yielding) GroupRuntime.setTickFrozen(false);
-        if (merge.receiving) PresyncStore.clear();
+        if (merge.yielding) WorkerProcess.freeze(false);
+        if (merge.receiving) WorkerProcess.cancelPresync();
         GroupHost.setPresyncHandler(null);
         active = null;
         SwitchTelemetry.finish("merge_aborted");
@@ -279,7 +279,12 @@ public final class MergeClient {
             try {
                 // COMMIT 才是写权限终止点。不能等成员排空，更不能等 SERVER_STOPPED
                 // 才终结旧 claim：Saving worlds 正在依赖这些加载 future 收束。
-                GroupRuntime.retireAfterTransfer(merge.source);
+                WorkerProcess.retireAfterTransfer(merge.source).whenComplete((ignored, error) -> {
+                    if (error != null) {
+                        merge.committed.completeExceptionally(error);
+                        LOGGER.error("合并提交后旧计算进程退休失败，保持冻结", error);
+                    } else merge.committed.complete(null);
+                });
             } catch (RuntimeException retirementFailure) {
                 merge.committed.completeExceptionally(retirementFailure);
                 LOGGER.error("合并 {} 已提交，但旧运行时退休失败；保持冻结避免旧主继续写入",
@@ -287,12 +292,11 @@ public final class MergeClient {
                 return;
             }
         }
-        merge.committed.complete(null);
+        if (!merge.yielding) merge.committed.complete(null);
         if (merge.receiving) {
             NodeContext.get().setGroupId(group);
             GroupHost.setPresyncHandler(null);
-            var claims = GroupRuntime.claims();
-            if (claims != null) claims.wakeBlockedClaims(merge.source);
+            WorkerProcess.wakeBlockedClaims(merge.source);
             // 原主 B 不重登录；已有的被拒区块申请由权威归属变更通知唤醒。
             SwitchTelemetry.finish("merge_received");
             clearIfCurrent(merge);

@@ -8,6 +8,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -20,6 +21,40 @@ class EnvironmentSnapshotManagerTest {
 
     @TempDir
     Path tempDir;
+
+    @Test
+    void publicationListenersOnlyReceiveChangedVersionsAndCanUnsubscribe() throws Exception {
+        Path source = tempDir.resolve("source-listener");
+        Files.createDirectories(source.resolve("config"));
+        Files.writeString(source.resolve("config/value.txt"), "first");
+        EnvironmentSnapshotManager manager = new EnvironmentSnapshotManager(source,
+                tempDir.resolve("repository-listener"), List.of(), Duration.ofMillis(10),
+                Duration.ofSeconds(30), Duration.ofMinutes(10));
+        List<String> observed = new CopyOnWriteArrayList<>();
+        AutoCloseable broken = manager.onPublished(ignored -> { throw new IllegalStateException("listener failed"); });
+        AutoCloseable subscription = manager.onPublished(snapshot -> observed.add(snapshot.snapshotId()));
+        try {
+            manager.start();
+            await(() -> observed.size() == 1);
+            manager.requestRefresh();
+            Thread.sleep(100);
+            assertEquals(1, observed.size());
+            Files.writeString(source.resolve("config/value.txt"), "second");
+            manager.requestRefresh();
+            await(() -> observed.size() == 2);
+            assertEquals(manager.current().snapshotId(), observed.get(1));
+            subscription.close();
+            String second = manager.current().snapshotId();
+            Files.writeString(source.resolve("config/value.txt"), "third");
+            manager.requestRefresh();
+            await(() -> !manager.current().snapshotId().equals(second));
+            assertEquals(2, observed.size());
+        } finally {
+            subscription.close();
+            broken.close();
+            manager.stop();
+        }
+    }
 
     @Test
     void publishesNewSnapshotAfterIncludedSourceFileChanges() throws Exception {
@@ -94,6 +129,32 @@ class EnvironmentSnapshotManagerTest {
         manager.stop();
 
         assertDoesNotThrow(() -> manager.endSourceUpdate(false));
+    }
+
+    @Test
+    void replacingSourceRootRegistersWatchesOnTheNewDirectory() throws Exception {
+        Path source = tempDir.resolve("source-replaced");
+        Files.createDirectories(source.resolve("config"));
+        Files.writeString(source.resolve("config/value.txt"), "first");
+        EnvironmentSnapshotManager manager = new EnvironmentSnapshotManager(source,
+                tempDir.resolve("repository-replaced"), List.of(), Duration.ofMillis(10),
+                Duration.ofSeconds(30), Duration.ofMinutes(10));
+        try {
+            manager.start();
+            await(() -> manager.current() != null);
+            String first = manager.current().snapshotId();
+            manager.beginSourceUpdate();
+            Files.move(source, tempDir.resolve("old-root"));
+            Files.createDirectories(source.resolve("config"));
+            Files.writeString(source.resolve("config/value.txt"), "second");
+            manager.endSourceUpdate(true);
+            await(() -> !manager.current().snapshotId().equals(first));
+            String second = manager.current().snapshotId();
+            Files.writeString(source.resolve("config/value.txt"), "third");
+            await(() -> !manager.current().snapshotId().equals(second));
+        } finally {
+            manager.stop();
+        }
     }
 
     @Test

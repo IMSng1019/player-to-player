@@ -12,6 +12,9 @@
 	"icon": "assets/player_to_player/icon.png",
 	"environment": "*",
 	"entrypoints": {
+		"preLaunch": [
+			"imsng.player_to_player.env.ClientRuntimeStartup"
+		],
 		"main": [
 			"imsng.player_to_player.Player_to_player"
 		],

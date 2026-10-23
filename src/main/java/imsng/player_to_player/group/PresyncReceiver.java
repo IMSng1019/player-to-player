@@ -44,7 +44,7 @@ public final class PresyncReceiver {
     /** 单条记录 NBT 解压上限（与发送侧/服务端一致；防解压炸弹）。 */
     private static final long MAX_NBT_BYTES = 64L * 1024 * 1024;
 
-    private final ReliableChannel channel;
+    private final PresyncChannel channel;
     /** B 本地存档的 playerdata 目录（null = 不落玩家数据，仅暂存区块）。 */
     private final Path playerDataDir;
     private final String label;
@@ -59,7 +59,7 @@ public final class PresyncReceiver {
         if (cancelled) throw new IOException("预同步事务已取消");
     }
 
-    public PresyncReceiver(ReliableChannel channel, Path playerDataDir, String label,
+    public PresyncReceiver(PresyncChannel channel, Path playerDataDir, String label,
                            Consumer<String> progress) {
         this.channel = channel;
         this.playerDataDir = playerDataDir;

@@ -52,7 +52,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 入站处理在 transport 的接收线程上（契约：不阻塞 —— 本层入站只做 map 操作与
  * 一次 ACK 发送）。重传定时器在 {@link ThreadPools#scheduler()} 上。
  */
-public final class ReliableChannel implements AutoCloseable {
+public final class ReliableChannel implements AutoCloseable, imsng.player_to_player.group.PresyncChannel {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("player_to_player/reliable");
 

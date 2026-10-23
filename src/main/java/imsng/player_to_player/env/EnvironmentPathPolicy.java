@@ -21,6 +21,10 @@ public final class EnvironmentPathPolicy {
     private static final List<String> BUILTIN_EXCLUSIONS = List.of(
             "logs",
             "player-to-player",
+            // Loader会重新提取/重映射这些缓存；.fabric/server是真实启动依赖，必须保留。
+            ".fabric/processedMods",
+            ".fabric/remappedJars",
+            ".fabric/tmp",
             "world/region",
             "world/poi",
             "world/entities",

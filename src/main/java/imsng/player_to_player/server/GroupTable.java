@@ -36,6 +36,11 @@ public final class GroupTable {
     /** 写路径互斥锁。 */
     private final Object lock = new Object();
 
+    /** 环境准入检查与角色写入共享同一组表事务，避免观察到merge/split的中间空表。 */
+    <T> T withMutationLock(java.util.function.Supplier<T> action) {
+        synchronized (lock) { return action.get(); }
+    }
+
     /**
      * 创建一个以该客户端为主客户端的新组（groupId == primaryClientId）。
      * 该客户端若已在其他组中，先移出（重复 ROLE_REQUEST / 快速重进的防御）。

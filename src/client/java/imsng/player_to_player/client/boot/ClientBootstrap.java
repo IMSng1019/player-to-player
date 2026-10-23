@@ -112,6 +112,7 @@ public final class ClientBootstrap {
         //    会在建控制连接前短暂等待本通道的数据。
         // ---------------------------------------------------------------
         PortSyncClient.register();
+        imsng.player_to_player.client.env.EnvironmentPreflightClient.register();
 
         // ---------------------------------------------------------------
         // d. 加入/离开世界钩子 → 世界会话开合（具体流程全部在 WorldSession）。
@@ -121,10 +122,7 @@ public final class ClientBootstrap {
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> WorldSession.onJoin(client));
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> WorldSession.onLeave(client));
 
-        // 集成服务端 SERVER_STARTED 早于本地玩家登录完成，不能在服务器回调中直接
-        // publishServer。每个客户端 tick 末尾仅做常量时间状态检查；门控满足后只消费一次，
-        // 不使用固定延时，也不会因机器性能差异提前发布。
-        ClientTickEvents.END_CLIENT_TICK.register(GroupHost::onClientTick);
+        // 组服务端由独立 worker 的 READY 发布；客户端 tick 仅更新切换界面遥测。
         ClientTickEvents.END_CLIENT_TICK.register(SwitchTelemetry::tick);
 
         // ---------------------------------------------------------------
@@ -133,9 +131,9 @@ public final class ClientBootstrap {
         //    onLeave 对此延迟拆除，由 GroupRuntime 在 SERVER_STOPPED（detach）后
         //    经本回调补拆。回调在服务器线程触发，拆除转 io 线程执行。
         // ---------------------------------------------------------------
-        GroupRuntime.setStopListener(() ->
-                ThreadPools.io().execute(WorldSession::teardownSession));
-        GroupRuntime.setExitBundleListener(ClientExitCoordinator::onExitBundle);
+        imsng.player_to_player.runtime.WorkerProcess.setStopListener(
+                (imsng.player_to_player.netproto.ControlConnection connection) -> WorldSession.teardownSession(connection));
+        imsng.player_to_player.runtime.WorkerProcess.setExitBundleListener(ClientExitCoordinator::onExitBundle);
 
         LOGGER.info("客户端引导完成：算力/NAT 探测已在后台进行，世界加入钩子已注册");
     }

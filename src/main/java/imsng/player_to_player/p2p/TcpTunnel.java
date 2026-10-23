@@ -70,6 +70,10 @@ public final class TcpTunnel {
     private TcpTunnel() {
     }
 
+    /** 子服游戏连接必须在首个MC字节前登记经P2P验证的真实身份。 */
+    @FunctionalInterface
+    public interface SocketAuthorization { void authorize(Socket socket) throws IOException; }
+
     // ------------------------------------------------------------ 会话头
 
     /** 写入一条隧道会话头（长度前缀 UTF 字符串，内容为 JSON）。 */
@@ -117,6 +121,11 @@ public final class TcpTunnel {
      */
     public static void bridgeToLocalPort(ReliableChannel channel, int port, String label,
                                          Runnable onTerminated) {
+        bridgeToLocalPort(channel, port, label, onTerminated, socket -> { });
+    }
+
+    public static void bridgeToLocalPort(ReliableChannel channel, int port, String label,
+                                         Runnable onTerminated, SocketAuthorization authorization) {
         // 连接 + 两个方向的泵都是阻塞长驻任务，必须用专用线程（有界 io 池承载不了
         // "整局游戏都占着"的任务，见 ThreadPools#startBlocking）
         ThreadPools.startBlocking("tunnel-bridge", () -> {
@@ -124,6 +133,7 @@ public final class TcpTunnel {
             try {
                 socket.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 10_000);
                 socket.setTcpNoDelay(true);
+                authorization.authorize(socket);
                 startPumps(channel, socket, label, onTerminated);
             } catch (IOException e) {
                 LOGGER.warn("隧道 {} 连接本机端口 {} 失败: {}", label, port, e.toString());
@@ -192,10 +202,17 @@ public final class TcpTunnel {
     /** 准备端已收到激活后连接 LAN，并在任何游戏字节之前发送确认。 */
     static void activateAndBridge(ReliableChannel channel, int port, String label,
                                   String activationReply, Runnable terminated) throws IOException {
+        activateAndBridge(channel, port, label, activationReply, terminated, socket -> { });
+    }
+
+    static void activateAndBridge(ReliableChannel channel, int port, String label,
+                                  String activationReply, Runnable terminated,
+                                  SocketAuthorization authorization) throws IOException {
         Socket socket = new Socket();
         try {
             socket.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 10_000);
             socket.setTcpNoDelay(true);
+            authorization.authorize(socket);
             writeHeader(channel, activationReply);
             startPumps(channel, socket, label, terminated);
         } catch (IOException error) {

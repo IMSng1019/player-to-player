@@ -3,6 +3,8 @@
 	"package": "imsng.player_to_player.client.mixin",
 	"compatibilityLevel": "JAVA_17",
 	"client": [
+		"ClientLoginAccess",
+		"ConnectScreenMixin",
 		"CommandDispatchMixin",
 		"MinecraftExitMixin",
 		"PauseScreenAccessor",

@@ -64,6 +64,9 @@ public final class HelloHandler implements MessageHandler {
     /** clientId → HELLO 上报的 NAT 探测信息（打洞协助时转发给对端）。 */
     private static final Map<UUID, NatInfo> NAT_TABLE = new ConcurrentHashMap<>();
 
+    /** 当前控制会话声明的实际启动环境，独立于已准入组的运行版本证据。 */
+    private static final Map<UUID, String> RUNTIME_HASHES = new ConcurrentHashMap<>();
+
     /** 固定条带锁串行同一客户端的新 HELLO 发布与权威写任务。 */
     private static final Object[] SESSION_LOCKS = new Object[256];
 
@@ -139,6 +142,7 @@ public final class HelloHandler implements MessageHandler {
                 computeTable.report(clientId, score);
             }
             NAT_TABLE.put(clientId, nat);
+            RUNTIME_HASHES.put(clientId, JsonUtil.getString(json, "runtimeHash", ""));
             // 身份声明与实际发布同临界区：客户端约定 clientId == 玩家档案 UUID，
             // 故这里既建立玩家表的第一行，也建立"本连接代表谁"的自洽判据
             //（ConnectionIdentity 的成员校验、PermissionRelay 的名单下发都用它）。
@@ -253,6 +257,9 @@ public final class HelloHandler implements MessageHandler {
         return NAT_TABLE.getOrDefault(clientId, NatInfo.UNKNOWN);
     }
 
+    /** 仅ROLE准入读取当前HELLO声明；已有组/合并使用EnvironmentAdmissionGate的固定证据。 */
+    static String runtimeHashOf(UUID clientId) { return RUNTIME_HASHES.getOrDefault(clientId, ""); }
+
     /**
      * 仅当连接仍是该 UUID 当前会话时执行动作；检查与动作和新 HELLO 发布原子互斥。
      */
@@ -305,6 +312,7 @@ public final class HelloHandler implements MessageHandler {
                 // 该客户端已完全离线才清 NAT 信息与 P2P 公钥指纹
                 //（重连会随新 HELLO + P2PSessions.register 重新上报）
                 NAT_TABLE.remove(clientId);
+                RUNTIME_HASHES.remove(clientId);
                 P2PKeyGate.SERVER.forget(clientId);
                 // 身份声明同理：连接已被新会话替换时不得误清（新 HELLO 刚写入的值）
                 ConnectionIdentity.forget(clientId);
@@ -320,6 +328,8 @@ public final class HelloHandler implements MessageHandler {
     static void clearAll() {
         ONLINE.clear();
         NAT_TABLE.clear();
+        RUNTIME_HASHES.clear();
+        EnvironmentAdmissionGate.SERVER.clear();
         ConnectionIdentity.clearAll();
         // 撮合指纹表与待定撮合同属"按会话存活的静态身份数据"：服务停止一并清空，
         // 避免重启后拿着上一个进程的指纹撮合（服务已停，超时定时器也不会再触发）。

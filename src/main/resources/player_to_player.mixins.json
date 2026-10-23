@@ -16,7 +16,8 @@
 		"ServerChunkCacheMainThreadExecutorMixin",
 		"ServerLevelMixin",
 		"ServerPlayerMixin",
-		"ThrownEnderpearlMixin"
+		"ThrownEnderpearlMixin",
+		"WorkerLoginMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

@@ -77,6 +77,12 @@ public final class PreparedTunnel implements AutoCloseable {
     /** 宿主接待准备会话；调用方已保留名额，直至实际隧道关闭才释放。 */
     public static void accept(ReliableChannel channel, JsonObject header, IntSupplier port,
                               Runnable terminated) {
+        accept(channel, header, port, terminated, socket -> { });
+    }
+
+    /** 授权回调先于 active 确认，未完成身份登记时客户端不会开始Minecraft登录。 */
+    public static void accept(ReliableChannel channel, JsonObject header, IntSupplier port,
+                              Runnable terminated, TcpTunnel.SocketAuthorization authorization) {
         boolean handedOff = false;
         try {
             String id = JsonUtil.getString(header, "transactionId", "");
@@ -87,7 +93,7 @@ public final class PreparedTunnel implements AutoCloseable {
             int currentPort = port.getAsInt();
             if (currentPort <= 0) throw new IOException("宿主已停止接待");
             TcpTunnel.activateAndBridge(channel, currentPort, "prepared:" + id,
-                    message("active", id).toString(), terminated);
+                    message("active", id).toString(), terminated, authorization);
             handedOff = true;
         } catch (Exception error) {
             channel.abort();

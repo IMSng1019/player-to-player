@@ -70,6 +70,22 @@ public final class WorldSwitcher {
         SWITCHING.set(true);
     }
 
+    /** 合并旧子服关停前先做编排性游戏断开，保证DISCONNECT不会拆除中心控制会话。 */
+    public static java.util.concurrent.CompletableFuture<Void> disconnectForSwitch(Minecraft minecraft) {
+        var done = new java.util.concurrent.CompletableFuture<Void>();
+        minecraft.execute(() -> {
+            try {
+                if (minecraft.level != null) {
+                    SWITCHING.set(true);
+                    minecraft.level.disconnect();
+                    minecraft.disconnect();
+                }
+                done.complete(null);
+            } catch (Throwable error) { done.completeExceptionally(error); }
+        });
+        return done;
+    }
+
     /** 登记副客户端隧道监听端口（SecondaryJoiner 建好隧道后调用；0 = 清除登记）。 */
     public static void markTunnelPort(int port) {
         tunnelPort = port;

@@ -84,11 +84,11 @@ class EnvSyncPairTest {
                 .syncPair(primary, secondary).get(5, TimeUnit.SECONDS);
 
         assertEquals(List.of("PRIMARY_CLIENT:config/main.txt"), connection.fileRequests);
-        assertTrue(Files.exists(secondary.resolve("config/old-world.txt")));
+        assertFalse(Files.exists(secondary.resolve("config/old-world.txt")));
     }
 
     @Test
-    void changedSourceFallsBackToItsOwnSnapshotDownload() throws Exception {
+    void changedPublishedDirectoryDoesNotCorruptValidatedStagingReuse() throws Exception {
         PairConnection connection = new PairConnection(
                 Map.of("config/shared.txt", "shared"),
                 Map.of("config/a-first.txt", "unique", "config/shared.txt", "shared"));
@@ -96,7 +96,7 @@ class EnvSyncPairTest {
         Path secondary = tempDir.resolve("secondary");
         connection.beforeFile = key -> {
             if (key.equals("SECONDARY_CLIENT:config/a-first.txt")) {
-                // 模拟主角色同步完成后、复用前配置被运行中的模组改写，大小保持不变。
+                // 模拟下载期间旧环境被模组改写；副角色仍可复用已验证的主角色暂存内容。
                 write(primary.resolve("config/shared.txt"), "broken");
             }
         };
@@ -104,7 +104,8 @@ class EnvSyncPairTest {
         new EnvSyncClient(connection, new GlobalConfig())
                 .syncPair(primary, secondary).get(5, TimeUnit.SECONDS);
 
-        assertEquals(3, connection.fileRequests.size());
+        assertEquals(2, connection.fileRequests.size());
+        assertEquals("shared", Files.readString(primary.resolve("config/shared.txt")));
         assertEquals("shared", Files.readString(secondary.resolve("config/shared.txt")));
         try (var files = Files.walk(secondary)) {
             assertFalse(files.anyMatch(path -> path.getFileName().toString().endsWith(".tmp")));
@@ -137,7 +138,7 @@ class EnvSyncPairTest {
     }
 
     @Test
-    void expiredSecondarySnapshotRefetchesOnlyItsOwnManifest() throws Exception {
+    void expiredSecondarySnapshotRefetchesBothManifests() throws Exception {
         PairConnection connection = new PairConnection(
                 Map.of("config/shared.txt", "shared"),
                 Map.of("config/shared.txt", "shared", "config/unique.txt", "unique"));
@@ -147,9 +148,9 @@ class EnvSyncPairTest {
                 .syncPair(tempDir.resolve("primary"), tempDir.resolve("secondary"))
                 .get(5, TimeUnit.SECONDS);
 
-        assertEquals(List.of(PRIMARY_CLIENT, SECONDARY_CLIENT, SECONDARY_CLIENT),
+        assertEquals(List.of(PRIMARY_CLIENT, SECONDARY_CLIENT, PRIMARY_CLIENT, SECONDARY_CLIENT),
                 connection.manifestRequests);
-        assertEquals(List.of("PRIMARY_CLIENT", "SECONDARY_CLIENT", "SECONDARY_CLIENT@2"),
+        assertEquals(List.of("v1", "v1", "v2", "v2"),
                 connection.requestedSnapshots);
         assertEquals("unique", Files.readString(tempDir.resolve("secondary/config/unique.txt")));
     }
@@ -198,14 +199,14 @@ class EnvSyncPairTest {
     }
 
     @Test
-    void downloadDoesNotTruncatePreexistingPredictableTemporaryPath() throws Exception {
+    void newDirectoryDoesNotRetainAnUnlistedPredictableTemporaryPath() throws Exception {
         PairConnection connection = new PairConnection(Map.of("config/shared.txt", "shared"), Map.of());
         Path primary = tempDir.resolve("primary");
         Path oldTemporary = primary.resolve("config/shared.txt.p2pdl.tmp");
         write(oldTemporary, "must remain untouched");
         new EnvSyncClient(connection, new GlobalConfig())
                 .syncPair(primary, tempDir.resolve("secondary")).get(5, TimeUnit.SECONDS);
-        assertEquals("must remain untouched", Files.readString(oldTemporary));
+        assertFalse(Files.exists(oldTemporary));
     }
 
     @FunctionalInterface
@@ -246,8 +247,7 @@ class EnvSyncPairTest {
                             : PRIMARY_CLIENT;
                     manifestRequests.add(target);
                     EnvironmentManifest manifest = manifests.get(target);
-                    json.addProperty("snapshotId", target.name()
-                            + (target == SECONDARY_CLIENT && secondaryExpired ? "@2" : ""));
+                    json.addProperty("snapshotId", secondaryExpired ? "v2" : "v1");
                     json.addProperty("filteredHash", manifest.globalHash());
                     json.add("manifest", manifest.toJson());
                     return CompletableFuture.completedFuture(ControlMessage.of(MessageType.ENV_MANIFEST, json));
@@ -255,8 +255,8 @@ class EnvSyncPairTest {
                 assertEquals(MessageType.ENV_FILE_REQUEST, message.type());
                 String snapshotId = message.json().get("snapshotId").getAsString();
                 requestedSnapshots.add(snapshotId);
-                var target = ModPrefixResolver.Target.valueOf(snapshotId.split("@")[0]);
                 String path = message.json().get("path").getAsString();
+                var target = contents.get(PRIMARY_CLIENT).containsKey(path) ? PRIMARY_CLIENT : SECONDARY_CLIENT;
                 assertEquals(0, message.json().get("offset").getAsLong());
                 String key = target.name() + ":" + path;
                 fileRequests.add(key);
