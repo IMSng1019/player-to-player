@@ -2,6 +2,7 @@ package imsng.player_to_player.mixin;
 
 import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.core.NodeContext;
+import imsng.player_to_player.group.GroupControlTasks;
 import imsng.player_to_player.group.GroupRuntime;
 import imsng.player_to_player.world.SpawnChunkPolicy;
 import net.minecraft.server.MinecraftServer;
@@ -13,6 +14,7 @@ import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
  * 出生点常加载区块禁用（规范出处：player_to_player-prompt.txt
@@ -54,6 +56,17 @@ public abstract class MinecraftServerMixin {
     @Unique
     private static final Logger player_to_player$LOGGER =
             LoggerFactory.getLogger("player_to_player/mixin");
+
+    /**
+     * 未进入同步区块等待时由正常服务器轮询推进迁移控制任务；每次最多执行一项，
+     * 原版任务队列保持独立，区块等待入口也不会因此重入游戏指令。
+     */
+    @Inject(method = "pollTask()Z", at = @At("HEAD"), cancellable = true)
+    private void player_to_player$pollMigrationControlTasks(CallbackInfoReturnable<Boolean> cir) {
+        if (GroupControlTasks.poll((MinecraftServer) (Object) this)) {
+            cir.setReturnValue(true);
+        }
+    }
 
     /**
      * 在 prepareLevels 头部按配置整体跳过出生点常加载与等待。

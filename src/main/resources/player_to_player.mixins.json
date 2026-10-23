@@ -13,6 +13,7 @@
 		"EntityPortalMixin",
 		"MinecraftServerMixin",
 		"PlayerListMixin",
+		"ServerChunkCacheMainThreadExecutorMixin",
 		"ServerLevelMixin",
 		"ServerPlayerMixin",
 		"ThrownEnderpearlMixin"

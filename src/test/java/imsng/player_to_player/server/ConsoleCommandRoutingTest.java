@@ -81,11 +81,13 @@ class ConsoleCommandRoutingTest {
     }
 
     @Test
-    void destinationOwnedByDifferentGroupIsRejectedBeforeSending() {
+    void teleportToAnotherGroupsChunkStillRunsOnMovedPlayersGroup() {
         var decision = plan("tp Alice 0.5 80 0.5", GROUP_B,
                 Map.of(new ChunkKey(DIMENSION, 0, 0), GROUP_B));
-        assertEquals(ConsoleCommandRouting.Kind.REJECT, decision.kind());
-        assertFalse(decision.message().isBlank());
+        assertEquals(ConsoleCommandRouting.Kind.FORWARD, decision.kind());
+        assertEquals(GROUP_A, decision.groupId());
+        assertTrue(decision.ownedChunks().isEmpty(),
+                "传送的落点允许触发认领/合并，不能当成跨组方块写入而直接拒绝");
     }
 
     @Test
@@ -96,10 +98,12 @@ class ConsoleCommandRoutingTest {
     }
 
     @Test
-    void crossGroupPlayerDestinationIsExplicitlyRejected() {
+    void crossGroupPlayerDestinationUsesGlobalPositionAndMovedPlayersGroup() {
         var decision = plan("tp Alice Bob", GROUP_B, Map.of());
-        assertEquals(ConsoleCommandRouting.Kind.REJECT, decision.kind());
-        assertTrue(decision.message().contains("坐标"));
+        assertEquals(ConsoleCommandRouting.Kind.FORWARD, decision.kind());
+        assertEquals(GROUP_A, decision.groupId());
+        assertTrue(decision.command().contains("6000.0 70.0 6000.0"));
+        assertDoesNotThrow(() -> Commands.validateParseResults(dispatcher.parse(decision.command(), source())));
     }
 
     @Test

@@ -245,6 +245,7 @@ public final class GroupRuntime {
         localWorldIdentity = null; // 身份结论不跨接管残留（下次 arm 重新携带）
         LocalPermissions.resetRuntime(); // 只结束当前实例的应用记录，会话名单供下一次角色切换复用
         managedServer = null;
+        GroupControlTasks.discard(server); // 旧实例的迁移采集不得泄漏至下一次组世界。
         setTickFrozen(false); // 记录完整冻结时长（包含尾部后等待提交及原版停服）
         LoginLoadGuard.reset("集成服务端停止"); // 登录窗口/诊断不得跨世界残留
         LogUploader.stop(); // Phase 4：日志上行随接管终止
@@ -593,7 +594,9 @@ public final class GroupRuntime {
                 if (server.isSameThread()) {
                     install.run();
                 } else {
-                    server.execute(install);
+                    // 此 dependency 会被停服 saveAll 的区块 managedBlock 等待，
+                    // 因此不能投进该等待不消费的普通 MinecraftServer 队列。
+                    GroupControlTasks.executor(server).execute(install);
                 }
             } catch (RuntimeException schedulingError) {
                 dependency.completeExceptionally(schedulingError);
@@ -629,7 +632,7 @@ public final class GroupRuntime {
             if (server.isSameThread()) {
                 capture.run();
             } else {
-                server.execute(capture);
+                GroupControlTasks.executor(server).execute(capture);
             }
         } catch (RuntimeException schedulingError) {
             future.completeExceptionally(schedulingError);

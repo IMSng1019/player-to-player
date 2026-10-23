@@ -2,9 +2,11 @@ package imsng.player_to_player.group;
 
 import imsng.player_to_player.p2p.ReliableChannel;
 import imsng.player_to_player.registry.ChunkKey;
+import imsng.player_to_player.mixin.ChunkMapSplitAccess;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.storage.ChunkSerializer;
@@ -18,6 +20,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
@@ -36,16 +39,17 @@ import java.util.function.Consumer;
  *       单块序列化不可中断，时间预算是软上限。玩家数据一并快照；</li>
  *   <li><b>追赶</b>：SNAPSHOT_DONE / ACK_SNAPSHOT 握手后循环发送积累的增量，
  *       直至增量队列吃空（B 已接近同步）；</li>
- *   <li><b>原子切换</b>：{@link GroupRuntime#setTickFrozen 冻结} A 的世界演算
- *       → 主线程 saveAllChunks（所有脏区块经写盘咽喉产生最终增量）→ 发送尾部
- *       → TAIL_DONE / ACK_TAIL 握手。<b>冻结窗口只覆盖这一段</b>（存盘 + 尾部
+ *   <li><b>切换尾部</b>：{@link GroupRuntime#setTickFrozen 冻结} A 的后续世界演算
+ *       → 发送已有存盘增量 → 重新采集完整区块和玩家最终态 → 发送尾部
+ *       → TAIL_DONE / ACK_TAIL 握手。<b>冻结窗口只覆盖这一段</b>（采集 + 尾部
  *       传输 + 一次 ACK 往返），实际时长由阶段日志测量；300ms 是目标而非保证。</li>
  * </ol>
  * 任何失败即抛出（调用方回报 MERGE_PROGRESS failed 并解冻），A 继续运行 ——
  * 规范"若 B 追赶失败或断开，A 继续运行，服务端取消合并"。
  * <p>
  * 线程模型：{@link #run} 整体在 io 线程（阻塞流读写允许）；序列化经
- * {@code server.execute} 回主线程；增量分接的消费在主线程（只做 map put）。
+ * {@link GroupControlTasks} 回主线程；增量分接的消费在主线程（只做 map put）。
+ * 区块等待中的轮询不是完整 tick 边界，不能据此宣称迁移了任意模组的在途调用栈。
  */
 public final class PresyncSender {
 
@@ -62,8 +66,7 @@ public final class PresyncSender {
     private static final long SNAPSHOT_BATCH_NANOS = TimeUnit.MILLISECONDS.toNanos(2);
 
     private final ReliableChannel channel;
-    private final MinecraftServer server;
-    private final ChunkClaimClient claims;
+    private final SnapshotSource source;
     private final String label;
     /** 进度回调（阶段名；MergeClient 转成 MERGE_PROGRESS 上报服务端）。 */
     private final Consumer<String> progress;
@@ -80,9 +83,14 @@ public final class PresyncSender {
 
     public PresyncSender(ReliableChannel channel, MinecraftServer server,
                          ChunkClaimClient claims, String label, Consumer<String> progress) {
+        this(channel, new MinecraftSnapshotSource(server, claims), label, progress);
+    }
+
+    /** 世界读取和传输分离，使同一真实协议流程可以验证悬置区块与尾部覆盖顺序。 */
+    PresyncSender(ReliableChannel channel, SnapshotSource source,
+                  String label, Consumer<String> progress) {
         this.channel = channel;
-        this.server = server;
-        this.claims = claims;
+        this.source = source;
         this.label = label;
         this.progress = progress;
     }
@@ -102,11 +110,11 @@ public final class PresyncSender {
             progress.accept("presync_started");
 
             // ---- 1. 快照：占用区块 + 玩家数据 ----
-            Set<ChunkKey> snapshot = claims.claimedSnapshot();
+            Set<ChunkKey> snapshot = source.claimedChunks();
             LOGGER.info("预同步 {} 快照开始: {} 个区块", label, snapshot.size());
             SnapshotTiming snapshotTiming = new SnapshotTiming();
             SnapshotBatchCollector<ChunkKey, CompoundTag> collector = new SnapshotBatchCollector<>(
-                    snapshot.iterator(), server::execute, this::captureChunkOnMainThread,
+                    snapshot.iterator(), source.executor(), this::captureChunkOnMainThread,
                     SNAPSHOT_BATCH_CHUNKS, SNAPSHOT_BATCH_NANOS, System::nanoTime);
             boolean snapshotFinished = snapshot.isEmpty();
             while (!snapshotFinished) {
@@ -158,44 +166,42 @@ public final class PresyncSender {
                     throw new IOException("增量追赶超过 " + MAX_CATCHUP_ROUNDS + " 轮仍未收敛");
                 }
                 for (Map.Entry<ChunkKey, CompoundTag> e : batch.entrySet()) {
-                    byte[] gzip = ChunkUploadService.compress(e.getValue());
-                    if (gzip != null) {
-                        PresyncProtocol.writeRecord(out, PresyncProtocol.TYPE_CHUNK,
-                                e.getKey().asString(), gzip);
-                    }
+                    compressAndWrite(out, PresyncProtocol.TYPE_CHUNK,
+                            e.getKey().asString(), e.getValue(), null);
                 }
             }
             progress.accept("caught_up");
             timing.mark("catchup_sent");
 
-            // ---- 3. 原子切换：冻结 → 全量存盘（脏区块产生最终增量）→ 尾部 ----
+            // ---- 3. 切换尾部：冻结 → 历史增量 → 当前完整区块最终态 ----
             long freezeStart = System.nanoTime();
             timing.mark("freeze_begin");
-            GroupRuntime.setTickFrozen(true);
             frozen = true;
-            // saveAllChunks 在主线程执行：所有 unsaved 区块经写盘咽喉 → 分接器
-            //（suppressLogs=true, flush=true, forced=true —— 与停服 saveAll 同参）
-            runOnMainThread(() -> server.saveAllChunks(true, true, true));
-            timing.mark("save_all_complete");
+            // 冻结是实例校验后的 volatile 控制标志，可直接设置；不把置位排进可超时
+            // 队列，避免“等待已取消，迟到任务却又把世界冻结”的竞态。世界读取仍走主线程。
+            source.setFrozen(true);
+            // 不能调用 saveAllChunks(true)：它等待 holder.chunkToSave，其中含等待
+            // 他组归属的加载链；只有 COMMIT 才能解开该链，COMMIT 又在尾部之后。
+            // 先发送旧存盘事件，再重采集内存最终态，避免旧 NBT 覆盖未保存修改。
             Map<ChunkKey, CompoundTag> tail = drainDeltas();
             for (Map.Entry<ChunkKey, CompoundTag> e : tail.entrySet()) {
-                byte[] gzip = ChunkUploadService.compress(e.getValue());
-                if (gzip != null) {
-                    PresyncProtocol.writeRecord(out, PresyncProtocol.TYPE_CHUNK,
-                            e.getKey().asString(), gzip);
-                }
+                compressAndWrite(out, PresyncProtocol.TYPE_CHUNK,
+                        e.getKey().asString(), e.getValue(), null);
             }
+            SnapshotTiming tailTiming = new SnapshotTiming();
+            sendFinalChunks(out, tailTiming);
+            timing.mark("final_chunks_captured");
             sendPlayerData(out, null); // 玩家最终态（位置/背包）也在尾部重发一次
             PresyncProtocol.writeMarker(out, PresyncProtocol.TYPE_TAIL_DONE);
             awaitAck(in, PresyncProtocol.TYPE_ACK_TAIL);
             timing.finish("tail_ack");
-            LOGGER.info("预同步 {} 切换完成: 尾部 {} 个区块，冻结窗口 {} ms",
-                    label, tail.size(), (System.nanoTime() - freezeStart) / 1_000_000);
+            LOGGER.info("预同步 {} 切换完成: 历史增量 {} / 最终完整区块 {}，冻结窗口 {} ms",
+                    label, tail.size(), tailTiming.chunks, (System.nanoTime() - freezeStart) / 1_000_000);
             // 成功路径不解冻：A 即将关停集成服务端，冻结状态随 detach 一起清除
         } catch (Exception e) {
             timing.finish("failed");
             if (frozen) {
-                GroupRuntime.setTickFrozen(false); // 失败：A 解冻继续运行
+                source.setFrozen(false); // 失败：A 解冻继续运行
             }
             throw e;
         } finally {
@@ -207,15 +213,33 @@ public final class PresyncSender {
 
     /** 只在批次主线程任务中读取区块；NBT 交给后台工作线程压缩和发送。 */
     private CompoundTag captureChunkOnMainThread(ChunkKey key) {
-        try {
-            ServerLevel level = resolveLevel(key.dimension());
-            LevelChunk chunk = level != null
-                    ? level.getChunkSource().getChunkNow(key.x(), key.z())
-                    : null;
-            return chunk != null ? ChunkSerializer.write(level, chunk) : null;
-        } catch (Exception e) {
-            LOGGER.warn("预同步序列化失败（跳过，服务端存档兜底）: {}", key.asString(), e);
-            return null;
+        if (!channel.isOpen()) {
+            throw new IllegalStateException("预同步通道已关闭，取消迟到的采集任务");
+        }
+        // 已加载区块的序列化失败必须传播；只有确实未加载时才能返回 null。
+        return source.captureChunk(key);
+    }
+
+    /** 冻结后重新取占用集合，覆盖初始快照期间新加载的区块；仍按批次限制内存。 */
+    private void sendFinalChunks(DataOutputStream out, SnapshotTiming timing) throws Exception {
+        var collector = new SnapshotBatchCollector<>(source.claimedChunks().iterator(),
+                source.executor(), this::captureChunkOnMainThread,
+                SNAPSHOT_BATCH_CHUNKS, SNAPSHOT_BATCH_NANOS, System::nanoTime);
+        boolean finished = false;
+        while (!finished) {
+            var pending = collector.next();
+            SnapshotBatchCollector.Batch<ChunkKey, CompoundTag> batch;
+            try {
+                batch = pending.get(ACK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+            } catch (Exception error) {
+                pending.cancel(false);
+                throw error;
+            }
+            finished = batch.finished();
+            for (var entry : batch.values()) {
+                compressAndWrite(out, PresyncProtocol.TYPE_CHUNK,
+                        entry.getKey().asString(), entry.getValue(), timing);
+            }
         }
     }
 
@@ -226,20 +250,14 @@ public final class PresyncSender {
     private void sendPlayerData(DataOutputStream out, SnapshotTiming timing) throws Exception {
         long submitted = System.nanoTime();
         CompletableFuture<PlayerSnapshot> future = new CompletableFuture<>();
-        server.execute(() -> {
+        source.executor().execute(() -> {
             if (future.isCancelled()) {
                 return;
             }
             long started = System.nanoTime();
             try {
-                Map<String, CompoundTag> result = new LinkedHashMap<>();
-                for (var player : server.getPlayerList().getPlayers()) {
-                    try {
-                        result.put(player.getUUID().toString(), player.saveWithoutId(new CompoundTag()));
-                    } catch (Exception error) {
-                        LOGGER.warn("预同步玩家数据序列化失败: {}", player.getUUID(), error);
-                    }
-                }
+                if (!channel.isOpen()) throw new IOException("预同步通道已关闭");
+                Map<String, CompoundTag> result = source.capturePlayers();
                 future.complete(new PlayerSnapshot(result, started - submitted, System.nanoTime() - started));
             } catch (Exception error) {
                 future.completeExceptionally(error);
@@ -270,7 +288,7 @@ public final class PresyncSender {
             timing.compressNanos += System.nanoTime() - started;
         }
         if (gzip == null) {
-            return;
+            throw new IOException("预同步 NBT 压缩失败: " + key);
         }
         started = System.nanoTime();
         PresyncProtocol.writeRecord(out, type, key, gzip);
@@ -308,6 +326,8 @@ public final class PresyncSender {
             }
             Map<ChunkKey, CompoundTag> batch = new LinkedHashMap<>(deltas);
             deltas.clear();
+            // 卸载后也必须发送最终存盘态：接收端可能已有该块的旧快照，单独按当前
+            // claims 过滤增量会让旧快照残留。是否允许加载仍由接收端的 claim 门控决定。
             return batch;
         }
     }
@@ -326,27 +346,70 @@ public final class PresyncSender {
         }
     }
 
-    /** 在主线程执行任务并等待完成。 */
-    private void runOnMainThread(Runnable task) throws Exception {
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        server.execute(() -> {
-            try {
-                task.run();
-                future.complete(null);
-            } catch (Exception e) {
-                future.completeExceptionally(e);
-            }
-        });
-        future.get(ACK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+    /** 仅 executor/claimedChunks 与冻结标志可跨线程，捕获方法只在所属主线程调用。 */
+    interface SnapshotSource {
+        Executor executor();
+        Set<ChunkKey> claimedChunks();
+        CompoundTag captureChunk(ChunkKey key);
+        Map<String, CompoundTag> capturePlayers();
+        void setFrozen(boolean frozen);
     }
 
-    /** 按维度标识解析 ServerLevel。 */
-    private ServerLevel resolveLevel(String dimension) {
-        for (ServerLevel level : server.getAllLevels()) {
-            if (level.dimension().location().toString().equals(dimension)) {
-                return level;
+    private record MinecraftSnapshotSource(MinecraftServer server, ChunkClaimClient claims)
+            implements SnapshotSource {
+        public Executor executor() { return GroupControlTasks.executor(server); }
+        public Set<ChunkKey> claimedChunks() { return claims.claimedSnapshot(); }
+
+        private void requireCurrent() {
+            if (!server.isSameThread() || GroupRuntime.server() != server
+                    || GroupRuntime.claims() != claims) {
+                throw new IllegalStateException("预同步所属组实例已失效或线程不正确");
             }
         }
-        return null;
+
+        public CompoundTag captureChunk(ChunkKey key) {
+            requireCurrent();
+            if (!claims.isClaimed(key)) return null;
+            for (ServerLevel level : server.getAllLevels()) {
+                if (!level.dimension().location().toString().equals(key.dimension())) continue;
+                LevelChunk chunk = level.getChunkSource().getChunkNow(key.x(), key.z());
+                if (chunk == null) {
+                    // 可见表之外仍可能有等待释放 ACK 的完整区块，不能遗漏其最后修改。
+                    var access = (ChunkMapSplitAccess) level.getChunkSource().chunkMap;
+                    long pos = ChunkPos.asLong(key.x(), key.z());
+                    ChunkHolder holder = access.player_to_player$updatingChunks().get(pos);
+                    if (holder == null) holder = access.player_to_player$pendingUnloads().get(pos);
+                    if (holder != null) {
+                        var full = holder.getFutureIfPresentUnchecked(
+                                net.minecraft.world.level.chunk.ChunkStatus.FULL).getNow(null);
+                        var ready = full == null ? null : full.left().orElse(null);
+                        if (ready instanceof LevelChunk complete) chunk = complete;
+                        else if (ready instanceof net.minecraft.world.level.chunk.ImposterProtoChunk imposter)
+                            chunk = imposter.getWrapped();
+                    }
+                }
+                // 不读取正在 worldgen 线程修改的 ProtoChunk，也不请求加载任何新块。
+                return chunk == null ? null : ChunkSerializer.write(level, chunk);
+            }
+            throw new IllegalStateException("预同步区块维度不存在: " + key.dimension());
+        }
+
+        public Map<String, CompoundTag> capturePlayers() {
+            requireCurrent();
+            Map<String, CompoundTag> players = new LinkedHashMap<>();
+            for (var player : server.getPlayerList().getPlayers()) {
+                players.put(player.getUUID().toString(), player.saveWithoutId(new CompoundTag()));
+            }
+            return players;
+        }
+
+        public void setFrozen(boolean frozen) {
+            // 失败处理可能来自后台；旧事务不得修改下一实例的冻结状态。
+            if (GroupRuntime.server() == server && GroupRuntime.claims() == claims) {
+                GroupRuntime.setTickFrozen(frozen);
+            } else if (frozen) {
+                throw new IllegalStateException("组实例已更换，不能冻结");
+            }
+        }
     }
 }

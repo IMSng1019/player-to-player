@@ -59,7 +59,7 @@ import java.util.concurrent.TimeoutException;
  *       构造解析源做原版解析，解析不通过就回原版报错文案
  *       （"在原版中不合理的指令是不会被执行的"）；</li>
  *   <li><b>三个特例</b>（决策 6）：{@code /list} 用玩家表答全网；{@code /tp <玩家名>}
- *       按玩家表解析坐标、由发起端本地传送；{@code /msg <玩家名> <文本>} 跨组投递；</li>
+ *       与具名/坐标 TP 按玩家表规划到被传送玩家的组；{@code /msg <玩家名> <文本>} 跨组投递；</li>
  *   <li><b>3/4 级指令</b>（决策 3）：在<b>服务端</b>执行（真实等级过原版 requires），
  *       结果文案回给发起者 —— 这类指令绝不跨组执行（防一台机器的管理员关停别人的
  *       集成服务端），执行后触发一次权限 diff 推送（{@code /op}、{@code /deop} 等）；</li>
@@ -351,7 +351,7 @@ public final class CommandChatHandlers {
             level = server.overworld();
         }
         CommandSourceStack source = new CommandSourceStack(CommandSource.NULL,
-                new Vec3(x, y, z), new Vec2(yRot, xRot), level, realPermission, playerName,
+                new Vec3(x, y, z), new Vec2(xRot, yRot), level, realPermission, playerName,
                 Component.literal(playerName), server, null);
         ParseResults<CommandSourceStack> parse;
         try {
@@ -376,25 +376,18 @@ public final class CommandChatHandlers {
             replyMessage(conn, msg, buildPlayerList());
             return;
         }
-        // ---- 特例二：/tp|/teleport <玩家名> —— 玩家表解析坐标，发起方本地执行 ----
-        if (tokens.length == 2 && ("tp".equalsIgnoreCase(tokens[0])
-                || "teleport".equalsIgnoreCase(tokens[0]))) {
-            PlayerTable.PlayerEntry target = players.byName(tokens[1]);
-            if (target != null && realPermission >= 2) {
-                JsonObject out = new JsonObject();
-                out.addProperty("handled", true);
-                out.addProperty("action", "teleport");
-                out.addProperty("dimension", target.dimension());
-                out.addProperty("x", target.x());
-                out.addProperty("y", target.y());
-                out.addProperty("z", target.z());
-                out.addProperty("message", "已传送到 " + target.playerName());
-                conn.send(msg.reply(MessageType.COMMAND_RELAY, out, null));
-                LOGGER.info("跨组 tp: {} → {} ({} {},{},{})", playerName, target.playerName(),
-                        target.dimension(), (int) target.x(), (int) target.y(), (int) target.z());
-                return;
+        // ---- TP 专用路由：目的玩家可以位于其他组，执行者始终是被传送玩家的当前组 ----
+        // 不能复用普通世界写入的落点归属预检，否则 /tp x y z 进入其他组领地时会在
+        // 认领/预同步/合并发生前直接被拒绝；也不能广播 /tp A B，让各组解析缺失实体。
+        TeleportCommandRouting.Plan teleport = TeleportCommandRouting.plan(parse, source,
+                dimension, playerName, players::byName, groups::groupOf);
+        if (teleport != null && realPermission >= 2) {
+            if (teleport.rejection() != null) {
+                replyMessage(conn, msg, teleport.rejection());
+            } else {
+                forwardTeleport(conn, msg, teleport, playerName, realPermission);
             }
-            // 目标不在玩家表：落到下面的通则（各组的虚拟源没有实体，会干净报错而不是错搬人）
+            return;
         }
         // ---- 特例三：/msg|/tell|/w <玩家名> <内容> —— 跨组私聊投递 ----
         if (tokens.length >= 3 && ("msg".equalsIgnoreCase(tokens[0])
@@ -425,6 +418,46 @@ public final class CommandChatHandlers {
         // ---- 0-2 级指令：形状规则 + 归属预检 → 分组广播执行 ----
         route(conn, msg, originGroup, command, playerUuid, playerName, dimension, parse,
                 realPermission);
+    }
+
+    /**
+     * TP 只发往一个执行组，并等该组的原版执行结果后再答复。旧 action=teleport
+     * 回执在真正移动玩家前已经写“已传送”，本路径避免把排队或执行失败当成功。
+     * 规划时已结算执行源位置、朝向和目标身份，所以接收端使用无实体虚拟源即可。
+     */
+    private void forwardTeleport(ControlConnection conn, ControlMessage msg,
+                                 TeleportCommandRouting.Plan plan, String sourceName,
+                                 int permission) {
+        UUID primary = groups.primaryOf(plan.groupId());
+        ControlConnection target = primary == null ? null : HelloHandler.connectionOf(primary);
+        if (target == null || !target.isOpen() || !ConnectionIdentity.supportsCommandRouting(primary)) {
+            replyMessage(conn, msg, "被传送玩家所在组当前不可执行指令，未执行");
+            return;
+        }
+        if (plan.command().length() > MAX_COMMAND_LENGTH) {
+            replyMessage(conn, msg, "传送指令展开后过长，未执行");
+            return;
+        }
+        JsonObject forward = new JsonObject();
+        forward.addProperty("execute", true);
+        forward.addProperty("command", plan.command());
+        forward.addProperty("sourceName", sourceName);
+        forward.addProperty("permissionLevel", Math.min(FORWARD_PERMISSION_CAP, permission));
+        forward.addProperty("origin", false);
+        forward.addProperty("dimension", plan.dimension());
+        CommandAggregator aggregator = new CommandAggregator(1,
+                text -> replyMessage(conn, msg, text));
+        LOGGER.info("TP 指令下放: /{} -> 组 {}", plan.command(), plan.groupId());
+        target.request(ControlMessage.of(MessageType.COMMAND_RELAY, forward))
+                .whenComplete((reply, error) -> {
+                    boolean executed = error == null && reply != null
+                            && reply.type() == MessageType.COMMAND_RELAY
+                            && JsonUtil.getBoolean(reply.json(), "executed", false);
+                    String text = error != null ? "传送执行组未在规定时间内应答，执行结果未确认"
+                            : reply == null ? "传送执行组没有返回结果"
+                            : JsonUtil.getString(reply.json(), "message", "");
+                    aggregator.record(false, executed, text);
+                });
     }
 
     /**
