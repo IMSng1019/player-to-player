@@ -8,10 +8,8 @@ import imsng.player_to_player.env.EnvironmentManifest;
 import imsng.player_to_player.env.EnvironmentPreflightInfo;
 import imsng.player_to_player.env.EnvironmentRuntimeIdentity;
 import imsng.player_to_player.util.Sha256;
-import net.fabricmc.api.EnvType;
 import net.fabricmc.loader.api.FabricLoader;
-import net.fabricmc.loader.api.ModContainer;
-import net.fabricmc.loader.api.metadata.ModOrigin;
+import net.minecraft.client.Minecraft;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -20,14 +18,13 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
 /**
  * 渲染客户端的独立游戏目录及重启。Fabric 在游戏启动后不能追加模组，因此所有
- * 模组/启动配置变化都先生成新目录，玩家点击后使用原启动器的同一身份重新启动。
+ * 模组/启动配置变化都先生成新目录，由统一协调器使用当前登录身份自动重启。
  * 当前全局 mods/config 从不被覆盖；认证参数仅留在内存，不落日志和说明文件。
  */
 public final class ClientRuntimeProfile {
@@ -35,14 +32,10 @@ public final class ClientRuntimeProfile {
     public static final String RUNTIME_PROPERTY = "player_to_player.clientRuntime";
     public record Loaded(Map<String, ClientEnvironmentCompatibility.LoadedMod> mods,
                          Map<String, Path> clientOnlyJars) { }
-    public record Installation(Path directory, List<String> command, String limitation) {
-        public boolean canLaunch() { return !command.isEmpty(); }
-        public void launch() throws IOException {
-            if (!canLaunch()) throw new IOException(limitation);
-            // ProcessBuilder 直接传参数，路径、空格和玩家名字不经过 cmd/PowerShell 解释。
-            new ProcessBuilder(command).directory(directory.toFile())
-                    .redirectErrorStream(true)
-                    .redirectOutput(directory.resolve("client-launch.log").toFile()).start();
+    public record Installation(Path directory, String runtimeHash, String serverAddress,
+                               boolean canLaunch, String limitation) {
+        public List<String> commandForRestart() {
+            return canLaunch ? launchCommand(directory, runtimeHash, serverAddress) : List.of();
         }
     }
     private ClientRuntimeProfile() { }
@@ -96,22 +89,33 @@ public final class ClientRuntimeProfile {
         startupRecord.add("manifest", new EnvironmentManifest(installedFiles).toJson());
         imsng.player_to_player.util.JsonUtil.writeFileAtomic(
                 directory.getParent().resolve(ClientRuntimeStartup.MANIFEST_FILE), startupRecord);
-        List<String> command = launchCommand(directory, info.runtimeHash(), serverAddress);
-        String limitation = command.isEmpty()
+        boolean canLaunch = supportsLaunch();
+        String limitation = !canLaunch
                 ? "当前启动方式无法安全自动重启。请在启动器中复制当前 Fabric 1.20.4 配置，将游戏目录设为下方已安装目录，然后启动并连接原服务器。"
-                : "点击游戏中的“用同步环境重启”按钮即可使用已安装环境。";
+                : "客户端将自动正常退出，再用此环境启动并连接原服务器；失败后可在游戏中手动重试。";
         Files.writeString(directory.resolve("P2P-启动说明.txt"),
                 "此目录已安装服务器要求的客户端模组和配置。\n游戏目录：" + directory
                         + "\n服务器：" + serverAddress + "\n" + limitation
                         + "\n如在启动器手动启动，请添加 JVM 参数：\n-D" + DATA_ROOT_PROPERTY + "="
                         + NodeContext.get().paths().root().toAbsolutePath()
-                        + "\n-D" + RUNTIME_PROPERTY + "=" + info.runtimeHash() + "\n",
+                        + "\n-D" + RUNTIME_PROPERTY + "=" + info.runtimeHash()
+                        + "\n-Dfabric.modsFolder=" + directory.resolve("mods")
+                        + "\n同时移除原配置中的 fabric.addMods 参数，避免混入旧模组。\n",
                 StandardCharsets.UTF_8);
-        return new Installation(directory, command, limitation);
+        return new Installation(directory, info.runtimeHash(), serverAddress, canLaunch, limitation);
+    }
+
+    /** 特殊包装启动器可能依赖额外引导状态；无法证明可还原时保留明确的手动路径。 */
+    private static boolean supportsLaunch() {
+        if (FabricLoader.getInstance().isDevelopmentEnvironment()) return false;
+        String main = System.getProperty("sun.java.command", "").split(" ", 2)[0];
+        return (main.equals("net.fabricmc.loader.impl.launch.knot.KnotClient")
+                || main.equals("net.fabricmc.loader.launch.knot.KnotClient"))
+                && !System.getProperty("java.class.path", "").isBlank();
     }
 
     private static List<String> launchCommand(Path directory, String runtimeHash, String serverAddress) {
-        if (FabricLoader.getInstance().isDevelopmentEnvironment()) return List.of();
+        if (!supportsLaunch()) return List.of();
         // Windows 的 JDK17 ProcessHandle.Info 不提供 arguments，改用 Loader 已解析的
         // 原游戏参数和 JVM 自身输入参数。认证/代理参数保留在内存中，不写入磁盘或日志。
         String executable = Path.of(System.getProperty("java.home"), "bin",
@@ -127,10 +131,15 @@ public final class ClientRuntimeProfile {
         original.add("-cp");
         original.add(System.getProperty("java.class.path"));
         original.add("net.fabricmc.loader.impl.launch.knot.KnotClient");
-        original.addAll(List.of(FabricLoader.getInstance().getLaunchArguments(false)));
+        var user = Minecraft.getInstance().getUser();
+        original.addAll(ClientLaunchArguments.withIdentity(List.of(FabricLoader.getInstance().getLaunchArguments(false)),
+                Map.of("--username", user.getName(), "--uuid", user.getProfileId().toString(),
+                        "--accessToken", user.getAccessToken(), "--userType", user.getType().getName(),
+                        "--xuid", user.getXuid().orElse(""), "--clientId", user.getClientId().orElse(""))));
         List<String> rewritten = new ArrayList<>(ClientLaunchArguments.rewrite(original, directory, serverAddress));
         rewritten.removeIf(arg -> arg.startsWith("-D" + DATA_ROOT_PROPERTY + "=")
-                || arg.startsWith("-D" + RUNTIME_PROPERTY + "=") || arg.startsWith("-Duser.dir="));
+                || arg.startsWith("-D" + RUNTIME_PROPERTY + "=") || arg.startsWith("-Duser.dir=")
+                || arg.startsWith("-D" + imsng.player_to_player.env.restart.RestartTask.TASK_PROPERTY + "="));
         // Windows 控制台启动的 java.exe 改用同目录 javaw.exe，重启时不额外弹出控制台窗口。
         Path java = Path.of(executable);
         if (java.getFileName().toString().equalsIgnoreCase("java.exe")

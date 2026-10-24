@@ -11,6 +11,7 @@ import imsng.player_to_player.env.ClientRuntimeStartup;
 import imsng.player_to_player.env.EnvironmentPreflightInfo;
 import imsng.player_to_player.env.EnvironmentPreflightState;
 import imsng.player_to_player.env.EnvSyncClient;
+import imsng.player_to_player.env.restart.RestartCoordinator;
 import imsng.player_to_player.netproto.ControlClient;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
@@ -55,6 +56,7 @@ public final class EnvironmentPreflightClient {
     private static CompletableFuture<ClientRuntimeProfile.Loaded> loaded;
     private static boolean resuming;
     private static boolean registered;
+    private static String manualRetryAddress;
 
     public record Prepared(String address, String host, Path worldFolder,
                            EnvironmentPreflightInfo info, EnvSyncClient.PairResult environments) { }
@@ -66,11 +68,15 @@ public final class EnvironmentPreflightClient {
         final ServerAddress address;
         final ServerData data;
         final boolean quickPlay;
+        final RestartCoordinator.Intent restartIntent;
+        final boolean manualRestart;
         volatile boolean downloading;
         volatile ControlClient downloader;
-        Request(long epoch, String key, Screen parent, ServerAddress address, ServerData data, boolean quickPlay) {
+        Request(long epoch, String key, Screen parent, ServerAddress address, ServerData data, boolean quickPlay,
+                RestartCoordinator.Intent restartIntent, boolean manualRestart) {
             this.epoch = epoch; this.key = key; this.parent = parent; this.address = address;
             this.data = data; this.quickPlay = quickPlay;
+            this.restartIntent = restartIntent; this.manualRestart = manualRestart;
         }
     }
     private EnvironmentPreflightClient() { }
@@ -78,6 +84,7 @@ public final class EnvironmentPreflightClient {
     public static synchronized void register() {
         if (registered) return;
         registered = true;
+        ClientEnvironmentRestart.register();
         loaded = CompletableFuture.supplyAsync(() -> {
             try { return ClientRuntimeProfile.captureLoadedMods(); }
             catch (Exception e) { throw new java.util.concurrent.CompletionException(e); }
@@ -91,6 +98,7 @@ public final class EnvironmentPreflightClient {
             Request closed = LOGINS.remove(handler);
             if (closed != null && !closed.downloading && request == closed) {
                 STATE.cancel();
+                ClientEnvironmentRestart.cancel(closed.restartIntent);
                 prepared = null;
             }
         });
@@ -98,16 +106,27 @@ public final class EnvironmentPreflightClient {
                 (client, handler, buffer, callbacks) -> receive(client, handler, buffer));
     }
 
-    public static void onConnect(Screen parent, Minecraft client, ServerAddress address, ServerData data, boolean quickPlay) {
+    public static boolean onConnect(Screen parent, Minecraft client, ServerAddress address, ServerData data, boolean quickPlay) {
+        if (ClientEnvironmentRestart.committed()) return false;
         // 原版会忽略“连接界面中再次开始连接”的调用，不能提前让当前合法票据失效。
         if (resuming || client.screen instanceof ConnectScreen
-                || (data != null && WorldSwitcher.isTunnelAddress(data.ip))) return;
+                || (data != null && WorldSwitcher.isTunnelAddress(data.ip))) return true;
         LOGINS.clear();
         closeDownloader(request);
         String key = EnvironmentPreflightState.addressKey(address.getHost(), address.getPort());
         long epoch = STATE.begin(key);
         prepared = null;
-        request = new Request(epoch, key, parent, address, data, quickPlay);
+        request = new Request(epoch, key, parent, address, data, quickPlay,
+                ClientEnvironmentRestart.begin(key), key.equals(manualRetryAddress));
+        manualRetryAddress = null;
+        return true;
+    }
+
+    static void retryRecovered(Minecraft client, Screen parent, String target) {
+        ServerAddress address = ServerAddress.parseString(target);
+        manualRetryAddress = EnvironmentPreflightState.addressKey(address.getHost(), address.getPort());
+        ConnectScreen.startConnecting(parent, client, address,
+                new ServerData("P2P 环境重试", target, ServerData.Type.OTHER), false);
     }
 
     private static CompletableFuture<FriendlyByteBuf> receive(Minecraft client,
@@ -214,12 +233,20 @@ public final class EnvironmentPreflightClient {
                         worldFolder, secondary, pair.secondaryManifest(), info, current, active.key);
                 String reason = mismatches.isEmpty() ? "环境已同步。启动配置需要在独立游戏实例中加载。"
                         : "环境已同步，但当前进程尚未加载所需环境：\n" + String.join("；", mismatches.stream().limit(3).toList());
-                client.execute(() -> { if (STATE.current(active.epoch)) screen.requireRestart(reason, installation); });
+                client.execute(() -> {
+                    if (!STATE.current(active.epoch) || request != active || client.screen != screen) return;
+                    java.util.function.BooleanSupplier currentRequest = () -> STATE.current(active.epoch) && request == active;
+                    Runnable retry = () -> ClientEnvironmentRestart.restart(client, screen, active.restartIntent,
+                            installation, true, currentRequest);
+                    screen.requireRestart(reason, installation, retry);
+                    ClientEnvironmentRestart.restart(client, screen, active.restartIntent,
+                            installation, active.manualRestart, currentRequest);
+                });
                 return;
             }
             EnvironmentPreflightInfo ready = info;
             client.execute(() -> {
-                if (!STATE.ready(active.epoch, ready.runtimeHash())) return;
+                if (request != active || client.screen != screen || !STATE.ready(active.epoch, ready.runtimeHash())) return;
                 prepared = new Prepared(active.key, host, worldFolder, ready, pair);
                 active.downloading = false;
                 resuming = true;
@@ -244,6 +271,7 @@ public final class EnvironmentPreflightClient {
 
     private static void cancel(Minecraft client, Request active) {
         if (!STATE.current(active.epoch)) return;
+        if (!ClientEnvironmentRestart.cancel(active.restartIntent)) return;
         STATE.cancel();
         prepared = null;
         request = null;

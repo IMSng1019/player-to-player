@@ -11,6 +11,10 @@ final class EnvironmentPreflightScreen extends Screen {
     private final Runnable cancel;
     private String status = "正在校验并同步服务器环境…";
     private ClientRuntimeProfile.Installation installation;
+    private Runnable retry;
+    private boolean restarting;
+    private boolean committed;
+    private String restartReason = "";
 
     EnvironmentPreflightScreen(Runnable cancel) {
         super(Component.literal("准备服务器环境"));
@@ -19,9 +23,34 @@ final class EnvironmentPreflightScreen extends Screen {
 
     void status(String value) { status = value; }
 
-    void requireRestart(String reason, ClientRuntimeProfile.Installation value) {
-        status = reason + "\n" + value.limitation();
+    void requireRestart(String reason, ClientRuntimeProfile.Installation value, Runnable retry) {
+        restartReason = reason;
+        status = reason + (value.canLaunch() ? "" : "\n" + value.limitation());
         installation = value;
+        this.retry = retry;
+        refresh();
+    }
+
+    void preparingRestart() {
+        restarting = true;
+        status = "环境已安装并校验。正在准备自动重启…\n此时仍可取消连接。";
+        refresh();
+    }
+
+    void restartCommitted() {
+        committed = true;
+        status = "正在提交重启并正常退出游戏…\n保存和退出完成后，将自动启动同步环境并连接原服务器。";
+        refresh();
+    }
+
+    void restartFailed(String reason) {
+        restarting = false;
+        committed = false;
+        status = restartReason + "\n" + reason;
+        refresh();
+    }
+
+    private void refresh() {
         clearWidgets();
         init();
     }
@@ -30,23 +59,18 @@ final class EnvironmentPreflightScreen extends Screen {
         int y = height / 2 + 40;
         if (installation != null) {
             if (installation.canLaunch()) {
-                addRenderableWidget(Button.builder(Component.literal("用同步环境重启游戏"), button -> {
-                    try {
-                        installation.launch();
-                        minecraft.stop();
-                    } catch (Exception failure) {
-                        status = "无法启动同步环境：" + failure.getMessage();
-                    }
-                }).bounds(width / 2 - 120, y, 240, 20).build());
+                var restart = addRenderableWidget(Button.builder(Component.literal("重试：用同步环境重启"), button -> retry.run())
+                        .bounds(width / 2 - 120, y, 240, 20).build());
+                restart.active = !restarting && !committed;
                 y += 25;
             }
             addRenderableWidget(Button.builder(Component.literal("打开已安装的游戏目录"), button ->
                     Util.getPlatform().openFile(installation.directory().toFile()))
-                    .bounds(width / 2 - 120, y, 240, 20).build());
+                    .bounds(width / 2 - 120, y, 240, 20).build()).active = !committed;
             y += 25;
         }
         addRenderableWidget(Button.builder(Component.literal("取消连接"), button -> cancel.run())
-                .bounds(width / 2 - 120, y, 240, 20).build());
+                .bounds(width / 2 - 120, y, 240, 20).build()).active = !committed;
     }
 
     @Override public void render(GuiGraphics graphics, int mouseX, int mouseY, float delta) {
@@ -57,6 +81,6 @@ final class EnvironmentPreflightScreen extends Screen {
         super.render(graphics, mouseX, mouseY, delta);
     }
 
-    @Override public void onClose() { cancel.run(); }
+    @Override public void onClose() { if (!committed) cancel.run(); }
     @Override public boolean isPauseScreen() { return false; }
 }

@@ -13,6 +13,21 @@ public final class ClientLaunchArguments {
             "--quickPlayMultiplayer", "--quickPlaySingleplayer", "--quickPlayRealms", "--quickPlayPath");
     private ClientLaunchArguments() { }
 
+    /** 仅处理 Loader 解析后的游戏参数；每次手动重试都以当前会话替换旧账号字段。 */
+    public static List<String> withIdentity(List<String> original, java.util.Map<String, String> identity) {
+        List<String> result = new ArrayList<>();
+        for (int index = 0; index < original.size(); index++) {
+            String arg = original.get(index);
+            int equals = arg.indexOf('=');
+            String key = equals > 0 ? arg.substring(0, equals) : arg;
+            if (identity.containsKey(key)) {
+                if (equals < 0 && index + 1 < original.size()) index++;
+            } else result.add(arg);
+        }
+        identity.forEach((key, value) -> { result.add(key); result.add(value); });
+        return List.copyOf(result);
+    }
+
     public static List<String> rewrite(List<String> original, Path gameDir, String address) {
         List<String> result = new ArrayList<>();
         for (int index = 0; index < original.size(); index++) {
@@ -23,7 +38,8 @@ public final class ClientLaunchArguments {
                 if (equals < 0 && index + 1 < original.size()) index++;
                 continue;
             }
-            if (arg.startsWith("-Dfabric.addMods=")) continue;
+            // Loader 的绝对 modsFolder 会绕过新的 gameDir；必须与 addMods 一起清除。
+            if (arg.startsWith("-Dfabric.addMods=") || arg.startsWith("-Dfabric.modsFolder=")) continue;
             if (arg.startsWith("-javaagent:") || arg.startsWith("-agentpath:")) {
                 int colon = arg.indexOf(':');
                 String agent = arg.substring(colon + 1);
@@ -35,8 +51,12 @@ public final class ClientLaunchArguments {
             }
             // 新进程的工作目录也要隔离；原启动器常以相对路径指定 natives，必须保留其实际位置。
             if (arg.startsWith("-Djava.library.path=") || arg.startsWith("-Dorg.lwjgl.librarypath=")
-                    || arg.startsWith("-Dfabric.gameJarPath=")) {
+                    || arg.startsWith("-Dfabric.gameJarPath=") || arg.startsWith("-Dfabric.gameJarPath.client=")) {
                 result.add(arg.substring(0, equals + 1) + absolutePathList(arg.substring(equals + 1)));
+                continue;
+            }
+            if (arg.startsWith("--assetsDir=")) {
+                result.add("--assetsDir=" + Path.of(arg.substring(equals + 1)).toAbsolutePath());
                 continue;
             }
             result.add(arg);
@@ -47,6 +67,8 @@ public final class ClientLaunchArguments {
                 result.add(Path.of(original.get(++index)).toAbsolutePath().toString());
             }
         }
+        // JVM 属性必须在主类之前；原参数的第一个位置始终属于 JVM 参数区。
+        result.add(0, "-Dfabric.modsFolder=" + gameDir.toAbsolutePath().resolve("mods"));
         result.add("--gameDir");
         result.add(gameDir.toAbsolutePath().toString());
         result.add("--quickPlayMultiplayer");

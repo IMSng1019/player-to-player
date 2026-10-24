@@ -15,6 +15,18 @@ import static org.junit.jupiter.api.Assertions.*;
 class ClientEnvironmentCompatibilityTest {
     @TempDir Path root;
 
+    @Test void addingOrRemovingUniversalModsRequiresANewClientProcess() throws Exception {
+        Path oldJar = mod("old.jar", "oldmod", "*", "1");
+        Path addedJar = mod("added.jar", "addedmod", "*", "1");
+        var oldEntry = new EnvironmentManifest.Entry(Sha256.hexOfFile(oldJar), Files.size(oldJar));
+        var addedEntry = new EnvironmentManifest.Entry(Sha256.hexOfFile(addedJar), Files.size(addedJar));
+        var loaded = Map.of("oldmod", new ClientEnvironmentCompatibility.LoadedMod("oldmod", "1", "*", oldEntry.sha256()));
+        assertTrue(ClientEnvironmentCompatibility.check(root, new EnvironmentManifest(Map.of("mods/old.jar", oldEntry)), loaded).isEmpty());
+        assertFalse(ClientEnvironmentCompatibility.check(root, new EnvironmentManifest(Map.of(
+                "mods/old.jar", oldEntry, "mods/added.jar", addedEntry)), loaded).isEmpty());
+        assertFalse(ClientEnvironmentCompatibility.check(root, new EnvironmentManifest(Map.of()), loaded).isEmpty());
+    }
+
     @Test void matchingFilenameIsInsufficientWhenLoadedBytesDiffer() throws Exception {
         Path jar = mod("game.jar", "game", "*", "1");
         var manifest = new EnvironmentManifest(Map.of("mods/game.jar",

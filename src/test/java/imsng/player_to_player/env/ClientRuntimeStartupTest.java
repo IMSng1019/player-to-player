@@ -11,6 +11,24 @@ import static org.junit.jupiter.api.Assertions.*;
 class ClientRuntimeStartupTest {
     @TempDir Path directory;
 
+    @Test void firstIsolatedLaunchNeedsStartupEvidenceEvenForAnEmptyEnvironment() {
+        assertFalse(ClientRuntimeStartup.matches("a".repeat(64), new EnvironmentManifest(Map.of()), "world"));
+    }
+
+    @Test void addedAndDeletedConfigurationChangesRuntimeIdentityWithoutChangingMods() throws Exception {
+        Path config = directory.resolve("config/rules.txt");
+        Files.createDirectories(config.getParent());
+        Files.writeString(config, "rules");
+        var empty = new EnvironmentManifest(Map.of());
+        var configured = new EnvironmentManifest(Map.of("config/rules.txt",
+                new EnvironmentManifest.Entry(Sha256.hexOfFile(config), Files.size(config))));
+        var startup = ClientRuntimeStartup.capture(directory, empty);
+        assertFalse(startup.matches(configured, "world"));
+        assertNotEquals(EnvironmentRuntimeIdentity.hash(empty, "world"), EnvironmentRuntimeIdentity.hash(configured, "world"));
+        assertEquals(EnvironmentRuntimeIdentity.hash(empty, "world"),
+                EnvironmentRuntimeIdentity.hash(new EnvironmentManifest(Map.of()), "world"));
+    }
+
     @Test void changedConfigurationBeforeStartupCannotPassWithOnlyVersionFlag() throws Exception {
         Path config = directory.resolve("config/game.json");
         Files.createDirectories(config.getParent());
