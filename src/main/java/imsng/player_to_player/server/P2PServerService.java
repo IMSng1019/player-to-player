@@ -67,6 +67,8 @@ public final class P2PServerService {
     /** 实时环境快照管理器；首轮不可变快照发布前 HELLO 返回 envReady=false。 */
     private static volatile EnvironmentSnapshotManager environmentSnapshots;
     private static volatile AutoCloseable environmentUpdates;
+    /** 独立于环境文件版本的权威世界字段服务。 */
+    private static volatile imsng.player_to_player.metadata.MetadataService worldMetadata;
 
     private static volatile ControlServer controlServer;
     private static volatile ChunkRegistry chunkRegistry;
@@ -84,6 +86,12 @@ public final class P2PServerService {
     private static volatile RelayCore relayCore;
 
     private P2PServerService() {
+    }
+
+    /** 全局事件派发不得穿过合并/分离的尾部快照窗口。 */
+    public static boolean isGroupTransitioning(UUID group) {
+        MergeCoordinator coordinator = mergeCoordinator;
+        return coordinator != null && coordinator.isTransitioning(group);
     }
 
     // ------------------------------------------------------------------ 启动
@@ -160,6 +168,12 @@ public final class P2PServerService {
 
         // c/d. 控制服务器 + 全部消息处理器
         ControlServer control = new ControlServer(config.controlPort);
+        try {
+            worldMetadata = new imsng.player_to_player.metadata.MetadataService(
+                    server, groups, registry, players, control, paths.metadataDir());
+        } catch (java.io.IOException error) {
+            throw new IllegalStateException("权威世界元数据恢复失败，拒绝开放控制服务", error);
+        }
         // 权限下发（Phase 4 收口）：物理服务端 ops 名单是唯一权威，按"组 → 组成员"
         // 把真实等级推给该组主客户端，由它在自己的集成服务端精确落权。
         PermissionRelay permissions = new PermissionRelay(server, groups);
@@ -488,11 +502,8 @@ public final class P2PServerService {
         // Windows 下 relativize 产生反斜杠，统一规范化为正斜杠（排除表约定正斜杠比较）
         String worldPrefix = normalizedServerRoot.relativize(normalizedWorldRoot)
                 .toString().replace('\\', '/');
-        if (worldPrefix.isEmpty()) {
-            return exclusions; // 存档根 == 服务端根（理论不可能），防御性跳过
-        }
-        for (String dim : List.of("region", "poi", "entities", "DIM-1", "DIM1")) {
-            exclusions.add(worldPrefix + "/" + dim);
+        for (String dim : List.of("region", "poi", "entities", "DIM-1", "DIM1", "level.dat", "level.dat_old", "session.lock")) {
+            exclusions.add(worldPrefix.isEmpty() ? dim : worldPrefix + "/" + dim);
         }
         return exclusions;
     }
@@ -643,6 +654,12 @@ public final class P2PServerService {
             return;
         }
         running = false;
+        var metadata = worldMetadata;
+        worldMetadata = null;
+        if (metadata != null) {
+            try { metadata.close(); }
+            catch (java.io.IOException error) { LOGGER.error("最终世界元数据检查点失败", error); }
+        }
         EnvironmentPreflightServer.clear();
         AutoCloseable updates = environmentUpdates;
         environmentUpdates = null;

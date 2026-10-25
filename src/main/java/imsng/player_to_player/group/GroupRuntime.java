@@ -309,6 +309,7 @@ public final class GroupRuntime {
     /** 置位"下一次停止不拆会话"旗标（合并让出方在关闭集成服务端前调用）。 */
     public static void suppressNextStopTeardown() {
         suppressNextStopTeardown = true;
+        imsng.player_to_player.metadata.MetadataClient.disconnected();
     }
 
     /**

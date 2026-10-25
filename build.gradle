@@ -43,6 +43,16 @@ test {
 	useJUnitPlatform()
 }
 
+// Gradle/Loom仍使用自身JDK；显式选择验收JDK以验证目标Java17及其真实计算子进程。
+if (providers.gradleProperty('p2pSmokeJavaVersion').isPresent()) {
+	def smokeJavaVersion = Integer.parseInt(providers.gradleProperty('p2pSmokeJavaVersion').get())
+	tasks.named('test') {
+		javaLauncher = javaToolchains.launcherFor {
+			languageVersion = JavaLanguageVersion.of(smokeJavaVersion)
+		}
+	}
+}
+
 // 独立计算服务端使用 Loom 的真实 server 运行配置；不能借用客户端的 named/client-only
 // 类路径，也不能让远端下发的脚本决定本机开发进程的启动参数。描述只写入生成目录。
 def workerLaunchSpec = layout.buildDirectory.file('p2p/worker-launch.json')
@@ -72,6 +82,15 @@ if (providers.gradleProperty('p2pWorkerSmoke').isPresent()) {
 	tasks.named('test') {
 		dependsOn tasks.named('writeWorkerLaunchSpec')
 		systemProperty 'p2p.worker.smoke', 'true'
+		systemProperty 'p2p.worker.developmentSpec', workerLaunchSpec.get().asFile.absolutePath
+	}
+}
+
+// 三个真实Minecraft进程的元数据冒烟；常规test仍保持不启动Minecraft。
+if (providers.gradleProperty('p2pMetadataSmoke').isPresent()) {
+	tasks.named('test') {
+		dependsOn tasks.named('writeWorkerLaunchSpec')
+		systemProperty 'p2p.metadata.smoke', 'true'
 		systemProperty 'p2p.worker.developmentSpec', workerLaunchSpec.get().asFile.absolutePath
 	}
 }

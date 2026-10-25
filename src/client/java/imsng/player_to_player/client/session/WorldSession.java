@@ -449,6 +449,17 @@ public final class WorldSession {
             MergeClient.register(cc, conn);
             // 世界逻辑消息由实际运行独立服务端的 worker 消费，渲染进程仅持有中心会话。
             WorkerProcess.registerForwarders(cc, conn);
+            WorkerProcess.setMetadataRestartListener((connection, fields) -> Minecraft.getInstance().execute(() -> {
+                if (!isCurrentConnection(connection)) return;
+                Minecraft client = Minecraft.getInstance();
+                String reason = "世界启动设置已更新（" + fields + "）。已暂停模拟并保存世界，请重新连接以应用最新快照。";
+                var screen = new net.minecraft.client.gui.screens.DisconnectedScreen(
+                        new net.minecraft.client.gui.screens.TitleScreen(),
+                        net.minecraft.network.chat.Component.literal("世界需要重新加载"),
+                        net.minecraft.network.chat.Component.literal(reason));
+                // 沿用EXIT_BEGIN/最终尾部/EXIT_COMMIT屏障，不能直接杀掉正在写世界的子进程。
+                if (!ClientExitCoordinator.interceptDisconnect(client, screen)) transitionFailed(connection, reason);
+            }));
             // 分离晋升（Phase 3）：服务端主动推送的 ROLE_ASSIGN（不带 _rid，
             // 不会与 requestRoleAndSwitch 的 reply 路径冲突 —— 带 _rid 的应答
             // 在连接层被 pending future 消费，永远不进处理器分发）
@@ -571,7 +582,7 @@ public final class WorldSession {
                                                      boolean envReadyAtHello, long myGeneration,
                                                      String relayAddress, int relayPort) {
         SwitchTelemetry.mark("environment_begin");
-        EnvSyncClient sync = new EnvSyncClient(conn, config);
+        EnvSyncClient sync = new EnvSyncClient(conn, config, EnvironmentPreflightClient.worldPath());
         if (!envReadyAtHello) {
             // HELLO 已声明环境未就绪：首轮请求注定失败，先等一个周期再开始
             LOGGER.info("服务端环境尚未就绪，{} 秒后开始环境同步", ENV_SYNC_RETRY_SECONDS);
@@ -635,7 +646,7 @@ public final class WorldSession {
             JsonObject reg = new JsonObject();
             reg.addProperty("clientId", NodeContext.get().clientId().toString());
             conn.send(ControlMessage.of(MessageType.RELAY_REGISTER, reg));
-            EnvSyncClient sync = new EnvSyncClient(conn, config);
+            EnvSyncClient sync = new EnvSyncClient(conn, config, EnvironmentPreflightClient.worldPath());
             sync.syncPair(paths.environmentDir(worldFolder, ClientRole.PRIMARY),
                     paths.environmentDir(worldFolder, ClientRole.SECONDARY)).join();
             LOGGER.info("环境同步经中转端 {}:{} 完成", relayAddress, relayPort);
@@ -724,7 +735,7 @@ public final class WorldSession {
         CompoundTag playerState = PlayerDataClient.requestAuthoritative(conn, ctx.clientId());
         SwitchTelemetry.mark("player_state_ready");
         return LocalWorldLauncher.prepare(
-                worldFolder, worldName, ctx.clientId(), playerState);
+                conn, worldFolder, worldName, ctx.clientId(), playerState);
     }
 
     /**

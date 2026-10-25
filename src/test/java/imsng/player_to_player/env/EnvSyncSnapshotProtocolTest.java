@@ -43,7 +43,7 @@ class EnvSyncSnapshotProtocolTest {
     void manifestAndFileResponseUseTheSameSnapshotId() throws Exception {
         Path sourceRoot = tempDir.resolve("source");
         Path repositoryRoot = tempDir.resolve("repository");
-        Path file = sourceRoot.resolve("world/level.dat");
+        Path file = sourceRoot.resolve("world/serverconfig/settings.json");
         Files.createDirectories(file.getParent());
         Files.writeString(file, "snapshot-bytes", StandardCharsets.UTF_8);
 
@@ -69,13 +69,13 @@ class EnvSyncSnapshotProtocolTest {
 
             JsonObject fileRequest = new JsonObject();
             fileRequest.addProperty("snapshotId", snapshotId);
-            fileRequest.addProperty("path", "world/level.dat");
+            fileRequest.addProperty("path", "world/serverconfig/settings.json");
             fileRequest.addProperty("offset", 0);
             registry.handle(MessageType.ENV_FILE_REQUEST,
                     ControlMessage.of(MessageType.ENV_FILE_REQUEST, fileRequest), connection);
             ControlMessage fileResponse = connection.take();
 
-            assertEquals(8, Protocol.VERSION);
+            assertEquals(9, Protocol.VERSION);
             assertFalse(snapshotId.isBlank());
             assertEquals(snapshotId,
                     fileResponse.json().get("snapshotId").getAsString());

@@ -8,7 +8,8 @@ import imsng.player_to_player.core.ClientRole;
 import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.group.PlayerStateFiles;
 import imsng.player_to_player.netproto.ControlConnection;
-import imsng.player_to_player.world.LocalSaveGuard;
+import imsng.player_to_player.metadata.MetadataClient;
+import imsng.player_to_player.metadata.MetadataFiles;
 import imsng.player_to_player.world.WorldIdentity;
 import imsng.player_to_player.runtime.WorkerProcess;
 import imsng.player_to_player.client.env.EnvironmentPreflightClient;
@@ -27,9 +28,8 @@ import java.util.UUID;
  * <p>
  * 被指派为主客户端前后分为两个阶段：
  * <ol>
- *   <li><b>切换前准备</b>：环境同步已把服务端的世界骨架（level.dat、playerdata、
- *       data/ 等 —— 服务端扫描时只排除了 region/poi/entities/DIM* 维度数据）带到
- *       {@code environment/primary/<世界名>/}；首次启动复制世界骨架，随后每次都用
+ *   <li><b>切换前准备</b>：从独立元数据通道取得最新字段快照，校验世界身份，
+ *       在未运行的缓存存档安装启动字段；环境只提供数据包、配置和其他资源。随后每次都用
  *       物理服务器权威玩家 NBT 同时覆盖 UUID 玩家文件与 level.dat 内嵌玩家；</li>
  *   <li>由子进程在世界打开前预置区块申请门控、上行捕获与出生点禁用；</li>
  *   <li>父进程核对实际加载证明后，编排性断开旧游戏连接，走原版网络登录加入子服；</li>
@@ -65,7 +65,7 @@ public final class LocalWorldLauncher {
      * @param playerId  当前玩家 UUID
      * @param playerState 物理服务器实时下发并通过校验的权威玩家 NBT
      */
-    public static PreparedWorld prepare(Path worldFolder, String worldName, UUID playerId,
+    public static PreparedWorld prepare(ControlConnection connection, Path worldFolder, String worldName, UUID playerId,
                                         CompoundTag playerState) throws IOException {
         NodeContext ctx = NodeContext.get();
         P2PPaths paths = ctx.paths();
@@ -78,7 +78,16 @@ public final class LocalWorldLauncher {
         Path envWorldDir = environment.resolve(worldPath).normalize();
         if (!envWorldDir.startsWith(environment.normalize())) throw new IOException("世界路径越过环境目录");
 
-        String identity = prepareSave(envWorldDir, saveDir);
+        if (WorkerProcess.isRunning()) throw new IOException("旧计算进程尚未退出，禁止改写运行存档元数据");
+        String identity;
+        try {
+            var snapshot = MetadataClient.requestSnapshot(connection, "").get(20, java.util.concurrent.TimeUnit.SECONDS);
+            identity = MetadataFiles.prepareSave(envWorldDir, saveDir, snapshot, System.currentTimeMillis());
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt(); throw new IOException("世界元数据准备被中断", interrupted);
+        } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException failure) {
+            throw new IOException("无法取得本次权威世界元数据", failure);
+        }
         imsng.player_to_player.env.WorldEnvironmentResources.sync(envWorldDir, saveDir);
         PlayerStateFiles.installAuthoritative(saveDir, playerId, playerState);
         LOGGER.info("物理服务器权威玩家状态已安装到本地主缓存: {} (世界身份={})",
@@ -118,16 +127,4 @@ public final class LocalWorldLauncher {
         });
     }
 
-    /**
-     * 构建本地存档：身份一致的既有存档直接复用，否则隔离旧存档并从环境骨架重建。
-     * <p>
-     * 判定与隔离逻辑在 {@link LocalSaveGuard}（src/main，可被 src/test 直接覆盖）——
-     * 这里只负责把路径按 <b>P2PPaths</b> 口径解析出来。世界身份校验是数据完整性必需项，
-     * 详见该类的类注释。
-     *
-     * @return 已对齐的世界身份哈希；空串 = 服务端 level.dat 无法给出身份
-     */
-    private static String prepareSave(Path envWorldDir, Path saveDir) throws IOException {
-        return LocalSaveGuard.prepareSave(envWorldDir, saveDir, System.currentTimeMillis());
-    }
 }

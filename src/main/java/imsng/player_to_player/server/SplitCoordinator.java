@@ -3,6 +3,7 @@ package imsng.player_to_player.server;
 import com.google.gson.JsonObject;
 import imsng.player_to_player.compute.ComputeTable;
 import imsng.player_to_player.config.GlobalConfig;
+import imsng.player_to_player.metadata.MetadataService;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.MessageType;
@@ -41,19 +42,31 @@ final class SplitCoordinator {
     private final Function<UUID, ControlConnection> connections;
     private final Consumer<UUID> permissionPush;
     private final BiConsumer<UUID, Set<UUID>> redirectFollowers;
+    private final Function<UUID, MetadataFence> metadataFence;
     private final Map<UUID, Transaction> transactions = new HashMap<>();
+
+    /** 准备阶段固定的世界/任期/最低版本；自然计时可以继续，任期变化则必须重新准备。 */
+    record MetadataFence(String worldId, long term, long version, boolean transferable) {
+        boolean enabled() { return term > 0; }
+    }
+
+    private static final class MetadataFenceChanged extends IllegalStateException {
+        MetadataFenceChanged() { super("元数据版本、任期或接管状态已变化，必须取消本次分离"); }
+    }
 
     private static final class Transaction {
         final UUID id, source, newPrimary;
         final ControlConnection sourceConnection;
         final Set<UUID> members, departing;
+        final MetadataFence metadata;
         String phase = "prepared";
         ScheduledFuture<?> timeout;
         Transaction(UUID id, UUID source, UUID newPrimary, ControlConnection sourceConnection,
-                    Set<UUID> members, Set<UUID> departing) {
+                    Set<UUID> members, Set<UUID> departing, MetadataFence metadata) {
             this.id = id; this.source = source; this.newPrimary = newPrimary;
             this.sourceConnection = sourceConnection;
             this.members = Set.copyOf(members); this.departing = Set.copyOf(departing);
+            this.metadata = metadata;
         }
         boolean active() { return phase.equals("prepared") || phase.equals("cancel_requested"); }
     }
@@ -62,9 +75,19 @@ final class SplitCoordinator {
                      ComputeTable computes, PlayerTable players,
                      Function<UUID, ControlConnection> connections, Consumer<UUID> permissionPush,
                      BiConsumer<UUID, Set<UUID>> redirectFollowers) {
+        this(config, registry, groups, computes, players, connections, permissionPush, redirectFollowers,
+                SplitCoordinator::currentMetadataFence);
+    }
+
+    SplitCoordinator(GlobalConfig config, ChunkRegistry registry, GroupTable groups,
+                     ComputeTable computes, PlayerTable players,
+                     Function<UUID, ControlConnection> connections, Consumer<UUID> permissionPush,
+                     BiConsumer<UUID, Set<UUID>> redirectFollowers,
+                     Function<UUID, MetadataFence> metadataFence) {
         this.config = config; this.registry = registry; this.groups = groups;
         this.computes = computes; this.players = players; this.connections = connections;
         this.permissionPush = permissionPush; this.redirectFollowers = redirectFollowers;
+        this.metadataFence = metadataFence;
     }
 
     synchronized boolean involvesGroup(UUID group) {
@@ -106,7 +129,13 @@ final class SplitCoordinator {
             if (tx.departing.stream().anyMatch(member -> !online(member))) {
                 reject(connection, request, "member_offline", "离组成员已离线"); return;
             }
+            if (!metadataMatches(metadataFence.apply(source), request.json(), tx.metadata)) {
+                reject(connection, request, "metadata_barrier_changed", "元数据接管屏障已失效，旧组保留，请完成取消后重新准备"); return;
+            }
             boolean committed = registry.finishSplit(id, source, () -> {
+                // finishSplit持有注册表写锁；在真正改组表前再次验证，不能先改角色再补校验。
+                if (!metadataMatches(metadataFence.apply(source), request.json(), tx.metadata))
+                    throw new MetadataFenceChanged();
                 if (groups.splitPreparedGroup(source, tx.departing, tx.newPrimary, tx.members) == null) {
                     throw new IllegalStateException("分离准备期间成员或原主已变化");
                 }
@@ -129,6 +158,9 @@ final class SplitCoordinator {
             sendRole(tx.newPrimary, tx.newPrimary, "primary", id);
             reply(connection, request, tx);
             LOGGER.info("分离已提交: splitId={} 离组成员={}，旧区域已卸载并耐久释放", id, tx.departing.size());
+        } catch (MetadataFenceChanged failure) {
+            // 此异常只能发生在组表修改之前。显式拒绝让源端进入已有的安全取消流程。
+            reject(connection, request, "metadata_barrier_changed", failure.getMessage());
         } catch (Exception failure) {
             Transaction recorded = id == null ? null : transactions.get(id);
             if (recorded != null && recorded.sourceConnection == connection
@@ -148,6 +180,10 @@ final class SplitCoordinator {
         if (!source.equals(groups.primaryOf(source)) || involvesGroup(source)) {
             reject(connection, request, "busy", "原组不存在或已有分离事务"); return;
         }
+        MetadataFence metadata = metadataFence.apply(source);
+        if (!metadataMatches(metadata, request.json(), null)) {
+            reject(connection, request, "metadata_transfer_unsafe", "世界元数据未确认或当前状态不能完整迁移，保持原组运行"); return;
+        }
         Set<UUID> departing = new HashSet<>();
         for (var value : request.json().getAsJsonArray("departingClientIds"))
             departing.add(UUID.fromString(value.getAsString()));
@@ -165,7 +201,7 @@ final class SplitCoordinator {
         var election = computes.selectPrimaryOrRelaxed(departing, config.minFreeMemoryBytes);
         UUID newPrimary = election != null ? election.clientId()
                 : departing.stream().min(UUID::compareTo).orElseThrow();
-        Transaction tx = new Transaction(id, source, newPrimary, connection, members, departing);
+        Transaction tx = new Transaction(id, source, newPrimary, connection, members, departing, metadata);
         transactions.put(id, tx);
         tx.timeout = ThreadPools.scheduler().schedule(() -> requestTimeout(id), 120, TimeUnit.SECONDS);
         reply(connection, request, tx);
@@ -173,6 +209,27 @@ final class SplitCoordinator {
         pause.addProperty("splitId", id.toString()); pause.addProperty("groupId", source.toString());
         for (UUID member : departing) send(member, ControlMessage.of(MessageType.SPLIT_PREPARE, pause.deepCopy()));
         LOGGER.info("分离准备: splitId={} 成员={} 范围={}，保持原有区块归属", id, departing.size(), regions.size());
+    }
+
+    private static MetadataFence currentMetadataFence(UUID source) {
+        long term = MetadataService.term();
+        // 无元数据服务的独立协调器/旧测试夹具没有分布式元数据会话，不伪造任期检查。
+        if (term <= 0) return new MetadataFence("", 0, -1, true);
+        net.minecraft.nbt.CompoundTag data = MetadataService.committedData();
+        if (data == null) return new MetadataFence("", term, -1, false);
+        net.minecraft.nbt.CompoundTag root = new net.minecraft.nbt.CompoundTag(); root.put("Data", data);
+        String world = imsng.player_to_player.world.WorldIdentity.ofLevelData(root).orElse("");
+        return new MetadataFence(world, term, MetadataService.version(), MetadataService.transferAllowed(source));
+    }
+
+    private static boolean metadataMatches(MetadataFence current, JsonObject request, MetadataFence prepared) {
+        if (!current.enabled()) return prepared == null || !prepared.enabled();
+        if (!current.transferable() || (prepared != null && (!prepared.enabled()
+                || current.term() != prepared.term() || !current.worldId().equals(prepared.worldId())))) return false;
+        long version = JsonUtil.getLong(request, "metadataVersion", -1);
+        return current.worldId().equals(JsonUtil.getString(request, "metadataWorldId", ""))
+                && JsonUtil.getLong(request, "metadataTerm", -1) == current.term()
+                && version >= (prepared == null ? 0 : prepared.version()) && version <= current.version();
     }
 
     /** 超时只要求源回滚，不拆除尚有旧 holder 的屏障，也不让客户端永久停在空屏。 */
@@ -265,6 +322,11 @@ final class SplitCoordinator {
         out.addProperty("phase", tx.phase); out.addProperty("splitId", tx.id.toString());
         out.addProperty("newGroupId", tx.newPrimary.toString());
         out.addProperty("newPrimaryClientId", tx.newPrimary.toString());
+        if (tx.metadata.enabled()) {
+            out.addProperty("metadataWorldId", tx.metadata.worldId());
+            out.addProperty("metadataTerm", tx.metadata.term());
+            out.addProperty("metadataVersion", tx.metadata.version());
+        }
         sendSafely(connection, request.reply(MessageType.SPLIT_ACK, out, null));
     }
     private static void reject(ControlConnection connection, ControlMessage request, String code, String reason) {

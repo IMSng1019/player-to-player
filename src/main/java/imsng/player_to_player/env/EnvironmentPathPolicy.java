@@ -30,6 +30,10 @@ public final class EnvironmentPathPolicy {
             "world/entities",
             "world/DIM-1",
             "world/DIM1",
+            // v9：可变元数据只经版本化NBT通道同步，自动保存不得推动环境版本。
+            "world/level.dat",
+            "world/level.dat_old",
+            "world/session.lock",
             "session.lock",
             "server.properties",
             "ops.json",
@@ -65,6 +69,12 @@ public final class EnvironmentPathPolicy {
             }
         }
         return new EnvironmentPathPolicy(merged);
+    }
+
+    /** 下载端和中转端没有 MinecraftServer，使用预检给出的实际存档相对路径建立同一规则。 */
+    public static List<String> worldMetadataExclusions(String worldPath) {
+        String world = EnvironmentRuntimeIdentity.normalizeWorldPath(worldPath);
+        return List.of(world + "/level.dat", world + "/level.dat_old", world + "/session.lock");
     }
 
     /**

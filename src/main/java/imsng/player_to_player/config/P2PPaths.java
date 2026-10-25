@@ -53,6 +53,11 @@ public final class P2PPaths {
         return root;
     }
 
+    /** 按生成身份隔离的世界字段检查点和变更日志，永不参加环境文件分发。 */
+    public Path metadataDir() {
+        return root.resolve("world-metadata");
+    }
+
     /** 总配置文件路径。 */
     public Path globalConfig() {
         return root.resolve("config.json");

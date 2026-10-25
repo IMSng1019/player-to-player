@@ -29,4 +29,11 @@ class EnvironmentRuntimeIdentityTest {
         assertTrue(EnvironmentRuntimeIdentity.isRuntimePath("world/datapacks/a.zip", "world"));
         assertTrue(EnvironmentRuntimeIdentity.isRuntimePath("config/state.json", "world"));
     }
+
+    @Test void customWorldMetadataCannotBypassUploadFilterByChangingPathCase() {
+        assertFalse(EnvironmentRuntimeIdentity.isRuntimePath("saves/CUSTOM/level.dat", "saves/custom"));
+        assertFalse(EnvironmentRuntimeIdentity.isRuntimePath("SAVES/custom/LEVEL.DAT_OLD", "saves/custom"));
+        assertFalse(EnvironmentRuntimeIdentity.isRuntimePath("saves/CUSTOM/session.lock", "saves/custom"));
+        assertTrue(EnvironmentRuntimeIdentity.isRuntimePath("saves/custom/serverconfig/mod.toml", "saves/custom"));
+    }
 }

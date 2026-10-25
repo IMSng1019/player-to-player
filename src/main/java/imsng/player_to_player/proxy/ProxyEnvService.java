@@ -7,6 +7,8 @@ import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.env.EnvSyncClient;
 import imsng.player_to_player.env.EnvSyncServerHandlers;
 import imsng.player_to_player.env.EnvironmentSnapshotManager;
+import imsng.player_to_player.env.EnvironmentPreflightInfo;
+import imsng.player_to_player.env.EnvironmentPathPolicy;
 import imsng.player_to_player.netproto.ControlClient;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
@@ -57,7 +59,9 @@ public final class ProxyEnvService {
     private final P2PPaths paths;
 
     /** 下游分发使用的不可变快照管理器；首次上游同步成功前不启动。 */
-    private final EnvironmentSnapshotManager snapshots;
+    private volatile EnvironmentSnapshotManager snapshots;
+    private volatile String worldPath;
+    private volatile java.util.Map<MessageType, imsng.player_to_player.netproto.MessageHandler> environmentHandlers = java.util.Map.of();
 
     /** 定期重同步任务；stop 时取消。 */
     private volatile ScheduledFuture<?> resyncTask;
@@ -67,9 +71,6 @@ public final class ProxyEnvService {
     public ProxyEnvService(GlobalConfig config, P2PPaths paths) {
         this.config = config;
         this.paths = paths;
-        this.snapshots = new EnvironmentSnapshotManager(
-                paths.proxyEnvDir(), paths.environmentSnapshotsDir(), List.of(),
-                config.envSnapshotRetentionMinutes);
     }
 
     /**
@@ -87,8 +88,19 @@ public final class ProxyEnvService {
         running = true;
         // 对外分发面始终读取不可变快照；首次上游同步完成前 current=null，
         // EnvSyncServerHandlers 会明确返回 env_not_ready。
-        relay.setExtraHandlers((ControlServer control) -> EnvSyncServerHandlers.register(
-                control, snapshots, config));
+        relay.setExtraHandlers((ControlServer control) -> {
+            for (MessageType type : List.of(MessageType.ENV_MANIFEST_REQUEST, MessageType.ENV_FILE_REQUEST, MessageType.MOD_LIST_REQUEST)) {
+                control.on(type, (connection, request) -> {
+                    var handler = environmentHandlers.get(type);
+                    if (handler != null) handler.handle(connection, request);
+                    else {
+                        JsonObject error = new JsonObject(); error.addProperty("code", "env_not_ready");
+                        error.addProperty("message", "中转端尚未取得上游实际世界路径及环境快照");
+                        connection.send(request.reply(MessageType.ERROR, error, null));
+                    }
+                });
+            }
+        });
 
         // 上游同步循环：首轮立即，失败退避重试；成功后转定期校验。整条循环在成功前不会
         // 返回（"直到成功或服务停止"），属长驻阻塞任务 —— 专用线程，不占有界 io 池。
@@ -126,7 +138,7 @@ public final class ProxyEnvService {
      *
      * @return 是否成功（失败由调用方决定重试节奏）
      */
-    private boolean syncFromParent(String parent) {
+    private synchronized boolean syncFromParent(String parent) {
         if (!running) {
             return false;
         }
@@ -145,17 +157,15 @@ public final class ProxyEnvService {
         ControlClient cc = new ControlClient(host, port);
         boolean sourceUpdateBegun = false;
         boolean publishUpdate = false;
+        EnvironmentSnapshotManager manager = null;
         try {
             ControlConnection conn = cc.connect();
-            // HELLO：过上级服务端的未鉴权白名单门（version + clientId 即可被接受）
+            // v9使用只读预检取得真实worldPath；不能按worldName猜路径，也不必为下载注册玩家身份。
             JsonObject hello = new JsonObject();
             hello.addProperty("version", Protocol.VERSION);
-            hello.addProperty("clientId", NodeContext.get().clientId().toString());
-            hello.addProperty("playerName", "proxy_server");
-            hello.addProperty("mode", "proxy_server");
-            ControlMessage ack = conn.request(ControlMessage.of(MessageType.HELLO, hello))
+            ControlMessage ack = conn.request(ControlMessage.of(MessageType.ENV_PREFLIGHT, hello))
                     .get(Protocol.REQUEST_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
-            if (!JsonUtil.getBoolean(ack.json(), "accepted", false)) {
+            if (ack.type() != MessageType.ENV_PREFLIGHT || !JsonUtil.getBoolean(ack.json(), "accepted", false)) {
                 LOGGER.warn("上级服务端拒绝握手: {}",
                         JsonUtil.getString(ack.json(), "reason", "未知原因"));
                 return false;
@@ -164,12 +174,27 @@ public final class ProxyEnvService {
                 LOGGER.info("上级服务端环境清单尚未就绪，稍后重试");
                 return false;
             }
+            EnvironmentPreflightInfo info = EnvironmentPreflightInfo.fromJson(ack.json());
+            if (!running) return false;
+            if (snapshots == null || !info.worldPath().equals(worldPath)) {
+                environmentHandlers = java.util.Map.of();
+                if (snapshots != null) snapshots.stop();
+                manager = new EnvironmentSnapshotManager(paths.proxyEnvDir(), paths.environmentSnapshotsDir(),
+                        EnvironmentPathPolicy.worldMetadataExclusions(info.worldPath()), config.envSnapshotRetentionMinutes);
+                snapshots = manager;
+                worldPath = info.worldPath();
+                java.util.Map<MessageType, imsng.player_to_player.netproto.MessageHandler> handlers = new java.util.HashMap<>();
+                EnvSyncServerHandlers.register(handlers::put, manager, config);
+                environmentHandlers = java.util.Map.copyOf(handlers);
+            } else manager = snapshots;
             // 全量视图同步（target=null：不过滤，中转端持有整仓）
-            snapshots.beginSourceUpdate();
+            manager.beginSourceUpdate();
             sourceUpdateBegun = true;
-            new EnvSyncClient(conn, config).syncTo(paths.proxyEnvDir(), null).join();
+            new EnvSyncClient(conn, config, info.worldPath()).syncTo(paths.proxyEnvDir(), null, info.snapshotId()).join();
             // 首轮成功后才启动管理器，避免把空缓存发布成“就绪环境”；后续调用幂等。
-            snapshots.start();
+            if (!running) return false;
+            manager.start();
+            if (!running) { manager.stop(); return false; }
             publishUpdate = true;
             LOGGER.info("中转端上游环境同步完成，已触发不可变快照发布");
             return true;
@@ -181,7 +206,7 @@ public final class ProxyEnvService {
             return false;
         } finally {
             if (sourceUpdateBegun) {
-                snapshots.endSourceUpdate(publishUpdate);
+                manager.endSourceUpdate(publishUpdate);
             }
             cc.close();
         }
@@ -195,6 +220,7 @@ public final class ProxyEnvService {
         if (task != null) {
             task.cancel(false);
         }
-        snapshots.stop();
+        EnvironmentSnapshotManager manager = snapshots;
+        if (manager != null) manager.stop();
     }
 }

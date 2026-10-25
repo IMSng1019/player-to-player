@@ -61,9 +61,15 @@ public final class EnvSyncClient {
     private static final long AWAIT_MILLIS = 20_000;
 
     private final ControlConnection conn;
+    private final EnvironmentPathPolicy pathPolicy;
 
     public EnvSyncClient(ControlConnection conn, GlobalConfig config) {
+        this(conn, config, "world");
+    }
+
+    public EnvSyncClient(ControlConnection conn, GlobalConfig config, String worldPath) {
         this.conn = conn;
+        this.pathPolicy = EnvironmentPathPolicy.create(EnvironmentPathPolicy.worldMetadataExclusions(worldPath));
     }
 
     /**
@@ -235,6 +241,9 @@ public final class EnvSyncClient {
             throw new IOException("服务端清单缺少 files 对象");
         }
         EnvironmentManifest manifest = EnvironmentManifest.fromJson(manifestJson);
+        for (String path : manifest.files().keySet()) {
+            if (!pathPolicy.includes(path)) throw new IOException("环境清单含已排除文件，必须重新获取v9环境快照: " + path);
+        }
         // 解析器供其他调用方兼容旧数据而允许忽略坏条目；网络同步必须拒绝丢条目以及
         // 不可信 filteredHash，避免空清单/截断清单被误当作成功并删除已有环境。
         if (manifest.files().size() != manifestJson.getAsJsonObject("files").size()

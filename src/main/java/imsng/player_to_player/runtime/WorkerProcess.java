@@ -4,6 +4,7 @@ import com.google.gson.JsonObject;
 import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.group.*;
 import imsng.player_to_player.env.EnvironmentManifest;
+import imsng.player_to_player.metadata.*;
 import imsng.player_to_player.netproto.*;
 import imsng.player_to_player.p2p.ReliableChannel;
 import imsng.player_to_player.registry.ChunkKey;
@@ -29,10 +30,12 @@ public final class WorkerProcess {
     private static final Logger LOGGER = LoggerFactory.getLogger("player_to_player/worker");
     private static final Set<MessageType> PUSH_TYPES = Set.of(MessageType.CHUNK_OWNERSHIP_CHANGED,
             MessageType.COMMAND_RELAY, MessageType.CHAT_RELAY, MessageType.PERMISSION_RELAY,
-            MessageType.PEARL_HANDOFF, MessageType.PEARL_LANDED);
+            MessageType.PEARL_HANDOFF, MessageType.PEARL_LANDED,
+            MessageType.METADATA_PATCH, MessageType.METADATA_SNAPSHOT, MessageType.METADATA_EVENT);
     private static volatile Session current;
     private static volatile Consumer<ControlConnection> stopListener;
     private static volatile Consumer<ExitBundle> exitBundleListener;
+    private static volatile java.util.function.BiConsumer<ControlConnection, String> metadataRestartListener;
     private static volatile JsonObject permissions;
     private static volatile ControlConnection registeredRemote;
     private static volatile java.util.function.Function<Path, CompletableFuture<Void>> stoppedFlush =
@@ -66,6 +69,8 @@ public final class WorkerProcess {
         volatile int gamePort;
         volatile String expectedRuntimeHash;
         volatile String expectedManifestHash;
+        volatile long metadataVersion = -1;
+        volatile long metadataTerm;
         volatile ExitManifest exitManifest;
         boolean bundleDelivered;
         Session(UUID group, ControlConnection remote, Path runtimeRoot) {
@@ -81,6 +86,13 @@ public final class WorkerProcess {
     /** 必须在首次 ROLE_REQUEST 前注册，权限提前到达时也缓存并在子服就绪前重放。 */
     public static void registerForwarders(ControlClient client, ControlConnection remote) {
         registeredRemote = remote;
+        client.onDisconnect(connection -> {
+            Session session = current;
+            if (connection == remote && session != null && session.remote == remote && session.rpc.connection() != null)
+                session.rpc.request("metadata_disconnect", null).exceptionally(error -> {
+                    LOGGER.error("中心连接断开后的模拟暂停未获子进程确认", error); return null;
+                });
+        });
         synchronized (MEMBER_LOCK) { permissions = null; members = Map.of(); MEMBER_LOCK.notifyAll(); }
         for (MessageType type : PUSH_TYPES) client.on(type, (connection, message) -> {
             if (registeredRemote != remote) return;
@@ -109,6 +121,9 @@ public final class WorkerProcess {
     public static void setStopListener(Runnable listener) { stopListener = connection -> listener.run(); }
     public static void setStopListener(Consumer<ControlConnection> listener) { stopListener = listener; }
     public static void setExitBundleListener(Consumer<ExitBundle> listener) { exitBundleListener = listener; }
+    public static void setMetadataRestartListener(java.util.function.BiConsumer<ControlConnection, String> listener) {
+        metadataRestartListener = listener;
+    }
     public static void setStoppedFlush(java.util.function.Function<Path, CompletableFuture<Void>> flush) { stoppedFlush = flush; }
     public static Path currentDirectory() { Session session = current; return session == null ? null : session.workingDirectory; }
     public static Path currentWorldFolder() { Session session = current; return session == null ? null : session.worldFolder; }
@@ -170,6 +185,11 @@ public final class WorkerProcess {
             int gamePort;
             try (ServerSocket reserve = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) { gamePort = reserve.getLocalPort(); }
             Map<String, String> localProperties = new HashMap<>(properties);
+            // 安装之后、真正打开世界之前再获取一次，避免环境预检/角色选举期间的元数据变化
+            // 被旧启动参数覆盖。Player 和本地模拟 Time 由安装器保留。
+            MetadataSnapshot metadata = MetadataClient.requestSnapshot(remote, identity).get(20, TimeUnit.SECONDS);
+            MetadataFiles.prepareSave(environment.resolve(worldPath), session.saveDirectory, metadata, System.currentTimeMillis());
+            applyMetadataProperties(localProperties, metadata);
             localProperties.put("p2p.local-port", Integer.toString(gamePort));
             Path working = RuntimeInstallation.install(environment, runtimeRoot.resolve("primary"), worldPath, localProperties);
             requireStarting(session);
@@ -187,6 +207,8 @@ public final class WorkerProcess {
             spec.addProperty("runtimeHash", runtimeHash);
             spec.addProperty("manifestHash", primaryManifest.globalHash());
             spec.add("primaryManifest", primaryManifest.toJson());
+            spec.addProperty("metadataSnapshot", Base64.getEncoder().encodeToString(
+                    MetadataWire.encode(MetadataWire.snapshotToTag(metadata))));
             JsonUtil.writeFileAtomic(session.sessionFile, spec);
             String executable = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win") ? "java.exe" : "java";
             Path java = Path.of(System.getProperty("java.home"), "bin", executable);
@@ -210,6 +232,8 @@ public final class WorkerProcess {
             JsonObject cached = permissions;
             if (cached != null) session.rpc.request(WorkerEnvelope.wrap("remote_push",
                     ControlMessage.of(MessageType.PERMISSION_RELAY, cached))).get(20, TimeUnit.SECONDS);
+            // READY仅证明服务端已启动；还需通过运行时RPC补齐启动期间的变化并取得中心ACK。
+            synchronizeMetadata().get(30, TimeUnit.SECONDS);
             synchronized (session) { requireStarting(session); session.gamePort = port; }
             LOGGER.info("独立计算服务端已就绪: runtime={} port={}", session.id, port);
             return port;
@@ -219,6 +243,35 @@ public final class WorkerProcess {
             throw error;
         } finally { session.launchFinished.complete(null); }
     }
+
+    /** 与 level.dat 重叠的原版启动参数始终取自本次快照，其余运行参数继续用环境预检值。 */
+    static void applyMetadataProperties(Map<String, String> properties, MetadataSnapshot snapshot) {
+        var data = snapshot.data();
+        if (data.contains("Difficulty", net.minecraft.nbt.Tag.TAG_ANY_NUMERIC)) {
+            properties.put("difficulty", switch (data.getByte("Difficulty")) {
+                case 0 -> "peaceful"; case 1 -> "easy"; case 3 -> "hard"; default -> "normal";
+            });
+        }
+        if (data.contains("GameType", net.minecraft.nbt.Tag.TAG_ANY_NUMERIC)) {
+            properties.put("gamemode", switch (data.getInt("GameType")) {
+                case 1 -> "creative"; case 2 -> "adventure"; case 3 -> "spectator"; default -> "survival";
+            });
+        }
+        if (data.contains("hardcore")) properties.put("hardcore", Boolean.toString(data.getBoolean("hardcore")));
+    }
+
+    /** 运行中的接管屏障：只发送RPC，不触碰世界目录中的任何文件。 */
+    public static CompletableFuture<ControlMessage> synchronizeMetadata() {
+        Session session = requireSession();
+        return session.rpc.request("metadata_sync", null).orTimeout(30, TimeUnit.SECONDS).thenApply(reply -> {
+            if (current != session || session.closing) throw new CompletionException(new IOException("元数据确认所属计算进程已过期"));
+            session.metadataVersion = reply.json().get("version").getAsLong();
+            session.metadataTerm = reply.json().get("term").getAsLong();
+            return reply;
+        });
+    }
+    public static long metadataVersion() { Session session = current; return session == null ? -1 : session.metadataVersion; }
+    public static long metadataTerm() { Session session = current; return session == null ? 0 : session.metadataTerm; }
 
     private static CompletionStage<ControlMessage> handle(Session session, ControlMessage message) {
         String op = JsonUtil.getString(message.json(), "op", "");
@@ -271,6 +324,11 @@ public final class WorkerProcess {
                 else session.ready.complete(message.json().get("port").getAsInt());
             }
             case "server_stopped" -> session.stopped.complete(null);
+            case "metadata_restart_required" -> {
+                var callback = metadataRestartListener;
+                if (callback != null && !session.retired && !session.closing)
+                    callback.accept(session.remote, JsonUtil.getString(message.json(), "fields", "启动设置"));
+            }
             case "stopped" -> {
                 Consumer<ControlConnection> callback = stopListener;
                 if (!session.exiting && !session.retired && !session.closing && callback != null)
@@ -279,6 +337,10 @@ public final class WorkerProcess {
             case "merge_trigger" -> MergeTriggers.trigger(UUID.fromString(message.json().get("blockingGroup").getAsString()),
                     ChunkKey.parse(message.json().get("chunk").getAsString()));
             case "presync_progress" -> {
+                if (message.json().has("metadataVersion")) {
+                    session.metadataVersion = message.json().get("metadataVersion").getAsLong();
+                    session.metadataTerm = message.json().get("metadataTerm").getAsLong();
+                }
                 Consumer<String> progress = session.progress.get(message.json().get("streamId").getAsString());
                 if (progress != null) progress.accept(message.json().get("phase").getAsString());
             }
@@ -328,7 +390,10 @@ public final class WorkerProcess {
         session.progress.put(id, progress);
         try {
             JsonObject json = new JsonObject(); json.addProperty("streamId", id);
-            session.rpc.request(sending ? "presync_send" : "presync_receive", json).get();
+            synchronizeMetadata().get();
+            ControlMessage confirmed = session.rpc.request(sending ? "presync_send" : "presync_receive", json).get();
+            session.metadataVersion = confirmed.json().get("metadataVersion").getAsLong();
+            session.metadataTerm = confirmed.json().get("metadataTerm").getAsLong();
         } finally { session.streams.remove(id); session.progress.remove(id); }
     }
 

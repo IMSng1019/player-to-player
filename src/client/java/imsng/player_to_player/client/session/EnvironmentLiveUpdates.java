@@ -119,7 +119,7 @@ public final class EnvironmentLiveUpdates {
                     EnvironmentPreflightInfo next;
                     while (active == this && (next = desired.getAndSet(null)) != null) {
                         Path pending = folder.resolve("pending-environment");
-                        new EnvSyncClient(connection, NodeContext.get().config()).syncPair(
+                        new EnvSyncClient(connection, NodeContext.get().config(), next.worldPath()).syncPair(
                                 pending.resolve("primary"), pending.resolve("secondary"), next.snapshotId(),
                                 () -> active == this && connection.isOpen()).join();
                         if (active != this) return;

@@ -236,6 +236,8 @@ public final class CommandChatHandlers {
         if ("list".equals(normalized)) {
             return CompletableFuture.completedFuture(buildPlayerList());
         }
+        // 全局字段只在中心执行一次；原版最终执行节点负责耐久提交结果补丁。
+        if (imsng.player_to_player.metadata.MetadataCommands.isGlobal(normalized)) return null;
         String dimension = source.getLevel().dimension().location().toString();
         ConsoleCommandRouting.Decision plan = ConsoleCommandRouting.plan(normalized,
                 server.getCommands().getDispatcher(), source, dimension,
@@ -410,7 +412,9 @@ public final class CommandChatHandlers {
         }
 
         // ---- 3/4 级指令：在服务端执行（真实等级过原版 requires），不跨组 ----
-        if (!isGroupExecutable(command, source)) {
+        if ((imsng.player_to_player.metadata.MetadataCommands.isGlobal(command)
+                && !imsng.player_to_player.metadata.MetadataCommands.isLocalClockQuery(command))
+                || !isGroupExecutable(command, source)) {
             executeOnServer(conn, msg, command, source, playerName);
             return;
         }
@@ -480,9 +484,14 @@ public final class CommandChatHandlers {
             CommandFeedback feedback = new CommandFeedback();
             CommandSourceStack collecting = realSource.withSource(feedback);
             try {
+                imsng.player_to_player.metadata.MetadataService.beginLocalCommand(groups.groupOf(conn.peerId()),
+                        parseUuid(JsonUtil.getString(msg.json(), "playerUuid", "")), collecting);
                 server.getCommands().performPrefixedCommand(collecting, command);
             } catch (Exception e) {
                 LOGGER.warn("服务端执行指令异常: /{}", command, e);
+                feedback.sendSystemMessage(Component.literal("全局指令未确认: " + e.getMessage()));
+            } finally {
+                imsng.player_to_player.metadata.MetadataService.endLocalCommand(server);
             }
             String message = feedback.joined();
             // 审计痕迹：这些指令（/op、/ban、/stop…）在原版会写控制台与 latest.log，
@@ -522,7 +531,7 @@ public final class CommandChatHandlers {
         List<UUID> targetGroups = new ArrayList<>();
         // 服务端核过的"持有区块"清单：随转发下发，接收端据此复核归属在预检之后没有变化
         List<ChunkKey> ownedChunks = new ArrayList<>();
-        if (analysis.contextBound()) {
+        if (analysis.contextBound() || imsng.player_to_player.metadata.MetadataCommands.containsGlobal(parse)) {
             // 引用执行上下文的指令只在发起组执行（源 = 发起玩家实体），但**越界仍要拦**：
             // /execute positioned … run fill ~ ~ ~ ~45 32 32 这类形态的绝对坐标同样会
             // 伸进别人的领地 —— 发起组执行时就地冻结，比"干净拒绝"糟糕得多

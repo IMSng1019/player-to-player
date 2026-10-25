@@ -248,7 +248,7 @@ public final class HelloHandler implements MessageHandler {
     // ------------------------------------------------------------ 静态查询（包内）
 
     /** 查询某客户端的在线控制连接；不在线返回 null（P2PBrokerHandlers 用）。 */
-    static ControlConnection connectionOf(UUID clientId) {
+    public static ControlConnection connectionOf(UUID clientId) {
         return ONLINE.get(clientId);
     }
 

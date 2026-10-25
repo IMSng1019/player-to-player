@@ -34,7 +34,7 @@ class EnvironmentSnapshotLifecycleTest {
     @Test
     void helloAdvertisesCurrentImmutableSnapshot() throws Exception {
         Path sourceRoot = tempDir.resolve("source");
-        Path file = sourceRoot.resolve("world/level.dat");
+        Path file = sourceRoot.resolve("world/serverconfig/settings.json");
         Files.createDirectories(file.getParent());
         Files.writeString(file, "world-bootstrap", StandardCharsets.UTF_8);
 

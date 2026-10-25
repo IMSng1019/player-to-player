@@ -60,7 +60,7 @@ class EnvironmentSnapshotManagerTest {
     void publishesNewSnapshotAfterIncludedSourceFileChanges() throws Exception {
         Path sourceRoot = tempDir.resolve("source");
         Path repositoryRoot = tempDir.resolve("repository");
-        Path levelDat = sourceRoot.resolve("world/level.dat");
+        Path levelDat = sourceRoot.resolve("world/serverconfig/settings.json");
         Files.createDirectories(levelDat.getParent());
         Files.writeString(levelDat, "before", StandardCharsets.UTF_8);
 

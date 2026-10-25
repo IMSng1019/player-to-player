@@ -87,6 +87,9 @@ public final class MergeCoordinator {
         final Set<UUID> preparingMembers;
         final Set<UUID> awaitingRedirects;
         final MergeReadiness readiness;
+        /** 计划生成时固定的元数据屏障；不得拿字段ACK替代区块尾部/隧道准备ACK。 */
+        final long metadataVersion = imsng.player_to_player.metadata.MetadataService.version();
+        final long metadataTerm = imsng.player_to_player.metadata.MetadataService.term();
         boolean drainSent;
         volatile State state = State.PLANNED;
         volatile ScheduledFuture<?> timeoutTask;
@@ -111,6 +114,13 @@ public final class MergeCoordinator {
 
     /** 活跃合并会话：mergeId → 会话。 */
     private final Map<UUID, MergeSession> sessions = new ConcurrentHashMap<>();
+
+    public boolean isTransitioning(UUID group) {
+        if (splits.involvesGroup(group)) return true;
+        for (MergeSession session : sessions.values())
+            if (session.state != State.COMMITTED && session.state != State.ABORTED && session.involves(group)) return true;
+        return false;
+    }
 
     /** 冷却表："小组id|大组id"（有序拼接）→ 上次尝试时刻。惰性清理。 */
     private final Map<String, Long> cooldowns = new ConcurrentHashMap<>();
@@ -281,6 +291,11 @@ public final class MergeCoordinator {
             return;
         }
         UUID oldPrimary = roles.oldPrimary();
+        if (!imsng.player_to_player.metadata.MetadataService.transferAllowed(requesterGroup)
+                || !imsng.player_to_player.metadata.MetadataService.transferAllowed(targetGroup)) {
+            conn.send(error(msg, "metadata_transfer_unsafe", "世界状态尚未通过接管核对，原组继续运行"));
+            return;
+        }
 
         MergeSession session = new MergeSession(requesterGroup, targetGroup, newPrimary, oldPrimary,
                 groups.membersOf(groups.groupOf(oldPrimary)));
@@ -315,6 +330,8 @@ public final class MergeCoordinator {
     private JsonObject buildPlan(MergeSession session) {
         JsonObject plan = new JsonObject();
         plan.addProperty("mergeId", session.mergeId.toString());
+        plan.addProperty("metadataVersion", session.metadataVersion);
+        plan.addProperty("metadataTerm", session.metadataTerm);
         plan.addProperty("newPrimaryClientId", session.newPrimary.toString());
         plan.addProperty("oldPrimaryClientId", session.oldPrimary.toString());
         plan.addProperty("groupAId", session.groupA.toString());
@@ -360,6 +377,13 @@ public final class MergeCoordinator {
                 mergeId, reporter, phase, success);
         if (!success || "failed".equals(phase)) {
             abort(session, "当事方回报失败: " + JsonUtil.getString(msg.json(), "detail", phase));
+            return;
+        }
+        if (("caught_up".equals(phase) || "switched".equals(phase)) && session.metadataTerm > 0
+                && !imsng.player_to_player.metadata.MetadataTransferBarrier.accepts(session.metadataVersion,
+                    session.metadataTerm, JsonUtil.getLong(msg.json(), "metadataVersion", -1),
+                    JsonUtil.getLong(msg.json(), "metadataTerm", -1), imsng.player_to_player.metadata.MetadataService.term())) {
+            abort(session, "元数据版本或写入任期未通过接管屏障，原主继续运行");
             return;
         }
         switch (phase) {

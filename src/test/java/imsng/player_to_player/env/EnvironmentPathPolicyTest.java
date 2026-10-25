@@ -19,11 +19,13 @@ class EnvironmentPathPolicyTest {
     }
 
     @Test
-    void includesStableEnvironmentAndWorldBootstrapFiles() {
+    void includesStableEnvironmentButExcludesWorldMetadata() {
         EnvironmentPathPolicy policy = EnvironmentPathPolicy.create(List.of());
 
         assertTrue(policy.includes("mods/example.jar"));
-        assertTrue(policy.includes("world/level.dat"));
+        assertFalse(policy.includes("world/level.dat"));
+        assertFalse(policy.includes("WORLD/LEVEL.DAT_OLD"));
+        assertTrue(policy.includes("config/level.dat"));
     }
 
     @Test
@@ -33,6 +35,9 @@ class EnvironmentPathPolicyTest {
         assertFalse(policy.includes("logs/latest.log"));
         assertFalse(policy.includes("player-to-player/config.json"));
         assertFalse(policy.includes("world/region/r.0.0.mca"));
+        assertFalse(policy.includes("world/session.lock"));
+        assertFalse(EnvironmentPathPolicy.create(List.of("saves/actual-world/session.lock"))
+                .includes("saves/actual-world/session.lock"));
         assertFalse(policy.includes("world/level.dat.p2pdl.tmp"));
         // 玩家数据/预同步使用的是 .p2p-tmp，不能只排除以 .tmp 结尾的文件。
         assertFalse(policy.includes("world/playerdata/player.dat.p2p-tmp"));

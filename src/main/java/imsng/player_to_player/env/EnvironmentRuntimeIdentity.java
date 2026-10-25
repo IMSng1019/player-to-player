@@ -26,9 +26,12 @@ public final class EnvironmentRuntimeIdentity {
     }
 
     public static boolean isRuntimePath(String path, String worldPath) {
-        String prefix = normalizeWorldPath(worldPath) + "/";
-        if (!path.startsWith(prefix)) return true;
-        String relative = path.substring(prefix.length());
+        // 与EnvironmentPathPolicy保持同一大小写口径。Windows上的Foo与foo指向同一
+        // 存档；若只做大小写敏感比较，上传者可把元数据伪装成世界目录外的普通配置。
+        String prefix = normalizeWorldPath(worldPath).toLowerCase(java.util.Locale.ROOT) + "/";
+        String normalized = path.replace('\\', '/').toLowerCase(java.util.Locale.ROOT);
+        if (!normalized.startsWith(prefix)) return true;
+        String relative = normalized.substring(prefix.length());
         return relative.startsWith("datapacks/") || relative.startsWith("serverconfig/");
     }
 

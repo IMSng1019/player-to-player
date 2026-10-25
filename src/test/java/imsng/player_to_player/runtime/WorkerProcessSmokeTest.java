@@ -5,6 +5,7 @@ import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.config.P2PPaths;
 import imsng.player_to_player.core.*;
 import imsng.player_to_player.netproto.*;
+import imsng.player_to_player.metadata.*;
 import net.fabricmc.api.ModInitializer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
@@ -79,9 +80,20 @@ class WorkerProcessSmokeTest {
         context.setGroupId(context.clientId());
         context.setPlayerName("WorkerProbe");
         AtomicInteger claims = new AtomicInteger();
+        MetadataSnapshot metadata = metadataFixture();
+        byte[] metadataBytes = MetadataWire.encode(MetadataWire.snapshotToTag(metadata));
+        AtomicInteger metadataAcks = new AtomicInteger();
         ControlConnection remote = new ControlConnection() {
             public void send(ControlMessage message) { }
             public CompletableFuture<ControlMessage> request(ControlMessage message) {
+                if (message.type() == MessageType.METADATA_SNAPSHOT_REQUEST) {
+                    return CompletableFuture.completedFuture(message.reply(MessageType.METADATA_SNAPSHOT, new JsonObject(), metadataBytes));
+                }
+                if (message.type() == MessageType.METADATA_ACK) {
+                    metadataAcks.incrementAndGet();
+                    JsonObject ack = new JsonObject(); ack.addProperty("accepted", true);
+                    return CompletableFuture.completedFuture(message.reply(MessageType.METADATA_ACK, ack, null));
+                }
                 if (message.type() == MessageType.CHUNK_CLAIM_REQUEST) claims.incrementAndGet();
                 JsonObject error = new JsonObject(); error.addProperty("code", "SMOKE_NO_WORLD_DEMAND");
                 return CompletableFuture.completedFuture(message.reply(MessageType.ERROR, error, null));
@@ -97,11 +109,14 @@ class WorkerProcessSmokeTest {
         var manifest = imsng.player_to_player.env.EnvironmentScanner.scan(environment, java.util.List.of());
         try {
             int port = WorkerProcess.start(folder, environment, "world", folder.resolve("data"),
-                    "world", "", context.groupId(), remote,
+                    "world", metadata.worldId(), context.groupId(), remote,
                     Map.of("view-distance", "2", "simulation-distance", "2", "eula", "true"),
                     manifest, manifest.globalHash());
             assertTrue(port > 0);
             assertTrue(WorkerProcess.isManagedWorld());
+            assertTrue(metadataAcks.get() > 0, "子服启动后必须应用快照并完成元数据版本确认");
+            assertEquals(metadata.version(), WorkerProcess.metadataVersion());
+            assertEquals(metadata.term(), WorkerProcess.metadataTerm());
             assertEquals("SERVER|authority-config-17", Files.readString(
                     WorkerProcess.currentDirectory().resolve("worker-fixture-result.txt"), StandardCharsets.UTF_8));
             // 直接接子服即使伪造正确玩家名也必须拒绝；走父进程授权桥时，服务端返回
@@ -140,7 +155,10 @@ class WorkerProcessSmokeTest {
                     finalBundle.playerData(context.clientId())).getLong("ProbeValue"));
         } catch (Exception failure) {
             Path log = folder.resolve("runtime/worker-console.log");
-            String output = Files.exists(log) ? Files.readString(log) : "未生成子进程日志";
+            // 开发启动器在 Windows 上使用 native.encoding；诊断读取不能以 UTF-8 解码失败
+            // 覆盖真正的启动/登录错误。解码允许替代字符，原异常始终保留为 cause。
+            String output = Files.exists(log) ? new String(Files.readAllBytes(log), java.nio.charset.Charset.forName(
+                    System.getProperty("native.encoding", StandardCharsets.UTF_8.name()))) : "未生成子进程日志";
             throw new AssertionError("独立服务端冒烟失败：\n" + output.substring(Math.max(0, output.length() - 24000)), failure);
         } finally {
             WorkerProcess.closeSession();
@@ -148,6 +166,26 @@ class WorkerProcessSmokeTest {
             while (WorkerProcess.isRunning() && System.nanoTime() < deadline) Thread.sleep(20);
         }
         assertFalse(WorkerProcess.isRunning(), "子服停止后父进程必须归还IPC和当前实例");
+    }
+
+    /** 不借用本机真实世界：fixture包含1.20.4三维度原版生成器与字段类型。 */
+    private static MetadataSnapshot metadataFixture() throws Exception {
+        var data = net.minecraft.nbt.TagParser.parseTag("""
+                {DataVersion:3700,version:19133,Version:{Id:3700,Name:"1.20.4",Snapshot:0b,Series:"main"},
+                 LevelName:"metadata-smoke",GameType:0,Difficulty:2b,hardcore:0b,allowCommands:1b,
+                 initialized:1b,SpawnX:0,SpawnY:64,SpawnZ:0,SpawnAngle:0.0f,Time:40L,DayTime:6000L,
+                 clearWeatherTime:0,rainTime:12000,raining:0b,thunderTime:12000,thundering:0b,
+                 DataPacks:{Enabled:["vanilla","fabric","fabric-convention-tags-v1","fabric-gametest-api-v1"],Disabled:["bundle","trade_rebalance","update_1_21"]},
+                 DragonFight:{DragonKilled:0b,PreviouslyKilled:0b,NeedsStateScanning:1b},
+                 GameRules:{doDaylightCycle:"true",doWeatherCycle:"true"},
+                 WorldGenSettings:{seed:42L,generate_features:1b,bonus_chest:0b,dimensions:{
+                  "minecraft:overworld":{type:"minecraft:overworld",generator:{type:"minecraft:noise",settings:"minecraft:overworld",biome_source:{type:"minecraft:multi_noise",preset:"minecraft:overworld"}}},
+                  "minecraft:the_nether":{type:"minecraft:the_nether",generator:{type:"minecraft:noise",settings:"minecraft:nether",biome_source:{type:"minecraft:multi_noise",preset:"minecraft:nether"}}},
+                  "minecraft:the_end":{type:"minecraft:the_end",generator:{type:"minecraft:noise",settings:"minecraft:end",biome_source:{type:"minecraft:the_end"}}}
+                 }}}
+                """);
+        var root = new net.minecraft.nbt.CompoundTag(); root.put("Data", data);
+        return new MetadataSnapshot(imsng.player_to_player.world.WorldIdentity.ofLevelData(root).orElseThrow(), 4, 2, data);
     }
 
     private static void loginHello(Socket socket, int port, String name, UUID claimedId) throws IOException {

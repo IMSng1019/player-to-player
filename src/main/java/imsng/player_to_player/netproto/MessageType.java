@@ -327,7 +327,22 @@ public enum MessageType {
     /** v8：仅父子进程回环通道使用的运行时请求，不能在协调服务端注册。 */
     WORKER_CONTROL(120),
     /** v8：仅父子进程回环通道使用的就绪、退出与状态事件。 */
-    WORKER_EVENT(121);
+    WORKER_EVENT(121),
+
+    /** v9：请求当前世界字段快照（首次加入、重连及无法补齐时使用）。 */
+    METADATA_SNAPSHOT_REQUEST(130),
+    /** v9：带世界身份、任期和版本的有类型 NBT 全量快照。 */
+    METADATA_SNAPSHOT(131),
+    /** v9：携带基础版本及稳定操作 ID 的字段修改或全局命令请求。 */
+    METADATA_CHANGE(132),
+    /** v9：已耐久提交的结果补丁，含显式删除集合。 */
+    METADATA_PATCH(133),
+    /** v9：计算进程应用确认；不代表实体和区块迁移完成。 */
+    METADATA_ACK(134),
+    /** v9：请求缺失版本；日志不足时退回新快照。 */
+    METADATA_CATCHUP(135),
+    /** v9：睡眠报告、唯一生成尝试和计划函数派发。 */
+    METADATA_EVENT(136);
 
     private final int id;
 

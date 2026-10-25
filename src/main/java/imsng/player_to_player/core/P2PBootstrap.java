@@ -86,6 +86,8 @@ public final class P2PBootstrap {
                 imsng.player_to_player.server.EnvironmentPreflightServer.registerLogin();
                 // 服务端主服务在 MC 服务器完全启动后再启动（需要注册表/世界目录就绪）
                 ServerLifecycleEvents.SERVER_STARTED.register(P2PServerService::start);
+                net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents.END_SERVER_TICK.register(
+                        imsng.player_to_player.metadata.MetadataService::tick);
                 ServerLifecycleEvents.SERVER_STOPPING.register(server -> P2PServerService.stop());
             }
             case PROXY_SERVER -> {

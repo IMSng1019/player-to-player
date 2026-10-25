@@ -101,6 +101,11 @@ public final class EnvironmentSnapshotStore {
                     .toList()) {
                 try {
                     EnvironmentSnapshot snapshot = readSnapshot(manifestFile);
+                    // 协议升级或管理员新增排除项后，旧清单不能绕过当前路径规则继续分发。
+                    // 不能简单删掉条目：那会改变snapshotId，因此整份旧版本必须失效。
+                    for (String path : snapshot.manifest().files().keySet()) {
+                        if (!pathPolicy.includes(path)) throw new IOException("旧环境快照包含当前已排除的路径: " + path);
+                    }
                     validateSnapshotBlobs(snapshot);
                     loaded.put(snapshot.snapshotId(), snapshot);
                 } catch (Exception e) {
@@ -272,6 +277,7 @@ public final class EnvironmentSnapshotStore {
             throw new IOException("快照不存在");
         }
         String normalized = pathPolicy.normalize(relativePath);
+        if (!pathPolicy.includes(normalized)) throw new IOException("路径已不属于环境同步范围: " + normalized);
         EnvironmentManifest.Entry entry = snapshot.manifest().files().get(normalized);
         if (entry == null) {
             throw new IOException("路径不在快照清单中: " + normalized);

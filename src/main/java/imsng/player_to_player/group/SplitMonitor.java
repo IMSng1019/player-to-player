@@ -3,6 +3,11 @@ package imsng.player_to_player.group;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import imsng.player_to_player.core.NodeContext;
+import imsng.player_to_player.metadata.MetadataClient;
+import imsng.player_to_player.metadata.MetadataEvents;
+import imsng.player_to_player.metadata.MetadataRuntime;
+import imsng.player_to_player.metadata.MetadataSnapshot;
+import imsng.player_to_player.metadata.MetadataTransferFence;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.MessageType;
@@ -104,8 +109,15 @@ public final class SplitMonitor {
         final List<SplitRegion> regions;
         final Map<UUID, CompletableFuture<Void>> finalUploads = new HashMap<>();
         final long started = System.currentTimeMillis();
+        final String metadataWorldId;
+        final long metadataTerm;
+        long metadataVersion;
         volatile boolean cancelRequested;
         boolean prepared;
+        boolean drainStarted;
+        boolean ownsTickFreeze;
+        boolean metadataFlushPending;
+        boolean finalMetadataFlushed;
         boolean requestInFlight;
         boolean resolveStatus;
         long nextRequestAt;
@@ -113,7 +125,7 @@ public final class SplitMonitor {
 
         SplitOperation(MinecraftServer server, ControlConnection connection, ChunkClaimClient claims,
                        UUID groupId, String signature, Map<UUID, ServerPlayer> departing,
-                       List<SplitRegion> regions) {
+                       List<SplitRegion> regions, MetadataSnapshot metadata) {
             this.server = server;
             this.connection = connection;
             this.claims = claims;
@@ -121,6 +133,9 @@ public final class SplitMonitor {
             this.signature = signature;
             this.departing = Map.copyOf(departing);
             this.regions = List.copyOf(regions);
+            this.metadataWorldId = metadata.worldId();
+            this.metadataTerm = metadata.term();
+            this.metadataVersion = metadata.version();
         }
 
         // 与服务端预约一致，包括四邻边界；否则边缘晚到claim会让服务端永远拒绝commit。
@@ -271,6 +286,13 @@ public final class SplitMonitor {
     private static void initiateSplit(MinecraftServer server, ControlConnection conn,
                                       ChunkClaimClient claims, UUID groupId, String signature,
                                       List<ServerPlayer> component, int viewDistance) {
+        String unsafeMetadata = metadataRejection(server, null);
+        if (unsafeMetadata != null) {
+            inFlight.remove(signature);
+            LOGGER.info("分离延期，保持原组运行: {}", unsafeMetadata);
+            return;
+        }
+        MetadataSnapshot metadata = MetadataClient.snapshot();
         List<SplitRegion> departingDemand = new ArrayList<>();
         List<SplitRegion> remainingDemand = new ArrayList<>();
         Map<UUID, ServerPlayer> departing = new HashMap<>();
@@ -302,7 +324,7 @@ public final class SplitMonitor {
             return;
         }
         SplitOperation operation = new SplitOperation(server, conn, claims, groupId,
-                signature, departing, planned.get());
+                signature, departing, planned.get(), metadata);
         // 必须在发prepare前登记：离组端收到服务端通知后可能比prepared应答更早断线。
         activeSplit = operation;
         LOGGER.info("分离开始准备: split={} 离组人数={} 完整区域={}",
@@ -392,6 +414,20 @@ public final class SplitMonitor {
         if (operation.requestInFlight || now < operation.nextRequestAt) return;
         if (operation.resolveStatus) { sendPhase(operation, "status"); return; }
         if (!operation.prepared) return;
+        if (operation.metadataFlushPending) return; // 异步尾部/版本确认尚未完成，不把其临时暂停误作失败。
+        if (!operation.cancelRequested) {
+            String reason = metadataRejection(server, operation);
+            if (reason != null) {
+                operation.cancelRequested = true;
+                LOGGER.warn("分离期间元数据屏障失效，转安全取消: split={} reason={}", operation.splitId, reason);
+            }
+        }
+        if (!operation.drainStarted) {
+            // 准备应答返回时发现不可迁移状态，尚未撤销任何本地加载岛；可直接取消预约，
+            // 不必为了取消而卸载整个区域。原组始终是唯一写者，重连继续使用其现有对象。
+            if (operation.cancelRequested) sendPhase(operation, "cancel");
+            return;
+        }
         boolean playersGone = server.getPlayerList().getPlayers().stream().noneMatch(player -> {
             UUID id = canonicalId(player);
             return operation.departing.containsValue(player)
@@ -403,6 +439,13 @@ public final class SplitMonitor {
                 && operation.finalUploads.values().stream()
                 .allMatch(future -> future.isDone() && !future.isCompletedExceptionally());
         if (playersGone && claimsGone && holdersGone && (playersSaved || operation.cancelRequested)) {
+            if (!operation.cancelRequested && !operation.finalMetadataFlushed) {
+                flushMetadataTail(operation, true);
+                return;
+            }
+            MetadataSnapshot currentMetadata = MetadataClient.snapshot();
+            if (!operation.cancelRequested && (currentMetadata == null
+                    || currentMetadata.version() < operation.metadataVersion)) return;
             // 回滚的ROLE_ASSIGN可能经另一条连接先于本端cancel ACK到达。只有旧holder已全清
             // 才在发cancel前解除本地fence；服务端预约此刻仍阻止旧组提前重占，安全性不变。
             if (operation.cancelRequested) operation.claims.cancelSplitDrain();
@@ -437,6 +480,12 @@ public final class SplitMonitor {
         request.addProperty("phase", phase);
         request.addProperty("splitId", operation.splitId.toString());
         request.addProperty("groupId", operation.groupId.toString());
+        MetadataSnapshot metadata = MetadataClient.snapshot();
+        if (metadata != null) {
+            request.addProperty("metadataWorldId", metadata.worldId());
+            request.addProperty("metadataTerm", metadata.term());
+            request.addProperty("metadataVersion", metadata.version());
+        }
         if ("prepare".equals(phase)) {
             JsonArray members = new JsonArray();
             operation.departing.keySet().forEach(id -> members.add(id.toString()));
@@ -491,9 +540,23 @@ public final class SplitMonitor {
             finishSplit(operation, false);
         } else if ("prepared".equals(phase) || "cancel_requested".equals(phase)) {
             if (!operation.prepared) {
-                // prepared证明服务器预约已生效，此后才使局部未决claim以UNLOADED完成。
-                operation.claims.beginSplitDrain(operation::contains);
                 operation.prepared = true;
+                operation.metadataVersion = Math.max(operation.metadataVersion,
+                        JsonUtil.getLong(reply.json(), "metadataVersion", operation.metadataVersion));
+                String metadataProblem = metadataRejection(operation.server, operation);
+                boolean sameBarrier = operation.metadataWorldId.equals(JsonUtil.getString(reply.json(),
+                        "metadataWorldId", operation.metadataWorldId))
+                        && operation.metadataTerm == JsonUtil.getLong(reply.json(), "metadataTerm", operation.metadataTerm);
+                if (metadataProblem != null || !sameBarrier || "cancel_requested".equals(phase)) {
+                    operation.cancelRequested = true;
+                    operation.nextRequestAt = System.currentTimeMillis();
+                    LOGGER.warn("分离尚未开始区域排空，取消失效准备: split={} reason={}", operation.splitId,
+                            metadataProblem != null ? metadataProblem : "准备任期变化或中心已请求取消");
+                    return;
+                }
+                // 先冻结并提交模拟字段，再允许卸载它们所属区块。否则注册表释放后中心可能
+                // 已撤销末地模拟权，最后的 DragonFight 便再也无法以原写者提交。
+                flushMetadataTail(operation, false);
             }
             if ("cancel_requested".equals(phase)) operation.cancelRequested = true;
             operation.nextRequestAt = System.currentTimeMillis() + 1_000;
@@ -505,11 +568,66 @@ public final class SplitMonitor {
     }
 
     private static void finishSplit(SplitOperation operation, boolean committed) {
-        if (operation.prepared) operation.claims.cancelSplitDrain();
+        if (operation.drainStarted) operation.claims.cancelSplitDrain();
+        if (operation.ownsTickFreeze && !GroupRuntime.isExitDraining()) GroupRuntime.setTickFrozen(false);
         activeSplit = null;
         inFlight.remove(operation.signature);
         candidates.clear();
         LOGGER.info("分离事务{}: split={} 离组人数={}（旧区块经最终写回释放，无直接所有权迁移）",
                 committed ? "提交完成" : "已回滚", operation.splitId, operation.departing.size());
+    }
+
+    /** 本地真实运行对象是最终依据，不能把中心最近一次字段报告当作当前复活中间态的证明。 */
+    private static String metadataRejection(MinecraftServer server, SplitOperation operation) {
+        if ((GroupRuntime.isTickFrozen() && (operation == null || !operation.ownsTickFreeze))
+                || GroupRuntime.isExitDraining()) return "原组正在冻结或退出排空，不能并发分离";
+        MetadataSnapshot metadata = MetadataClient.snapshot();
+        if (metadata == null || !MetadataClient.isSimulationReady()) return "世界元数据尚未确认，不能迁移模拟权";
+        if (operation != null && (!operation.metadataWorldId.equals(metadata.worldId())
+                || operation.metadataTerm != metadata.term())) return "分离准备期间世界身份或写入任期已变化";
+        try {
+            MetadataRuntime.assertTransferSafe(server);
+            return null;
+        } catch (IllegalStateException unsafe) {
+            return unsafe.getMessage();
+        }
+    }
+
+    /**
+     * 分离也有模拟字段尾部。为避免卸载区域与字段所有权之间出现空窗，当前实现保守冻结
+     * 留组模拟直到排空/提交或取消；区块服务仍继续卸载。网络等待全部异步，绝不占主线程。
+     */
+    private static void flushMetadataTail(SplitOperation operation, boolean finalPass) {
+        if (operation.metadataFlushPending || activeSplit != operation) return;
+        if (!operation.ownsTickFreeze) {
+            if (GroupRuntime.isTickFrozen()) { operation.cancelRequested = true; return; }
+            operation.ownsTickFreeze = true;
+            GroupRuntime.setTickFrozen(true);
+        }
+        operation.metadataFlushPending = true;
+        MetadataEvents.flushTransferState(operation.server)
+                .thenCompose(durable -> MetadataClient.synchronize(operation.server, operation.connection).thenApply(applied -> {
+                    if (!MetadataTransferFence.of(durable).coveredBy(applied))
+                        throw new IllegalStateException("分离模拟字段未达到已提交尾部版本");
+                    return applied;
+                }))
+                .whenComplete((applied, failure) -> operation.server.execute(() -> {
+                    if (activeSplit != operation || !GroupRuntime.isManagedServer(operation.server)) return;
+                    operation.metadataFlushPending = false;
+                    String unsafe = failure == null ? metadataRejection(operation.server, operation) : failure.toString();
+                    if (unsafe != null) {
+                        operation.cancelRequested = true;
+                        LOGGER.warn("分离模拟字段尾部未确认，保持旧组并取消: split={} reason={}", operation.splitId, unsafe);
+                    } else {
+                        operation.metadataVersion = Math.max(operation.metadataVersion, applied.version());
+                        if (finalPass) operation.finalMetadataFlushed = true;
+                        else if (!operation.cancelRequested) {
+                            operation.claims.beginSplitDrain(operation::contains);
+                            operation.drainStarted = true;
+                        }
+                    }
+                    operation.nextRequestAt = System.currentTimeMillis();
+                    advanceSplit(operation.server);
+                }));
     }
 }

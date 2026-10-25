@@ -130,6 +130,7 @@ public final class GroupServerHooks {
         });
 
         ServerTickEvents.END_SERVER_TICK.register(server -> {
+            imsng.player_to_player.metadata.MetadataEvents.tickWorker(server);
             LocalPermissions.onServerTick(server);
             reportPositions(server);
         });

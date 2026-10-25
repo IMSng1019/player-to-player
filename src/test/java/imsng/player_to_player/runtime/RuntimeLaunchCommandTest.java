@@ -7,8 +7,23 @@ import java.nio.file.Path;
 import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
+@org.junit.jupiter.api.parallel.ResourceLock(org.junit.jupiter.api.parallel.Resources.SYSTEM_PROPERTIES)
 class RuntimeLaunchCommandTest {
     @TempDir Path temp;
+    private String developmentSpec;
+
+    @org.junit.jupiter.api.BeforeEach
+    void selectProductionLauncher() {
+        // 同一轮可同时运行真实Loom子进程冒烟；这两个测试专门验证正式发行JAR入口。
+        developmentSpec = System.getProperty("p2p.worker.developmentSpec");
+        System.clearProperty("p2p.worker.developmentSpec");
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void restoreDevelopmentLauncher() {
+        if (developmentSpec == null) System.clearProperty("p2p.worker.developmentSpec");
+        else System.setProperty("p2p.worker.developmentSpec", developmentSpec);
+    }
 
     @Test
     void buildsDirectJavaArgumentsWithSeparateWorldDirectory() throws Exception {

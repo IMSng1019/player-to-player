@@ -10,6 +10,8 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class EnvironmentSnapshotStoreTest {
 
@@ -17,10 +19,26 @@ class EnvironmentSnapshotStoreTest {
     Path tempDir;
 
     @Test
+    void upgradedPolicyInvalidatesOldCustomWorldMetadataSnapshotsAndDirectReads() throws Exception {
+        Path source = tempDir.resolve("source");
+        Path repository = tempDir.resolve("repository");
+        String oldPath = "saves/custom-world/level.dat";
+        Files.createDirectories(source.resolve(oldPath).getParent());
+        Files.writeString(source.resolve(oldPath), "old-protocol-world-metadata");
+        // 模拟旧版/不知实际存档路径的中转端已经发布过该文件。
+        var previous = new EnvironmentSnapshotStore(source, repository, List.of()).buildSnapshot();
+        var upgraded = new EnvironmentSnapshotStore(source, repository,
+                EnvironmentPathPolicy.worldMetadataExclusions("saves/custom-world"));
+        assertTrue(upgraded.loadSnapshots().isEmpty(), "不能按旧snapshotId绕过当前排除规则");
+        assertThrows(java.io.IOException.class, () -> upgraded.readAllBytes(previous, oldPath));
+        assertTrue(upgraded.buildSnapshot().manifest().files().isEmpty());
+    }
+
+    @Test
     void publishedSnapshotKeepsBytesAfterLiveFileChanges() throws Exception {
         Path sourceRoot = tempDir.resolve("source");
         Path repositoryRoot = tempDir.resolve("repository");
-        Path levelDat = sourceRoot.resolve("world/level.dat");
+        Path levelDat = sourceRoot.resolve("world/serverconfig/settings.json");
         Files.createDirectories(levelDat.getParent());
         Files.writeString(levelDat, "old", StandardCharsets.UTF_8);
 
@@ -31,7 +49,7 @@ class EnvironmentSnapshotStoreTest {
         Files.writeString(levelDat, "new-content", StandardCharsets.UTF_8);
 
         assertEquals("old", new String(
-                store.readAllBytes(snapshot, "world/level.dat"), StandardCharsets.UTF_8));
+                store.readAllBytes(snapshot, "world/serverconfig/settings.json"), StandardCharsets.UTF_8));
     }
 
     @Test

@@ -171,7 +171,7 @@ public final class MergeClient {
             WorkerProcess.runPresync(channel, merge.id.toString(), true,
                     phase -> progress(conn, merge, phase, true));
             if (merge.aborted.get()) return;
-            // 接收器已读完 TAIL_DONE，同一流随后只交给游戏隧道准备协议。
+            // 接收器已读完区块尾部及双向元数据版本屏障，同一流随后只交给游戏隧道准备协议。
             PreparedTunnel tunnel = PreparedTunnel.prepare(channel, merge.id.toString());
             synchronized (MergeClient.class) {
                 if (merge.aborted.get() || active != merge) {
@@ -337,6 +337,12 @@ public final class MergeClient {
         report.addProperty("mergeId", merge.id.toString());
         report.addProperty("phase", phase);
         report.addProperty("success", success);
+        // 这些值来自计算进程实际应用并获得中心ACK的RPC结果；环境缓存版本或本地下载
+        // 完成不构成迁移屏障。版本仅证明元数据，区块/玩家尾部仍由既有预同步屏障负责。
+        if (merge.yielding || merge.receiving) {
+            report.addProperty("metadataVersion", WorkerProcess.metadataVersion());
+            report.addProperty("metadataTerm", WorkerProcess.metadataTerm());
+        }
         conn.send(ControlMessage.of(MessageType.MERGE_PROGRESS, report));
     }
 }

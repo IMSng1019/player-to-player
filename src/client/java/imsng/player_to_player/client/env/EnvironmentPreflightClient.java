@@ -219,7 +219,7 @@ public final class EnvironmentPreflightClient {
             context.paths().ensureWorldDirs(worldFolder);
             Path primary = context.paths().environmentDir(worldFolder, ClientRole.PRIMARY);
             Path secondary = context.paths().environmentDir(worldFolder, ClientRole.SECONDARY);
-            EnvSyncClient.PairResult pair = new EnvSyncClient(connection, context.config())
+            EnvSyncClient.PairResult pair = new EnvSyncClient(connection, context.config(), info.worldPath())
                     .syncPair(primary, secondary, info.snapshotId(),
                             () -> STATE.current(active.epoch) && request == active).join();
             if (!STATE.current(active.epoch)) return;

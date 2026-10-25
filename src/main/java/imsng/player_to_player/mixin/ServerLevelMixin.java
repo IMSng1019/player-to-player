@@ -134,13 +134,17 @@ public abstract class ServerLevelMixin {
         // Phase 3 合并"原子切换"：让出方 A 的集成服务端在发送尾部增量期间冻结
         // 世界演算（GroupRuntime.setTickFrozen）。挂起手法与服务端 suspendWorldTick
         // 完全一致 —— 保留区块服务与实体装载，玩家画面不断连，只是世界静止。
-        if (ctx.isClient() && GroupRuntime.isTickFrozen() && GroupRuntime.isManagedLevel(self)) {
+        if (ctx.isClient() && GroupRuntime.isManagedLevel(self)
+                && (GroupRuntime.isTickFrozen()
+                    || !imsng.player_to_player.metadata.MetadataClient.isSimulationReady()
+                    || GroupRuntime.conn() == null || !GroupRuntime.conn().isOpen())) {
             self.getChunkSource().tick(hasTimeLeft, false);
             this.entityManager.tick();
             ci.cancel();
             return;
         }
-        if (ctx.isServer() && config.suspendWorldTick) {
+        if (ctx.isServer() && (config.suspendWorldTick
+                || imsng.player_to_player.metadata.MetadataService.isAuthorityActive(self.getServer()))) {
             if (!player_to_player$suspendLogged) {
                 player_to_player$suspendLogged = true;
                 player_to_player$LOGGER.info(

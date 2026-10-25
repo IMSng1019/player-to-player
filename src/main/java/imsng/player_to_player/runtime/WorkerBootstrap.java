@@ -4,6 +4,7 @@ import com.google.gson.JsonObject;
 import imsng.player_to_player.config.*;
 import imsng.player_to_player.core.*;
 import imsng.player_to_player.group.*;
+import imsng.player_to_player.metadata.*;
 import imsng.player_to_player.netproto.*;
 import imsng.player_to_player.util.JsonUtil;
 import imsng.player_to_player.util.ThreadPools;
@@ -32,6 +33,9 @@ public final class WorkerBootstrap {
     private static volatile WorkerStream presyncStream;
     private static volatile String presyncId;
     private static volatile boolean stopping;
+    private static volatile boolean retired;
+    private static CompletableFuture<ControlMessage> stopFuture;
+    private static volatile boolean remoteConnected = true;
     private static Path bundlePath;
     private static final CountDownLatch RELEASE = new CountDownLatch(1);
     private WorkerBootstrap() { }
@@ -59,11 +63,19 @@ public final class WorkerBootstrap {
             context.setGroupId(UUID.fromString(spec.get("groupId").getAsString()));
             context.setPlayerName(spec.get("playerName").getAsString());
             context.setClientRole(ClientRole.PRIMARY);
+            MetadataClient.initialize(MetadataWire.snapshotFromTag(MetadataWire.decode(
+                    Base64.getDecoder().decode(spec.get("metadataSnapshot").getAsString()))));
             rpc = new WorkerRpc(WorkerBootstrap::handle, (connection, message) -> { });
+            MetadataClient.setRestartListener(fields -> {
+                JsonObject reason = new JsonObject();
+                reason.addProperty("fields", String.join(", ", fields));
+                rpc.emit("metadata_restart_required", reason, null);
+            });
             client = new ControlClient("127.0.0.1", spec.get("ipcPort").getAsInt());
             rpc.register(client);
             client.onDisconnect(connection -> {
                 rpc.disconnected();
+                MetadataClient.disconnected();
                 // 父进程死亡时先冻结唯一写者，不允许失联后继续生成/演算；再走原版保存停止。
                 GroupRuntime.setTickFrozen(true);
                 MinecraftServer server = GroupRuntime.server();
@@ -86,6 +98,8 @@ public final class WorkerBootstrap {
             ChatRelay.register(registry);
             PearlHandoff.register(registry);
             LocalPermissions.register(registry);
+            MetadataClient.register(registry);
+            MetadataEvents.install(registry);
             // Loader已解析全部模组容器；在arm之前核对真正加载的服务端模组，失败不得
             // 启动任何组世界tick。目录哈希与运行容器校验是两个不同的完成条件。
             var manifest = imsng.player_to_player.env.EnvironmentManifest.fromJson(spec.getAsJsonObject("primaryManifest"));
@@ -162,14 +176,22 @@ public final class WorkerBootstrap {
                 }
                 case "exit_adopt" -> GroupRuntime.adoptExitManifest(ExitManifest.fromJson(message.json()));
                 case "stop" -> {
-                    MinecraftServer server = GroupRuntime.server();
-                    if (server == null) throw new IllegalStateException("计算世界尚未启动");
-                    stopping = true;
-                    // halt(false)只请求停止，真正的save/最终bundle仍由原版生命周期完成。
-                    server.halt(false);
+                    return stopWithMetadata();
                 }
                 case "freeze" -> GroupRuntime.setTickFrozen(message.json().get("frozen").getAsBoolean());
-                case "retire" -> GroupRuntime.retireAfterTransfer(UUID.fromString(message.json().get("groupId").getAsString()));
+                case "metadata_disconnect" -> { remoteConnected = false; MetadataClient.disconnected(); }
+                case "metadata_sync" -> {
+                    remoteConnected = true;
+                    return MetadataClient.synchronize(GroupRuntime.server(), new RemoteControl()).thenApply(snapshot -> {
+                        JsonObject result = new JsonObject(); result.addProperty("worldId", snapshot.worldId());
+                        result.addProperty("version", snapshot.version()); result.addProperty("term", snapshot.term());
+                        return ControlMessage.of(MessageType.WORKER_EVENT, result);
+                    });
+                }
+                case "retire" -> {
+                    GroupRuntime.retireAfterTransfer(UUID.fromString(message.json().get("groupId").getAsString()));
+                    retired = true; // 已完成双向字段屏障并提交所有权，停服不能再以旧写者提交。
+                }
                 case "wake" -> { if (GroupRuntime.claims() != null) GroupRuntime.claims().wakeBlockedClaims(UUID.fromString(message.json().get("groupId").getAsString())); }
                 case "split_cancel" -> SplitMonitor.requestCancel(UUID.fromString(message.json().get("splitId").getAsString()));
                 case "presync_cancel" -> cancelPresync();
@@ -179,6 +201,24 @@ public final class WorkerBootstrap {
             }
             return CompletableFuture.completedFuture(WorkerRpc.ok());
         } catch (Throwable error) { return CompletableFuture.failedFuture(error); }
+    }
+
+    /** 正常退出先冻结并确认模拟字段尾部；失败保留进程及冻结，交给已有耐久退出流程重试。 */
+    private static synchronized CompletionStage<ControlMessage> stopWithMetadata() {
+        MinecraftServer server = GroupRuntime.server();
+        if (server == null) return CompletableFuture.failedFuture(new IllegalStateException("计算世界尚未启动"));
+        if (stopFuture != null && !stopFuture.isCompletedExceptionally()) return stopFuture;
+        stopping = true;
+        GroupRuntime.setTickFrozen(true);
+        CompletableFuture<?> flush = retired ? CompletableFuture.completedFuture(null)
+                : MetadataEvents.flushTransferState(server);
+        stopFuture = flush.thenApply(ignored -> {
+            // halt(false)只请求停止，真正的save/最终bundle仍由原版生命周期完成。
+            server.halt(false);
+            return WorkerRpc.ok();
+        });
+        stopFuture.whenComplete((ignored, failure) -> { if (failure != null) stopping = false; });
+        return stopFuture;
     }
 
     private static synchronized CompletionStage<ControlMessage> startPresync(ControlMessage message, boolean sending) {
@@ -191,7 +231,13 @@ public final class WorkerBootstrap {
         CompletableFuture<ControlMessage> future = new CompletableFuture<>();
         ThreadPools.startBlocking("worker-presync", () -> {
             try {
+                // level.dat ACK 不能证明实体/内存状态可迁移。原版龙复活中间态等不能由现有
+                // 快照链承接时，在冻结和传输之前拒绝本次交接，让原组保持运行。
+                CompletableFuture.runAsync(() -> MetadataRuntime.assertTransferSafe(server),
+                        GroupControlTasks.executor(server)).get();
                 java.util.function.Consumer<String> progress = phase -> {
+                    // 旧区块协议的终结标记只说明区块尾部到达，不能提前穿过新增字段屏障。
+                    if ("caught_up".equals(phase) || "switched".equals(phase)) return;
                     JsonObject event = new JsonObject(); event.addProperty("streamId", id); event.addProperty("phase", phase);
                     rpc.emit("presync_progress", event, null);
                 };
@@ -200,7 +246,40 @@ public final class WorkerBootstrap {
                     receiver = new PresyncReceiver(stream, server.getWorldPath(LevelResource.PLAYER_DATA_DIR), id, progress);
                     receiver.run();
                 }
-                future.complete(WorkerRpc.ok());
+                // 快照生成期间还可能进入不可迁移状态；源端此时已冻结，最终再检查一次。
+                CompletableFuture.runAsync(() -> MetadataRuntime.assertTransferSafe(server),
+                        GroupControlTasks.executor(server)).get();
+                java.io.DataInputStream input = new java.io.DataInputStream(stream.inputStream());
+                java.io.DataOutputStream output = new java.io.DataOutputStream(stream.outputStream());
+                MetadataSnapshot applied;
+                if (sending) {
+                    MetadataSnapshot durable = MetadataEvents.flushTransferState(server).get(30, TimeUnit.SECONDS);
+                    applied = MetadataClient.synchronize(server, new RemoteControl()).get(30, TimeUnit.SECONDS);
+                    if (!MetadataTransferFence.of(durable).coveredBy(applied))
+                        throw new IOException("源端未确认已耐久提交的模拟字段尾部");
+                    MetadataTransferFence fence = MetadataTransferFence.of(applied);
+                    fence.write(output, false);
+                    MetadataTransferFence acknowledgement = MetadataTransferFence.read(input, true);
+                    if (!fence.worldId().equals(acknowledgement.worldId()) || fence.term() != acknowledgement.term()
+                            || acknowledgement.version() < fence.version())
+                        throw new IOException("接收端没有确认本次模拟字段尾部版本");
+                } else {
+                    MetadataTransferFence required = MetadataTransferFence.read(input, false);
+                    applied = MetadataClient.synchronize(server, new RemoteControl()).get(30, TimeUnit.SECONDS);
+                    if (!required.coveredBy(applied)) throw new IOException("接收端元数据未达到源端冻结尾部屏障");
+                    CompletableFuture.runAsync(() -> MetadataRuntime.assertTransferSafe(server),
+                            GroupControlTasks.executor(server)).get();
+                    MetadataTransferFence.of(applied).write(output, true);
+                }
+                JsonObject confirmed = new JsonObject();
+                confirmed.addProperty("worldId", applied.worldId());
+                confirmed.addProperty("metadataVersion", applied.version());
+                confirmed.addProperty("metadataTerm", applied.term());
+                // 父进程先安装这个证据再上报终结阶段，不能复用启动时的旧 metadataVersion。
+                JsonObject terminal = confirmed.deepCopy();
+                terminal.addProperty("streamId", id); terminal.addProperty("phase", "caught_up");
+                rpc.emit("presync_progress", terminal, null);
+                future.complete(ControlMessage.of(MessageType.WORKER_EVENT, confirmed));
             } catch (Throwable error) { future.completeExceptionally(error); }
             finally { synchronized (WorkerBootstrap.class) { if (presyncStream == stream) { presyncStream = null; presyncId = null; receiver = null; } } }
         });
@@ -223,7 +302,7 @@ public final class WorkerBootstrap {
         @Override public SocketAddress remoteAddress() { return rpc.connection() == null ? null : rpc.connection().remoteAddress(); }
         @Override public UUID peerId() { return NodeContext.get().clientId(); }
         @Override public void setPeerId(UUID peer) { throw new UnsupportedOperationException(); }
-        @Override public boolean isOpen() { return rpc.connection() != null && rpc.connection().isOpen(); }
+        @Override public boolean isOpen() { return remoteConnected && rpc.connection() != null && rpc.connection().isOpen(); }
         @Override public void close() { if (rpc.connection() != null) rpc.connection().close(); }
     }
 }
