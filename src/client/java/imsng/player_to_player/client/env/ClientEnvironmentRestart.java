@@ -1,6 +1,7 @@
 package imsng.player_to_player.client.env;
 
 import imsng.player_to_player.core.NodeContext;
+import imsng.player_to_player.env.ClientLocalSettings;
 import imsng.player_to_player.env.restart.RestartCoordinator;
 import imsng.player_to_player.env.restart.RestartHelperProcess;
 import imsng.player_to_player.env.restart.RestartTask;
@@ -67,6 +68,13 @@ final class ClientEnvironmentRestart {
                 LOGGER.warn("无法读取或确认本机重启状态；不会据此再次自动启动游戏");
             }
         }));
+        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
+            // 退出阶段同步保存少量本机选项，不能投递到即将关闭的后台线程池。
+            // 先让原版写出内存中的最终选项，再归档到该服务器的稳定个人设置目录。
+            client.options.save();
+            try { ClientLocalSettings.saveCurrent(FabricLoader.getInstance().getGameDir()); }
+            catch (IOException failure) { LOGGER.warn("保存服务器专属客户端设置失败，当前游戏目录中的设置仍保留", failure); }
+        });
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (recoveryShown || recovery == null || !(client.screen instanceof TitleScreen)
                     || client.getOverlay() != null) return;
@@ -116,6 +124,7 @@ final class ClientEnvironmentRestart {
         // 当前身份只在内存中捕获，辅助进程管道关闭后不再保留命令副本。
         final List<String> command;
         try {
+            client.options.save();
             command = installation.commandForRestart();
             if (command.isEmpty()) throw new IOException("无法重建启动方式");
         } catch (Exception failure) {
@@ -125,6 +134,8 @@ final class ClientEnvironmentRestart {
         ThreadPools.startBlocking("restart-prepare", () -> {
             try {
                 if (attempt.cancelled) return;
+                // 文件复制留在后台；失败时不提交重启，避免用默认音量/语言启动新进程。
+                installation.prepareLocalSettings();
                 RestartTask task = store.create(intent.chainId(), intent.address(), installation.runtimeHash(), installation.directory());
                 attempt.helper = RestartHelperProcess.prepare(store, task, command);
                 if (attempt.cancelled) { attempt.helper.abort(); return; }

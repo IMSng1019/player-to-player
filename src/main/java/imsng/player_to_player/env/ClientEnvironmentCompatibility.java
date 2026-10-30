@@ -16,6 +16,10 @@ import java.util.zip.ZipFile;
 
 /** 用 Fabric 实际加载容器的来源哈希检查运行状态，绝不把“JAR 已下载”当作“已加载”。 */
 public final class ClientEnvironmentCompatibility {
+    // 这三个 ID 属于 Fabric 启动平台。尤其 fabricloader 的元数据类型仍是 fabric，
+    // 来源是启动器类路径中的顶层 JAR，不能误判成需要在服务器 mods 中分发的额外模组。
+    // 这里只豁免“清单未要求却已加载”的检查；清单显式声明同 ID 时仍验证版本及真实字节。
+    private static final Set<String> LAUNCH_PLATFORM_IDS = Set.of("fabricloader", "minecraft", "java");
     public record LoadedMod(String id, String version, String environment, String sha256,
                             boolean nested, boolean developmentOnly) {
         public LoadedMod(String id, String version, String environment, String sha256) {
@@ -52,7 +56,8 @@ public final class ClientEnvironmentCompatibility {
                 problems.add("已加载版本/内容不同: " + metadata.id());
         }
         for (LoadedMod active : loaded.values()) {
-            if (!required.contains(active.id()) && !active.nested() && !active.developmentOnly()
+            if (!required.contains(active.id()) && !LAUNCH_PLATFORM_IDS.contains(active.id())
+                    && !active.nested() && !active.developmentOnly()
                     && (!targetEnvironment.equals("client") || !active.environment().equals("client")))
                 problems.add("当前进程额外加载了通用模组: " + active.id());
         }

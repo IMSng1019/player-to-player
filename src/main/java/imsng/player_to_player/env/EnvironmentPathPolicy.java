@@ -88,6 +88,8 @@ public final class EnvironmentPathPolicy {
         if (lower.isEmpty() || lower.endsWith(".tmp") || lower.endsWith(".p2p-tmp")) {
             return false;
         }
+        // 音量、语言和按键属于每位玩家自己的设置，不能被打包下发或推动环境版本。
+        if (ClientLocalSettings.isLocalPath(lower)) return false;
         for (String exclusion : exclusions) {
             if (lower.equals(exclusion) || lower.startsWith(exclusion + "/")) {
                 return false;

@@ -29,6 +29,9 @@ public final class ClientRuntimeStartup implements PreLaunchEntrypoint {
 
         public boolean matches(EnvironmentManifest expected, String worldPath) {
             for (var file : expected.files().entrySet()) {
+                // 旧服务端清单可能仍携带 options.txt；语言、音量等属于本机玩家，
+                // 不得因恢复个人偏好而否认已经加载的玩法环境并再次重启。
+                if (ClientLocalSettings.isLocalPath(file.getKey())) continue;
                 if (file.getKey().startsWith(EnvironmentRuntimeIdentity.normalizeWorldPath(worldPath) + "/")) continue;
                 if (!file.getValue().equals(files.get(file.getKey()))) return false;
             }
@@ -66,6 +69,8 @@ public final class ClientRuntimeStartup implements PreLaunchEntrypoint {
         Path root = gameDir.toAbsolutePath().normalize();
         Map<String, EnvironmentManifest.Entry> files = new TreeMap<>();
         for (String relative : installed.files().keySet()) {
+            // 本机选项不属于启动证据；即使旧安装记录包含它，也不读取或哈希此文件。
+            if (ClientLocalSettings.isLocalPath(relative)) continue;
             Path path = root.resolve(relative).normalize();
             if (!path.startsWith(root) || !Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) continue;
             // 拒绝由父目录软链接指向实例外的文件，不能拿外部配置冒充独立安装。

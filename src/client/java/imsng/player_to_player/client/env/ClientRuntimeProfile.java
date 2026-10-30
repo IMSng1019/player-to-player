@@ -3,6 +3,7 @@ package imsng.player_to_player.client.env;
 import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.env.ClientEnvironmentCompatibility;
 import imsng.player_to_player.env.ClientLaunchArguments;
+import imsng.player_to_player.env.ClientLocalSettings;
 import imsng.player_to_player.env.ClientRuntimeStartup;
 import imsng.player_to_player.env.EnvironmentManifest;
 import imsng.player_to_player.env.EnvironmentPreflightInfo;
@@ -32,10 +33,15 @@ public final class ClientRuntimeProfile {
     public static final String RUNTIME_PROPERTY = "player_to_player.clientRuntime";
     public record Loaded(Map<String, ClientEnvironmentCompatibility.LoadedMod> mods,
                          Map<String, Path> clientOnlyJars) { }
-    public record Installation(Path directory, String runtimeHash, String serverAddress,
+    public record Installation(Path directory, Path worldFolder, String runtimeHash, String serverAddress,
                                boolean canLaunch, String limitation) {
         public List<String> commandForRestart() {
             return canLaunch ? launchCommand(directory, runtimeHash, serverAddress) : List.of();
+        }
+
+        /** 手动重试可能晚于安装，启动前再次取当前已保存的个人设置，避免使用旧副本。 */
+        public void prepareLocalSettings() throws IOException {
+            ClientLocalSettings.prepare(worldFolder, FabricLoader.getInstance().getGameDir(), directory);
         }
     }
     private ClientRuntimeProfile() { }
@@ -46,8 +52,9 @@ public final class ClientRuntimeProfile {
         return new Loaded(captured.mods(), captured.clientOnlyJars());
     }
 
-    public static boolean wasLaunchedFor(String runtimeHash) {
-        return runtimeHash.equals(System.getProperty(RUNTIME_PROPERTY, ""));
+    public static boolean wasLaunchedFor(String runtimeHash, Path worldFolder) throws IOException {
+        return runtimeHash.equals(System.getProperty(RUNTIME_PROPERTY, ""))
+                && ClientLocalSettings.belongsToWorld(worldFolder, FabricLoader.getInstance().getGameDir());
     }
 
     /** 每次安装创建新目录，避免覆盖当前运行的某个旧版本实例。 */
@@ -89,6 +96,9 @@ public final class ClientRuntimeProfile {
         startupRecord.add("manifest", new EnvironmentManifest(installedFiles).toJson());
         imsng.player_to_player.util.JsonUtil.writeFileAtomic(
                 directory.getParent().resolve(ClientRuntimeStartup.MANIFEST_FILE), startupRecord);
+        // options.txt 含语言、音量、键位和无障碍首次引导状态。独立 gameDir 也必须继承
+        // 玩家选项；这些文件只从本机个人存档读取，绝不由服务器的环境清单覆盖。
+        ClientLocalSettings.prepare(worldFolder, FabricLoader.getInstance().getGameDir(), directory);
         boolean canLaunch = supportsLaunch();
         String limitation = !canLaunch
                 ? "当前启动方式无法安全自动重启。请在启动器中复制当前 Fabric 1.20.4 配置，将游戏目录设为下方已安装目录，然后启动并连接原服务器。"
@@ -102,7 +112,7 @@ public final class ClientRuntimeProfile {
                         + "\n-Dfabric.modsFolder=" + directory.resolve("mods")
                         + "\n同时移除原配置中的 fabric.addMods 参数，避免混入旧模组。\n",
                 StandardCharsets.UTF_8);
-        return new Installation(directory, info.runtimeHash(), serverAddress, canLaunch, limitation);
+        return new Installation(directory, worldFolder, info.runtimeHash(), serverAddress, canLaunch, limitation);
     }
 
     /** 特殊包装启动器可能依赖额外引导状态；无法证明可还原时保留明确的手动路径。 */

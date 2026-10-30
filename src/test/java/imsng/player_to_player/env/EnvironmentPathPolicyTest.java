@@ -10,6 +10,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class EnvironmentPathPolicyTest {
 
     @Test
+    void personalClientOptionsNeverBelongToTheSharedEnvironment() {
+        EnvironmentPathPolicy policy = EnvironmentPathPolicy.create(List.of());
+
+        assertFalse(policy.includes("options.txt"));
+        assertFalse(policy.includes("./OPTIONSOF.TXT"));
+        assertFalse(policy.includes("optionsshaders.txt"));
+        // 同名模组配置不属于根目录的个人选项，仍须服从服务端环境。
+        assertTrue(policy.includes("config/options.txt"));
+        assertTrue(policy.includes("config/rules.json"));
+    }
+
+    @Test
     void excludesRegenerableFabricCachesButKeepsServerRuntimeDependencies() {
         EnvironmentPathPolicy policy = EnvironmentPathPolicy.create(List.of());
         assertFalse(policy.includes(".fabric/processedMods/nested.jar"));

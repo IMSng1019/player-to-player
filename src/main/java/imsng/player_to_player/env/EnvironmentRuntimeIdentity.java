@@ -6,7 +6,8 @@ import java.util.TreeMap;
 /**
  * 静态运行环境版本。世界保存会不断改变 level.dat、玩家文件和模组自己的存档，
  * 这些变化不能使下载完成的玩家在登录阶段无限重连。世界目录中仅数据包及
- * serverconfig 属于启动环境，其余内容由世界数据面负责；目录外文件仍全部计入。
+ * serverconfig 属于启动环境，其余内容由世界数据面负责；目录外的个人客户端选项
+ * 只在本机保存，不能因为玩家修改音量、语言或键位而更换服务器运行版本。
  */
 public final class EnvironmentRuntimeIdentity {
     private EnvironmentRuntimeIdentity() { }
@@ -26,6 +27,7 @@ public final class EnvironmentRuntimeIdentity {
     }
 
     public static boolean isRuntimePath(String path, String worldPath) {
+        if (ClientLocalSettings.isLocalPath(path)) return false;
         // 与EnvironmentPathPolicy保持同一大小写口径。Windows上的Foo与foo指向同一
         // 存档；若只做大小写敏感比较，上传者可把元数据伪装成世界目录外的普通配置。
         String prefix = normalizeWorldPath(worldPath).toLowerCase(java.util.Locale.ROOT) + "/";

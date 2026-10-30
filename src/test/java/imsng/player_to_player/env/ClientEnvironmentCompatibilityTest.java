@@ -68,6 +68,36 @@ class ClientEnvironmentCompatibilityTest {
         assertTrue(ClientEnvironmentCompatibility.check(root, manifest, Map.of("serverlogic", loaded), "server").isEmpty());
     }
 
+    @Test void launchPlatformDoesNotRequireInstallingTheLoaderAsAServerMod() throws Exception {
+        Path jar = mod("game.jar", "game", "*", "1");
+        var manifest = new EnvironmentManifest(Map.of("mods/game.jar",
+                new EnvironmentManifest.Entry(Sha256.hexOfFile(jar), Files.size(jar))));
+        var loaded = Map.of(
+                "game", new ClientEnvironmentCompatibility.LoadedMod("game", "1", "*", Sha256.hexOfFile(jar)),
+                "fabricloader", new ClientEnvironmentCompatibility.LoadedMod("fabricloader", "0.19.3", "*", "a".repeat(64)),
+                "minecraft", new ClientEnvironmentCompatibility.LoadedMod("minecraft", "1.20.4", "*", "b".repeat(64)),
+                "java", new ClientEnvironmentCompatibility.LoadedMod("java", "17", "*", ""));
+        // Fabric Loader 自身也是 type=fabric 的顶层容器；客户端与 worker 都不应因此重装。
+        for (String target : List.of("client", "server")) {
+            assertTrue(ClientEnvironmentCompatibility.check(root, manifest, loaded, target).isEmpty());
+            var extra = new java.util.HashMap<>(loaded);
+            extra.put("game_extra", new ClientEnvironmentCompatibility.LoadedMod("game_extra", "1", "*", "c".repeat(64)));
+            assertEquals(List.of("当前进程额外加载了通用模组: game_extra"),
+                    ClientEnvironmentCompatibility.check(root, manifest, extra, target));
+        }
+    }
+
+    @Test void explicitlyDistributedPlatformIdsStillRequireTheActualJarBytes() throws Exception {
+        for (String id : List.of("fabricloader", "minecraft", "java")) {
+            Path jar = mod(id + ".jar", id, "*", "1");
+            var manifest = new EnvironmentManifest(Map.of("mods/" + id + ".jar",
+                    new EnvironmentManifest.Entry(Sha256.hexOfFile(jar), Files.size(jar))));
+            var different = new ClientEnvironmentCompatibility.LoadedMod(id, "1", "*", "a".repeat(64));
+            assertEquals(List.of("已加载版本/内容不同: " + id),
+                    ClientEnvironmentCompatibility.check(root, manifest, Map.of(id, different)));
+        }
+    }
+
     private Path mod(String name, String id, String environment, String version) throws Exception {
         Path jar = root.resolve("mods").resolve(name);
         Files.createDirectories(jar.getParent());

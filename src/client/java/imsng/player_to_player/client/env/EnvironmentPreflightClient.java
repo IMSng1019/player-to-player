@@ -174,6 +174,8 @@ public final class EnvironmentPreflightClient {
         connection.handleDisconnection();
         EnvironmentPreflightScreen screen = new EnvironmentPreflightScreen(() -> cancel(client, active));
         client.setScreen(screen);
+        // 进入后台安装前由渲染线程保存最新选项，首次隔离启动即可继承玩家当前音量等设置。
+        client.options.save();
         ThreadPools.startBlocking("environment-preflight", () -> synchronize(client, screen, active, info, host));
     }
 
@@ -225,9 +227,13 @@ public final class EnvironmentPreflightClient {
             if (!STATE.current(active.epoch)) return;
             ClientRuntimeProfile.Loaded current = loaded.get(60, TimeUnit.SECONDS);
             List<String> mismatches = ClientEnvironmentCompatibility.check(secondary, pair.secondaryManifest(), current.mods());
-            if (!ClientRuntimeProfile.wasLaunchedFor(info.runtimeHash())
-                    || !ClientRuntimeStartup.matches(info.runtimeHash(), pair.secondaryManifest(), info.worldPath())
-                    || !mismatches.isEmpty()) {
+            boolean launchedForRuntime = ClientRuntimeProfile.wasLaunchedFor(info.runtimeHash(), worldFolder);
+            boolean startupMatches = ClientRuntimeStartup.matches(info.runtimeHash(), pair.secondaryManifest(), info.worldPath());
+            if (!launchedForRuntime || !startupMatches || !mismatches.isEmpty()) {
+                // 只记录校验结论与模组ID，不打印启动参数/身份令牌。区分首次隔离启动和真正
+                // 的文件/模组差异，避免日志中只剩“下载成功→退出”却无法确定为何再次重启。
+                LOGGER.info("客户端需要环境重启：运行版本及服务器目录匹配={}，启动文件匹配={}，模组差异={}",
+                        launchedForRuntime, startupMatches, mismatches);
                 client.execute(() -> { if (STATE.current(active.epoch)) screen.status("正在安装独立的客户端游戏环境…"); });
                 ClientRuntimeProfile.Installation installation = ClientRuntimeProfile.install(
                         worldFolder, secondary, pair.secondaryManifest(), info, current, active.key);

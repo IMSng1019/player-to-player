@@ -8,6 +8,15 @@ class EnvironmentRuntimeIdentityTest {
     private static final EnvironmentManifest.Entry A = new EnvironmentManifest.Entry("a".repeat(64), 1);
     private static final EnvironmentManifest.Entry B = new EnvironmentManifest.Entry("b".repeat(64), 2);
 
+    @Test void personalOptionsDoNotChangeTheServerRuntimeVersion() {
+        var baseline = new EnvironmentManifest(Map.of("config/game.json", A));
+        var withOptions = new EnvironmentManifest(Map.of("config/game.json", A,
+                "options.txt", B, "OPTIONSOF.TXT", A, "optionsshaders.txt", B));
+        assertEquals(EnvironmentRuntimeIdentity.hash(baseline, "world"),
+                EnvironmentRuntimeIdentity.hash(withOptions, "world"));
+        assertTrue(EnvironmentRuntimeIdentity.isRuntimePath("config/options.txt", "world"));
+    }
+
     @Test void worldSavesDoNotInvalidateLoginButDatapacksDo() {
         var before = new EnvironmentManifest(Map.of("saves/actual/level.dat", A,
                 "saves/actual/playerdata/a.dat", A, "saves/actual/datapacks/rules.zip", A,
