@@ -23,8 +23,9 @@ import java.util.jar.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * 显式开启的真实独立Fabric服务端冒烟验收。无需图形客户端或公网中心服，使用本次构建
- * 导出的开发启动描述；固定检查server-only模组真实加载、同步配置真实读取和零出生点申请。
+ * 显式开启的真实独立Fabric服务端冒烟验收。无需图形客户端或公网中心服，可使用本次
+ * 构建的开发描述，或只读现场环境的启动依赖与正式 remap JAR。两个模式均检查
+ * server-only模组真实加载、同步配置真实读取、零出生点申请、身份桥接与持久化退出。
  */
 @EnabledIfSystemProperty(named = "p2p.worker.smoke", matches = "true")
 class WorkerProcessSmokeTest {
@@ -65,6 +66,7 @@ class WorkerProcessSmokeTest {
         Path environment = temporary.resolve("environment");
         Files.createDirectories(environment.resolve("mods"));
         Files.createDirectories(environment.resolve("config"));
+        prepareProductionEnvironment(environment);
         Files.writeString(environment.resolve("config/worker-fixture.txt"), "authority-config-17", StandardCharsets.UTF_8);
         createServerOnlyFixture(environment.resolve("mods/worker-fixture.jar"));
         Path folder = temporary.resolve("world-session");
@@ -168,6 +170,50 @@ class WorkerProcessSmokeTest {
         assertFalse(WorkerProcess.isRunning(), "子服停止后父进程必须归还IPC和当前实例");
     }
 
+    /**
+     * 正式冒烟不复用用户存档或运行目录：只读启动 JAR、游戏/Loader 依赖与 Fabric API。
+     * 根目录的诊断工具、启动脚本、账号和配置均不复制；模组始终使用本次构建产物。
+     * 临时副本后续仍经过 RuntimeInstallation、环境证明与真实 WorkerProcess 启动链。
+     */
+    private static void prepareProductionEnvironment(Path environment) throws Exception {
+        String sourceProperty = System.getProperty("p2p.worker.productionEnvironment", "");
+        if (sourceProperty.isBlank()) return;
+        assertTrue(System.getProperty("p2p.worker.developmentSpec", "").isBlank(),
+                "正式冒烟不能借助 Loom 开发入口绕过发行启动器");
+        Path source = Path.of(sourceProperty).toAbsolutePath().normalize();
+        assertTrue(Files.isDirectory(source, LinkOption.NOFOLLOW_LINKS), "正式环境源必须是本机普通目录");
+        // 直接调用生产选择逻辑；保留现场原始文件名，使版本化/重命名入口得到真实验证。
+        List<String> command = RuntimeLaunchCommand.build(Path.of("java"), source,
+                environment.resolve("unused-saves"), "world", environment.resolve("unused-session.json"));
+        Path launcher = Path.of(command.get(command.indexOf("-jar") + 1));
+        Files.copy(launcher, environment.resolve(launcher.getFileName()));
+        for (String directory : List.of("libraries", ".fabric/server", "versions")) {
+            Path dependencies = source.resolve(directory);
+            if (!Files.isDirectory(dependencies, LinkOption.NOFOLLOW_LINKS)) continue;
+            try (var files = Files.walk(dependencies)) {
+                for (Path file : files.filter(path -> Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)
+                        && path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar")).toList()) {
+                    Path target = environment.resolve(source.relativize(file));
+                    Files.createDirectories(target.getParent());
+                    Files.copy(file, target);
+                }
+            }
+        }
+        boolean copiedApi = false;
+        try (var mods = Files.list(source.resolve("mods"))) {
+            for (Path mod : mods.filter(path -> Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)
+                    && path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar")).toList()) {
+                if (!imsng.player_to_player.env.ClientEnvironmentCompatibility.metadata(mod).id().equals("fabric-api")) continue;
+                Files.copy(mod, environment.resolve("mods/fabric-api.jar"));
+                copiedApi = true;
+            }
+        }
+        assertTrue(copiedApi, "正式环境源需要已安装 Fabric API");
+        Path builtMod = Path.of(System.getProperty("p2p.worker.productionMod"));
+        assertTrue(Files.isRegularFile(builtMod), "正式冒烟需要本次 remap JAR");
+        Files.copy(builtMod, environment.resolve("mods/player_to_player.jar"));
+    }
+
     /** 不借用本机真实世界：fixture包含1.20.4三维度原版生成器与字段类型。 */
     private static MetadataSnapshot metadataFixture() throws Exception {
         var data = net.minecraft.nbt.TagParser.parseTag("""
@@ -184,6 +230,11 @@ class WorkerProcessSmokeTest {
                   "minecraft:the_end":{type:"minecraft:the_end",generator:{type:"minecraft:noise",settings:"minecraft:end",biome_source:{type:"minecraft:the_end"}}}
                  }}}
                 """);
+        if (!System.getProperty("p2p.worker.productionEnvironment", "").isBlank()) {
+            // fabric-gametest-api 的开发数据包不在发行版 Fabric API 中，不能让测试世界依赖它。
+            data.getCompound("DataPacks").getList("Enabled", 8)
+                    .removeIf(pack -> pack.getAsString().equals("fabric-gametest-api-v1"));
+        }
         var root = new net.minecraft.nbt.CompoundTag(); root.put("Data", data);
         return new MetadataSnapshot(imsng.player_to_player.world.WorldIdentity.ofLevelData(root).orElseThrow(), 4, 2, data);
     }

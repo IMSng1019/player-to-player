@@ -77,8 +77,24 @@ tasks.named('runClient') {
 	jvmArgs '-Dp2p.worker.developmentSpec=' + workerLaunchSpec.get().asFile.absolutePath
 }
 
-// 显式开启的真实子进程冒烟；正常单元测试不会额外启动 Minecraft。
-if (providers.gradleProperty('p2pWorkerSmoke').isPresent()) {
+// 正式环境冒烟只读取指定的安装源，测试会把启动器/依赖复制到临时目录；
+// 使用本次 remap JAR 和 Java17，避免 Loom 开发入口绕过发行启动器选择。
+def productionWorkerEnvironment = providers.gradleProperty('p2pWorkerProductionEnvironment')
+if (productionWorkerEnvironment.isPresent()) {
+	if (providers.gradleProperty('p2pMetadataSmoke').isPresent()) {
+		throw new GradleException('正式 worker 冒烟与依赖 Loom 的元数据冒烟需分开执行。')
+	}
+	tasks.named('test') {
+		dependsOn tasks.named('remapJar')
+		javaLauncher = javaToolchains.launcherFor {
+			languageVersion = JavaLanguageVersion.of(17)
+		}
+		systemProperty 'p2p.worker.smoke', 'true'
+		systemProperty 'p2p.worker.productionEnvironment', file(productionWorkerEnvironment.get()).absolutePath
+		systemProperty 'p2p.worker.productionMod', tasks.named('remapJar').get().archiveFile.get().asFile.absolutePath
+	}
+} else if (providers.gradleProperty('p2pWorkerSmoke').isPresent()) {
+	// 显式开启的 Loom 子进程冒烟；正常单元测试不会额外启动 Minecraft。
 	tasks.named('test') {
 		dependsOn tasks.named('writeWorkerLaunchSpec')
 		systemProperty 'p2p.worker.smoke', 'true'

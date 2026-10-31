@@ -47,7 +47,7 @@ Minecraft 或 Fabric Loader，仍要求基础运行时与服务端兼容。
 
 玩家电脑后台启动一个独立的 Fabric 专用服务端 JVM，使用已校验的主角色模组和配置。服务端专用模组可以按其原有物理 SERVER 环境加载。父进程继续负责游戏界面、中心控制连接和 P2P；子进程通过认证回环通道使用现有区块申请、上传、合并分离和退出持久化链路。
 
-发行环境需要环境中包含规范约定的 `fabric-server-launch.jar` 及其依赖。只直接执行本机 Java 与该启动 JAR，不执行环境附带的 bat/sh。开发环境通过 `writeWorkerLaunchSpec` 导出本机 Loom 的真实 server 启动配置，`runClient` 自动传入该描述。
+发行环境需要环境根目录包含一个可识别的 Fabric 服务端启动 JAR 及其依赖。按 JAR 清单的官方 Fabric 启动入口识别，支持 `fabric-server-launch.jar`、官方带版本号的下载包以及管理员重命名的启动包；多个候选会明确报错，不会任选旧版本，也不扫描 `.fabric/server` 缓存来猜测入口。只直接执行本机 Java 与该启动 JAR，不执行环境附带的 bat/sh。开发环境通过 `writeWorkerLaunchSpec` 导出本机 Loom 的真实 server 启动配置，`runClient` 自动传入该描述。
 
 子进程只监听回环地址，游戏连接必须先由父进程登记经过认证的玩家身份。未登记的本机直接连接也会被拒绝。父子握手绑定随机令牌与实例代次；READY 需匹配环境清单和运行版本，并验证实际加载的服务端模组。
 
