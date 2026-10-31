@@ -142,11 +142,7 @@ public final class WorldSession {
             SwitchTelemetry.begin("split", id.toString());
             // 全体离组成员都先关闭旧游戏连接（包括尚未指定的新副客户端），
             // 这样原组的 PLAYER 票据才能撤销，避免等待新主就绪的循环依赖。
-            if (client.level != null) {
-                WorldSwitcher.markSwitching();
-                client.level.disconnect();
-                client.disconnect();
-            }
+            WorldSwitcher.disconnectForSwitchNow(client);
             client.setScreen(new JoinProgressScreen());
         });
     }
@@ -250,11 +246,11 @@ public final class WorldSession {
         ThreadPools.startBlocking("join-flow", () -> openSession(myGeneration, rawAddress, playerId, playerName));
     }
 
-    /** 离开世界（客户端主线程回调）。 */
-    public static void onLeave(Minecraft client) {
+    /** 离开世界；Fabric 的 channelInactive 回调也可能直接来自 Netty 线程。 */
+    public static void onLeave(Minecraft client, net.minecraft.network.Connection connection) {
         // Phase 2 世界切换：主/副客户端从物理服务端"编排性断开"再进组世界，
-        // 与服务端的控制连接必须活到组世界的整个生命周期 —— 旗标一次性消费
-        if (WorldSwitcher.consumeSwitchFlag()) {
+        // 只豁免本次编排关闭的旧连接；消费事件不能撤销渲染线程的同步切换保护。
+        if (WorldSwitcher.consumeSwitchDisconnect(connection)) {
             LOGGER.info("世界切换中的编排性断开，P2P 会话保持");
             return;
         }
@@ -314,7 +310,7 @@ public final class WorldSession {
             CommandRelayClient.reset();
             PearlHandoff.reset();
             PortalPreloader.reset();
-            WorldSwitcher.markTunnelPort(0);
+            WorldSwitcher.reset();
             NodeContext ctx = NodeContext.get();
             ctx.setGroupId(null);
             ctx.setClientRole(ClientRole.UNASSIGNED);

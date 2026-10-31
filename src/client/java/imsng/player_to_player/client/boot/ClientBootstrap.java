@@ -120,7 +120,8 @@ public final class ClientBootstrap {
         //    保证不阻塞渲染。
         // ---------------------------------------------------------------
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> WorldSession.onJoin(client));
-        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> WorldSession.onLeave(client));
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) ->
+                WorldSession.onLeave(client, handler.getConnection()));
 
         // 组服务端由独立 worker 的 READY 发布；客户端 tick 仅更新切换界面遥测。
         ClientTickEvents.END_CLIENT_TICK.register(SwitchTelemetry::tick);

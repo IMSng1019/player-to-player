@@ -1,6 +1,7 @@
 package imsng.player_to_player.client.group;
 
 import imsng.player_to_player.client.session.SwitchTelemetry;
+import imsng.player_to_player.group.ConnectionSwitchGuard;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.ConnectScreen;
@@ -9,12 +10,12 @@ import net.minecraft.client.gui.screens.multiplayer.JoinMultiplayerScreen;
 import net.minecraft.client.gui.screens.worldselection.WorldOpenFlows;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.resolver.ServerAddress;
+import net.minecraft.network.Connection;
 import net.minecraft.world.level.storage.LevelStorageSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 世界切换协调器（Phase 2）：把玩家从物理服务端的世界"搬"进组世界。
@@ -25,10 +26,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   <li>主客户端 → 打开本地存档（集成服务端接管世界演算）；</li>
  *   <li>副客户端 → 连接 127.0.0.1 隧道口（经 P2P 进入主客户端的集成服务端）。</li>
  * </ul>
- * <b>切换旗标</b>：编排性断开同样会触发 Fabric 的 DISCONNECT 事件，
- * {@code WorldSession.onLeave} 以 {@link #consumeSwitchFlag} 识别并跳过会话拆除
- * （与服务端的控制连接必须活到组世界的整个生命周期）。旗标一次性消费，
- * 玩家之后真正退出组世界时的 DISCONNECT 走正常拆除。
+ * <b>切换保护</b>：整个同步调用旁路耐久退出拦截，旧连接的 DISCONNECT 事件
+ * 单独按连接身份消费。Netty 线程提前发出事件不会结束调用线程的保护，原版
+ * ConnectScreen 内再次 disconnect 也不会误关刚启动的计算服务端。
  * <p>
  * <b>隧道地址登记</b>：副客户端经隧道连接时也会触发 JOIN 事件，
  * {@code WorldSession.onJoin} 以 {@link #isTunnelAddress} 识别并跳过新会话建立。
@@ -40,8 +40,7 @@ public final class WorldSwitcher {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("player_to_player/switcher");
 
-    /** 切换旗标（一次性）：置位后下一次 DISCONNECT 事件不拆会话。 */
-    private static final AtomicBoolean SWITCHING = new AtomicBoolean(false);
+    private static final ConnectionSwitchGuard SWITCHING = new ConnectionSwitchGuard();
 
     /** 当前隧道监听端口；0 = 无（volatile：JOIN 事件在主线程读，加入器在 io 线程写）。 */
     private static volatile int tunnelPort;
@@ -51,23 +50,42 @@ public final class WorldSwitcher {
 
     // ------------------------------------------------------------ 旗标与登记
 
-    /** 消费切换旗标（WorldSession.onLeave 调用）：返回 true 表示这是编排性断开。 */
-    public static boolean consumeSwitchFlag() {
-        return SWITCHING.getAndSet(false);
+    /** Fabric 回调可能在 Netty 线程到达，只消费属于旧游戏连接的事件。 */
+    public static boolean consumeSwitchDisconnect(Connection connection) {
+        return SWITCHING.consumeDisconnect(connection);
     }
 
-    /** 只读查询当前断开是否属于主副切换；退出拦截器不能消费该一次性旗标。 */
+    /** 退出拦截器查询同步作用域；不能与异步断连事件共用一次性布尔值。 */
     public static boolean isSwitching() {
-        return SWITCHING.get();
+        return SWITCHING.isSwitching();
     }
 
-    /**
-     * 置位切换旗标（Phase 3 合并让出方：A 关停本地组世界降级为副客户端时，
-     * 这次 DISCONNECT 同样是编排性断开，不得拆除与物理服务端的控制连接）。
-     * 必须在触发断开<b>之前</b>调用（客户端主线程）。
-     */
-    public static void markSwitching() {
-        SWITCHING.set(true);
+    /** 会话结束时清除旧连接许可及隧道身份，不改变当前调用栈的作用域。 */
+    public static void reset() {
+        SWITCHING.clear();
+        tunnelPort = 0;
+    }
+
+    private static void runSwitch(Minecraft minecraft, Runnable transition) {
+        if (!minecraft.isSameThread()) {
+            throw new IllegalStateException("世界切换必须在客户端主线程调用");
+        }
+        var handler = minecraft.getConnection();
+        Connection oldConnection = minecraft.level != null && handler != null ? handler.getConnection() : null;
+        SWITCHING.run(oldConnection, transition);
+    }
+
+    /** 当前世界关闭与 Minecraft 清理必须在同一保护作用域内，先关连接再清理世界。 */
+    private static void disconnectCurrentWorld(Minecraft minecraft) {
+        if (minecraft.level != null) {
+            minecraft.level.disconnect();
+            minecraft.disconnect();
+        }
+    }
+
+    /** 分离等待等同步调用入口；不会留下可被下次真正退出误消费的全局旗标。 */
+    public static void disconnectForSwitchNow(Minecraft minecraft) {
+        runSwitch(minecraft, () -> disconnectCurrentWorld(minecraft));
     }
 
     /** 合并旧子服关停前先做编排性游戏断开，保证DISCONNECT不会拆除中心控制会话。 */
@@ -75,11 +93,7 @@ public final class WorldSwitcher {
         var done = new java.util.concurrent.CompletableFuture<Void>();
         minecraft.execute(() -> {
             try {
-                if (minecraft.level != null) {
-                    SWITCHING.set(true);
-                    minecraft.level.disconnect();
-                    minecraft.disconnect();
-                }
+                disconnectForSwitchNow(minecraft);
                 done.complete(null);
             } catch (Throwable error) { done.completeExceptionally(error); }
         });
@@ -122,25 +136,19 @@ public final class WorldSwitcher {
         }
         LOGGER.info("编排性断开物理服务端，打开本地组世界: {}/{}", savesRoot, saveName);
         SwitchTelemetry.mark("disconnect_begin");
-        // 旗标只在真的会触发 DISCONNECT 时置位（level 为 null 时没有断开事件，
-        // 置了也无人消费，会残留到下一次真实退出把会话拆除误吞掉）
-        if (minecraft.level != null) {
-            SWITCHING.set(true);
-            // 对齐原版退出顺序：先关闭游戏连接，再由 Minecraft 清理世界并等待本地服停止。
-            // 只调用 Minecraft.disconnect 会让旧主继续等待本地玩家心跳超时（约20秒）。
-            minecraft.level.disconnect();
-            minecraft.disconnect();
-        }
-        // 原版"选择世界界面打开存档"的同款入口（签名已 javap 核实）；
-        // 失败回调里除业务回退外把玩家送回标题屏，避免卡在空屏
-        SwitchTelemetry.mark("local_load_begin");
-        new WorldOpenFlows(minecraft, LevelStorageSource.createDefault(savesRoot))
-                .checkForBackupAndLoad(saveName, () -> {
-                    LOGGER.error("本地组世界打开失败/被取消: {}", saveName);
-                    SwitchTelemetry.finish("load_cancelled_or_failed");
-                    minecraft.setScreen(new TitleScreen());
-                    onFail.run();
-                });
+        runSwitch(minecraft, () -> {
+            disconnectCurrentWorld(minecraft);
+            // 原版"选择世界界面打开存档"的同款入口（签名已 javap 核实）；
+            // 失败回调里除业务回退外把玩家送回标题屏，避免卡在空屏。
+            SwitchTelemetry.mark("local_load_begin");
+            new WorldOpenFlows(minecraft, LevelStorageSource.createDefault(savesRoot))
+                    .checkForBackupAndLoad(saveName, () -> {
+                        LOGGER.error("本地组世界打开失败/被取消: {}", saveName);
+                        SwitchTelemetry.finish("load_cancelled_or_failed");
+                        minecraft.setScreen(new TitleScreen());
+                        onFail.run();
+                    });
+        });
     }
 
     /**
@@ -156,16 +164,14 @@ public final class WorldSwitcher {
         }
         LOGGER.info("编排性断开物理服务端，经隧道加入主客户端 {} (127.0.0.1:{})", primaryName, port);
         SwitchTelemetry.mark("disconnect_begin");
-        if (minecraft.level != null) {
-            SWITCHING.set(true);
-            // 主→副切换同样必须先断开旧游戏连接，否则集成服务端不知道本地房主已离开。
-            minecraft.level.disconnect();
-            minecraft.disconnect();
-        }
-        ServerData data = new ServerData("P2P 组世界（主客户端: " + primaryName + "）",
-                "127.0.0.1:" + port, ServerData.Type.OTHER);
-        SwitchTelemetry.mark("login_begin");
-        ConnectScreen.startConnecting(new JoinMultiplayerScreen(new TitleScreen()), minecraft,
-                new ServerAddress("127.0.0.1", port), data, false);
+        runSwitch(minecraft, () -> {
+            disconnectCurrentWorld(minecraft);
+            ServerData data = new ServerData("P2P 组世界（主客户端: " + primaryName + "）",
+                    "127.0.0.1:" + port, ServerData.Type.OTHER);
+            SwitchTelemetry.mark("login_begin");
+            // startConnecting 内部还会无条件 disconnect；必须留在同一作用域内。
+            ConnectScreen.startConnecting(new JoinMultiplayerScreen(new TitleScreen()), minecraft,
+                    new ServerAddress("127.0.0.1", port), data, false);
+        });
     }
 }
