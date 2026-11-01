@@ -8,7 +8,10 @@ import java.io.IOException;
 import java.nio.file.ClosedWatchServiceException;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.StandardWatchEventKinds;
 import java.nio.file.WatchEvent;
 import java.nio.file.WatchKey;
@@ -17,11 +20,12 @@ import java.time.Duration;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Map;
+import java.util.Set;
+import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Stream;
 import java.util.function.Consumer;
 
 /**
@@ -29,7 +33,7 @@ import java.util.function.Consumer;
  * <p>
  * WatchService 线程只负责收事件和标记 dirty，哈希、复制与 manifest 落盘全部转交
  * IO 线程池。构建使用“dirty + building”单飞状态机：任意时刻最多一轮重活；构建
- * 期间的新变化不会丢失，而是在当前轮结束后立即补建下一版。
+ * 期间的新变化不会丢失，合并后按最短间隔补建，避免持续写盘触发无间隔重复制。
  */
 public final class EnvironmentSnapshotManager {
 
@@ -50,6 +54,8 @@ public final class EnvironmentSnapshotManager {
     private volatile EnvironmentSnapshot current;
     private volatile boolean running;
     private boolean dirty;
+    private final Set<String> changedPaths = new HashSet<>();
+    private boolean verifyAll = true;
     private boolean building;
     private boolean maintenanceRunning;
     private int sourceUpdateDepth;
@@ -57,7 +63,6 @@ public final class EnvironmentSnapshotManager {
     private ScheduledFuture<?> maintenanceTask;
     private WatchService watchService;
     private Thread watchThread;
-    private volatile String publishedSourceFingerprint;
 
     /** 生产构造：1 秒防抖、60 秒校验，旧快照保留时长由配置传入。 */
     public EnvironmentSnapshotManager(Path sourceRoot, Path repositoryRoot,
@@ -90,6 +95,7 @@ public final class EnvironmentSnapshotManager {
             }
             running = true;
             dirty = true;
+            verifyAll = true;
         }
         try {
             Files.createDirectories(sourceRoot);
@@ -151,15 +157,22 @@ public final class EnvironmentSnapshotManager {
 
     /** 外部组件可主动请求刷新；多次调用会被防抖合并。 */
     public void requestRefresh() {
+        requestRefresh(Set.of(), true);
+    }
+
+    private void requestRefresh(Set<String> paths, boolean fullVerification) {
         synchronized (stateLock) {
             if (!running) {
                 return;
             }
             dirty = true;
+            changedPaths.addAll(paths);
+            verifyAll |= fullVerification;
             if (building || maintenanceRunning || sourceUpdateDepth > 0) {
                 return;
             }
-            scheduleBuildLocked(debounceMillis);
+            // 以首个事件为窗口起点，不因连续新事件无限推迟构建。
+            if (debounceTask == null) scheduleBuildLocked(debounceMillis);
         }
     }
 
@@ -205,6 +218,8 @@ public final class EnvironmentSnapshotManager {
                     }
                 }
                 dirty = publish;
+                changedPaths.clear();
+                verifyAll = true; // 批量替换期间监听已关闭，无法安全定向复用。
                 if (running && publish) {
                     scheduleBuildLocked(0L);
                 }
@@ -222,6 +237,7 @@ public final class EnvironmentSnapshotManager {
             }
             running = false;
             dirty = false;
+            changedPaths.clear();
             if (debounceTask != null) {
                 debounceTask.cancel(false);
                 debounceTask = null;
@@ -261,6 +277,8 @@ public final class EnvironmentSnapshotManager {
     }
 
     private void beginBuild() {
+        Set<String> changes;
+        boolean fullVerification;
         synchronized (stateLock) {
             debounceTask = null;
             if (!running || building || maintenanceRunning
@@ -269,42 +287,45 @@ public final class EnvironmentSnapshotManager {
             }
             dirty = false;
             building = true;
+            changes = Set.copyOf(changedPaths);
+            changedPaths.clear();
+            fullVerification = verifyAll;
+            verifyAll = false;
         }
-        ThreadPools.io().execute(this::buildOnce);
+        ThreadPools.io().execute(() -> buildOnce(changes, fullVerification));
     }
 
-    private void buildOnce() {
+    private void buildOnce(Set<String> changes, boolean fullVerification) {
         try {
-            String fingerprintBefore = store.sourceFingerprint();
-            EnvironmentSnapshot built = store.buildSnapshot();
-            String fingerprintAfter = store.sourceFingerprint();
+            long started = System.nanoTime();
+            EnvironmentSnapshot built = store.buildSnapshot(changes, fullVerification);
             if (running) {
                 EnvironmentSnapshot previous = current;
                 snapshots.put(built.snapshotId(), built);
                 current = built;
-                publishedSourceFingerprint = fingerprintAfter;
-                LOGGER.info("环境快照已发布: id={} 文件数={}",
-                        built.snapshotId(), built.manifest().files().size());
                 if (previous == null || !previous.snapshotId().equals(built.snapshotId())) {
+                    EnvironmentSnapshotStore.BuildStats stats = store.lastBuildStats();
+                    LOGGER.info("环境快照已发布: id={} 文件数={} 复制文件={} 复制字节={} 复用文件={} 耗时={}ms",
+                            built.snapshotId(), built.manifest().files().size(), stats.copiedFiles(),
+                            stats.copiedBytes(), stats.reusedFiles(),
+                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
                     for (Consumer<EnvironmentSnapshot> listener : publicationListeners) {
                         try { listener.accept(built); }
                         catch (RuntimeException error) { LOGGER.warn("环境发布监听器执行失败", error); }
                     }
                 }
-                if (!fingerprintBefore.equals(fingerprintAfter)) {
-                    // 构建窗口内源目录又变化：当前版本仍然内部一致，但需立即追赶最新状态。
-                    requestRefresh();
-                }
             }
         } catch (Exception e) {
             // 失败时绝不清空 current：已经发布的上一版仍可继续服务正在加入的客户端。
             LOGGER.error("环境快照构建失败，继续保留上一有效版本", e);
+            // 已消费的事件不能在失败后丢失；下一次重试/维护扩大校验范围。
+            synchronized (stateLock) { verifyAll = true; }
         } finally {
             synchronized (stateLock) {
                 building = false;
                 stateLock.notifyAll();
                 if (running && dirty) {
-                    scheduleBuildLocked(0L);
+                    scheduleBuildLocked(debounceMillis);
                 }
             }
         }
@@ -313,17 +334,18 @@ public final class EnvironmentSnapshotManager {
     /** 60 秒兜底校验 + 旧版本/孤儿 Blob 回收。 */
     private void runMaintenance() {
         synchronized (stateLock) {
-            if (!running || building || maintenanceRunning || sourceUpdateDepth > 0) {
+            if (!running) return;
+            // 校验到期是必须保留的事件：忙碌只推迟执行，不能连续增量构建时永远漏检。
+            dirty = true;
+            verifyAll = true;
+            if (building || maintenanceRunning || sourceUpdateDepth > 0) {
                 return;
             }
             maintenanceRunning = true;
         }
         try {
-            String observed = store.sourceFingerprint();
-            String published = publishedSourceFingerprint;
-            if (published == null || !published.equals(observed)) {
-                requestRefresh();
-            }
+            // 文件可被同长度改写并恢复 mtime，轻量属性指纹无法保证发现漏事件。
+            // 兜底轮读取内容校验但复用相同 Blob，不再为每个文件创建完整临时副本。
             cleanupExpiredSnapshots();
         } catch (Exception e) {
             if (running) {
@@ -334,7 +356,7 @@ public final class EnvironmentSnapshotManager {
                 maintenanceRunning = false;
                 stateLock.notifyAll();
                 if (running && dirty && !building) {
-                    scheduleBuildLocked(0L);
+                    scheduleBuildLocked(debounceMillis);
                 }
             }
         }
@@ -367,7 +389,7 @@ public final class EnvironmentSnapshotManager {
 
     /** 每个监听线程只使用创建时的 watcher，避免旧线程在关闭时误接管新 watcher。 */
     private void watchLoop(WatchService watcher) {
-        while (running) {
+        while (running && watcher == watchService) {
             try {
                 WatchKey key = watcher.take();
                 Path directory = watchDirectories.get(key);
@@ -375,10 +397,11 @@ public final class EnvironmentSnapshotManager {
                     key.reset();
                     continue;
                 }
-                boolean relevantChange = false;
+                Set<String> paths = new HashSet<>();
+                boolean fullVerification = false;
                 for (WatchEvent<?> event : key.pollEvents()) {
                     if (event.kind() == StandardWatchEventKinds.OVERFLOW) {
-                        relevantChange = true;
+                        fullVerification = true;
                         continue;
                     }
                     Object context = event.context();
@@ -393,14 +416,15 @@ public final class EnvironmentSnapshotManager {
                         registerAllDirectories(changed);
                     }
                     if (pathPolicy.includes(relative)) {
-                        relevantChange = true;
+                        paths.add(relative);
                     }
                 }
                 if (!key.reset()) {
                     watchDirectories.remove(key);
+                    fullVerification = true;
                 }
-                if (relevantChange) {
-                    requestRefresh();
+                if (watcher == watchService && (!paths.isEmpty() || fullVerification)) {
+                    requestRefresh(paths, fullVerification);
                 }
             } catch (ClosedWatchServiceException ignored) {
                 return;
@@ -443,19 +467,21 @@ public final class EnvironmentSnapshotManager {
         if (watcher == null || !Files.isDirectory(start)) {
             return;
         }
-        try (Stream<Path> walk = Files.walk(start)) {
-            for (Path directory : walk.filter(Files::isDirectory).toList()) {
+        Files.walkFileTree(start, new SimpleFileVisitor<>() {
+            @Override public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attributes)
+                    throws IOException {
                 String relative = pathPolicy.normalize(
                         sourceRoot.relativize(directory).toString());
                 if (!relative.isEmpty() && !pathPolicy.includes(relative)) {
-                    continue;
+                    return FileVisitResult.SKIP_SUBTREE;
                 }
                 WatchKey key = directory.register(watcher,
                         StandardWatchEventKinds.ENTRY_CREATE,
                         StandardWatchEventKinds.ENTRY_MODIFY,
                         StandardWatchEventKinds.ENTRY_DELETE);
                 watchDirectories.put(key, directory);
+                return FileVisitResult.CONTINUE;
             }
-        }
+        });
     }
 }

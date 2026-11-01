@@ -80,7 +80,9 @@ final class MetadataSchedules {
 
     void tick() throws IOException {
         if (server.getWorldData().overworldData().getScheduledEvents().getEventsIds().isEmpty()) return;
-        CompoundTag data = service.collect();
+        CompoundTag data = collectIfDue(server.getWorldData().overworldData().getScheduledEvents().store(),
+                server.overworld().getGameTime(), service::collect);
+        if (data == null) return;
         ListTag events = data.getList("ScheduledEvents", Tag.TAG_COMPOUND);
         if (events.isEmpty()) return;
         CompoundTag routes = data.getCompound("__p2pScheduleRoutes");
@@ -164,6 +166,19 @@ final class MetadataSchedules {
             }));
             return; // 单tick最多派发一次，避免大量过期函数阻塞控制线程。
         }
+    }
+
+    @FunctionalInterface interface Collector { CompoundTag collect() throws IOException; }
+
+    /**
+     * 先只查看原版内存队列，真正有到期事件才进入全量采集与耐久提交屏障。
+     * 否则一个未来的 /schedule 会在每个 tick 等待后台检查点，重新引入慢盘卡顿。
+     */
+    static CompoundTag collectIfDue(ListTag events, long gameTime, Collector collector) throws IOException {
+        for (Tag entry : events) {
+            if (((CompoundTag) entry).getLong("TriggerTime") <= gameTime) return collector.collect();
+        }
+        return null;
     }
 
     private static final class WorldId {

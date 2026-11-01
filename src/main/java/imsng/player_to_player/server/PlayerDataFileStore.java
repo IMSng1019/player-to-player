@@ -1,8 +1,6 @@
 package imsng.player_to_player.server;
 
 import imsng.player_to_player.group.PlayerStateNbt;
-import net.minecraft.nbt.CompoundTag;
-import net.minecraft.nbt.NbtIo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -72,10 +70,13 @@ public final class PlayerDataFileStore {
         Path tmp = dataDir.resolve(playerId + ".dat.p2p-tmp");
         Path target = dataDir.resolve(playerId + ".dat");
         try {
-            CompoundTag validated = PlayerStateNbt.decodeValidated(gzipNbt);
+            // 必须先完成解压限额及玩家字段校验；失败时不能触碰已有玩家存档。
+            // 上传内容本身已是原版玩家文件使用的 gzip NBT，校验通过后直接复用原字节，
+            // 避免每秒把同一份玩家状态重新压缩。以下锁、刷盘与替换顺序仍为原有耐久屏障。
+            PlayerStateNbt.decodeValidated(gzipNbt);
             Files.createDirectories(dataDir);
             Files.deleteIfExists(tmp);
-            NbtIo.writeCompressed(validated, tmp);
+            Files.write(tmp, gzipNbt);
             force(tmp);
             try {
                 Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING,

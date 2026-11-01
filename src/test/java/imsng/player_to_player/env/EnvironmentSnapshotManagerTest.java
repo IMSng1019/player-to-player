@@ -9,6 +9,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -21,6 +23,90 @@ class EnvironmentSnapshotManagerTest {
 
     @TempDir
     Path tempDir;
+
+    @Test
+    void reconciliationDueDuringBuildRunsAfterPublicationCompletes() throws Exception {
+        Path source = tempDir.resolve("busy-reconciliation");
+        Files.createDirectories(source);
+        Files.writeString(source.resolve("config.json"), "first");
+        EnvironmentSnapshotManager manager = new EnvironmentSnapshotManager(source,
+                tempDir.resolve("repository"), List.of(), Duration.ofMillis(10),
+                Duration.ofSeconds(30), Duration.ofMinutes(10));
+        CountDownLatch publishing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        manager.onPublished(snapshot -> {
+            publishing.countDown();
+            try { release.await(5, TimeUnit.SECONDS); }
+            catch (InterruptedException error) { Thread.currentThread().interrupt(); }
+        });
+        try {
+            manager.start();
+            assertTrue(publishing.await(5, TimeUnit.SECONDS));
+            // 用真实发布回调固定住一轮构建，只提前触发维护时点，不修改内部状态标志。
+            var maintenance = EnvironmentSnapshotManager.class.getDeclaredMethod("runMaintenance");
+            maintenance.setAccessible(true);
+            maintenance.invoke(manager);
+            var storage = EnvironmentSnapshotManager.class.getDeclaredField("store");
+            storage.setAccessible(true);
+            EnvironmentSnapshotStore store = (EnvironmentSnapshotStore) storage.get(manager);
+            assertEquals(1, store.lastBuildStats().copiedFiles());
+            release.countDown();
+            // 第二轮无变化，应实际完成校验并复用首轮内容，不能把忙碌时的维护请求丢掉。
+            await(() -> store.lastBuildStats().reusedFiles() == 1);
+        } finally {
+            release.countDown();
+            manager.stop();
+        }
+    }
+
+    @Test
+    void continuousRefreshRequestsDoNotStarvePublication() throws Exception {
+        Path source = tempDir.resolve("continuous");
+        Files.createDirectories(source);
+        Path file = source.resolve("config.json");
+        Files.writeString(file, "first");
+        EnvironmentSnapshotManager manager = new EnvironmentSnapshotManager(source,
+                tempDir.resolve("repository"), List.of(), Duration.ofMillis(150),
+                Duration.ofSeconds(30), Duration.ofMinutes(10));
+        try {
+            manager.start();
+            await(() -> manager.current() != null);
+            String first = manager.current().snapshotId();
+            Files.writeString(file, "second");
+            long deadline = System.nanoTime() + Duration.ofMillis(700).toNanos();
+            while (System.nanoTime() < deadline) {
+                manager.requestRefresh();
+                Thread.sleep(10);
+            }
+            assertNotEquals(first, manager.current().snapshotId(), "连续通知不能无限重置防抖计时");
+        } finally {
+            manager.stop();
+        }
+    }
+
+    @Test
+    void periodicVerificationRepairsMissedChangeEvenWhenAttributesMatch() throws Exception {
+        Path source = tempDir.resolve("missed-event");
+        Files.createDirectories(source);
+        Path file = source.resolve("config.json");
+        Files.writeString(file, "first");
+        EnvironmentSnapshotManager manager = new EnvironmentSnapshotManager(source,
+                tempDir.resolve("repository"), List.of(), Duration.ofMillis(20),
+                Duration.ofMillis(80), Duration.ofMinutes(10));
+        try {
+            manager.start();
+            await(() -> manager.current() != null);
+            String first = manager.current().snapshotId();
+            manager.beginSourceUpdate(); // 停止监听，模拟文件系统漏事件。
+            var modified = Files.getLastModifiedTime(file);
+            Files.writeString(file, "other");
+            Files.setLastModifiedTime(file, modified);
+            manager.endSourceUpdate(false); // 不主动请求构建，必须由周期校验发现。
+            await(() -> !first.equals(manager.current().snapshotId()));
+        } finally {
+            manager.stop();
+        }
+    }
 
     @Test
     void publicationListenersOnlyReceiveChangedVersionsAndCanUnsubscribe() throws Exception {

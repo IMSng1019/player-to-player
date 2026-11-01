@@ -1,5 +1,6 @@
 package imsng.player_to_player.env;
 
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -16,9 +17,20 @@ import java.util.Locale;
 public final class EnvironmentPathPolicy {
 
     /**
+     * 已有专门同步通道的世界状态。玩家位置/背包通过玩家数据耐久通道上传；
+     * level.dat 通过版本化元数据通道同步，均不应推动共享环境版本。
+     * stats、advancements 尚无独立完整持久化路径，不能仅为降负载在这里排除。
+     */
+    private static final List<String> WORLD_STATE_PATHS = List.of(
+            "level.dat", "level.dat_old", "session.lock", "playerdata");
+
+    /**
      * 内置非环境路径。比较统一使用小写正斜杠形式，但清单键仍保留源文件原始大小写。
      */
-    private static final List<String> BUILTIN_EXCLUSIONS = List.of(
+    private static final List<String> BUILTIN_EXCLUSIONS = builtinExclusions();
+
+    private static List<String> builtinExclusions() {
+        List<String> paths = new ArrayList<>(List.of(
             "logs",
             "player-to-player",
             // Loader会重新提取/重映射这些缓存；.fabric/server是真实启动依赖，必须保留。
@@ -30,10 +42,6 @@ public final class EnvironmentPathPolicy {
             "world/entities",
             "world/DIM-1",
             "world/DIM1",
-            // v9：可变元数据只经版本化NBT通道同步，自动保存不得推动环境版本。
-            "world/level.dat",
-            "world/level.dat_old",
-            "world/session.lock",
             "session.lock",
             "server.properties",
             "ops.json",
@@ -41,7 +49,11 @@ public final class EnvironmentPathPolicy {
             "banned-ips.json",
             "banned-players.json",
             "usercache.json",
-            "eula.txt");
+            "eula.txt"));
+        // 默认存档和预检返回的自定义存档必须来自同一份状态分类，避免各端再次漏项。
+        paths.addAll(worldMetadataExclusions("world"));
+        return List.copyOf(paths);
+    }
 
     /** 已规范化为小写正斜杠形式的完整排除表。 */
     private final List<String> exclusions;
@@ -71,10 +83,30 @@ public final class EnvironmentPathPolicy {
         return new EnvironmentPathPolicy(merged);
     }
 
-    /** 下载端和中转端没有 MinecraftServer，使用预检给出的实际存档相对路径建立同一规则。 */
+    /**
+     * 下载端和中转端没有 MinecraftServer，使用预检给出的实际存档相对路径建立同一规则。
+     * 保留既有方法名，同时覆盖已由独立通道持久化的玩家存档及整个备份子目录。
+     */
     public static List<String> worldMetadataExclusions(String worldPath) {
         String world = EnvironmentRuntimeIdentity.normalizeWorldPath(worldPath);
-        return List.of(world + "/level.dat", world + "/level.dat_old", world + "/session.lock");
+        return qualifyWorldStatePaths(world + "/");
+    }
+
+    /**
+     * 中心服务已知真实磁盘目录，用相同状态分类计算排除路径。
+     * 存档位于扫描根之外时不需要额外排除；存档恰为扫描根时使用空前缀，
+     * 不把它伪装成 "world" 子目录，也不放宽网络预检对相对路径的校验。
+     */
+    public static List<String> worldMetadataExclusions(Path sourceRoot, Path worldRoot) {
+        Path source = sourceRoot.toAbsolutePath().normalize();
+        Path world = worldRoot.toAbsolutePath().normalize();
+        if (!world.startsWith(source)) return List.of();
+        String relative = source.relativize(world).toString().replace('\\', '/');
+        return qualifyWorldStatePaths(relative.isEmpty() ? "" : relative + "/");
+    }
+
+    private static List<String> qualifyWorldStatePaths(String prefix) {
+        return WORLD_STATE_PATHS.stream().map(path -> prefix + path).toList();
     }
 
     /**

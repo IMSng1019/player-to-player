@@ -51,14 +51,15 @@ public final class MetadataStore implements AutoCloseable {
     private final FileChannel wal;
     private final Map<String, Receipt> receipts = new HashMap<>();
     private final ArrayDeque<MetadataPatch> history = new ArrayDeque<>();
-    private MetadataSnapshot current;
+    /** 仅在耐久写入成功后替换；Snapshot 本身及其 NBT 访问均为防御性复制。 */
+    private volatile MetadataSnapshot current;
     /** 检查点确认时 WAL 的物理边界；该边界之前的回执绝不允许按断尾丢弃。 */
     private long checkpointWalBytes;
     /** WAL 能独立重建到的版本/任期；自然检查点不会推进这两个值。 */
     private long walVersion = -1;
     private long walTerm;
-    private boolean closed;
-    private boolean failed;
+    private volatile boolean closed;
+    private volatile boolean failed;
 
     private MetadataStore(Path directory, FileChannel lockChannel, FileLock lock,
                           FileChannel wal, MetadataSnapshot current) {
@@ -137,7 +138,8 @@ public final class MetadataStore implements AutoCloseable {
         }
     }
 
-    public synchronized MetadataSnapshot snapshot() {
+    /** 后台检查点持有写锁时，读者仍可立即取得上一份已提交快照。 */
+    public MetadataSnapshot snapshot() {
         requireOpen();
         return current;
     }

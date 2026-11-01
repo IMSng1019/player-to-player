@@ -6,6 +6,7 @@ import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.config.P2PPaths;
 import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.env.EnvSyncServerHandlers;
+import imsng.player_to_player.env.EnvironmentPathPolicy;
 import imsng.player_to_player.env.EnvironmentSnapshotManager;
 import imsng.player_to_player.netproto.ControlServer;
 import imsng.player_to_player.netproto.MessageType;
@@ -502,9 +503,13 @@ public final class P2PServerService {
         // Windows 下 relativize 产生反斜杠，统一规范化为正斜杠（排除表约定正斜杠比较）
         String worldPrefix = normalizedServerRoot.relativize(normalizedWorldRoot)
                 .toString().replace('\\', '/');
-        for (String dim : List.of("region", "poi", "entities", "DIM-1", "DIM1", "level.dat", "level.dat_old", "session.lock")) {
+        for (String dim : List.of("region", "poi", "entities", "DIM-1", "DIM1")) {
             exclusions.add(worldPrefix.isEmpty() ? dim : worldPrefix + "/" + dim);
         }
+        // 玩家存档每秒耐久回传，但它属于世界数据而非模组环境；和下载端/中转端共用
+        // 同一规则，避免保存位置/背包触发全环境哈希、临时复制及版本发布。
+        exclusions.addAll(EnvironmentPathPolicy.worldMetadataExclusions(
+                normalizedServerRoot, normalizedWorldRoot));
         return exclusions;
     }
 

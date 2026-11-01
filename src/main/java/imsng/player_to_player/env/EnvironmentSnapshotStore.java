@@ -15,7 +15,9 @@ import java.nio.channels.SeekableByteChannel;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
@@ -26,6 +28,7 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -54,6 +57,14 @@ public final class EnvironmentSnapshotStore {
     private final Path manifestsDir;
     private final Path stagingDir;
     private final EnvironmentPathPolicy pathPolicy;
+    /** 只缓存本进程成功构建时稳定读取的版本；重启后重新验证，不相信磁盘上的属性缓存。 */
+    private Map<String, CachedFile> sourceCache = new HashMap<>();
+    private EnvironmentSnapshot lastBuilt;
+    private volatile BuildStats lastBuildStats = new BuildStats(0, 0, 0);
+
+    public record BuildStats(int copiedFiles, long copiedBytes, int reusedFiles) { }
+
+    public BuildStats lastBuildStats() { return lastBuildStats; }
 
     public EnvironmentSnapshotStore(Path sourceRoot, Path repositoryRoot,
                                     List<String> extraExclusions) {
@@ -70,19 +81,71 @@ public final class EnvironmentSnapshotStore {
      * 调用方可以据此原子发布；任何文件持续变化都会让整轮构建失败。
      */
     public EnvironmentSnapshot buildSnapshot() throws IOException {
+        // 无事件上下文的调用方采用完整内容校验；相同内容仍可复用 Blob 而不写临时副本。
+        return buildSnapshot(Set.of(), true);
+    }
+
+    /**
+     * 事件已知时只重新校验受影响的路径树，其他条目同时核对文件版本与 Blob 是否存在。
+     * verifyAll 用于启动、监听溢出和周期兜底，即使同大小/同时间戳的修改也能被识别。
+     * 只有整轮成功才更换缓存，失败不会把尚未发布的部分清单变成后续构建的依据。
+     */
+    synchronized EnvironmentSnapshot buildSnapshot(Set<String> changedPaths, boolean verifyAll) throws IOException {
         Files.createDirectories(blobsDir);
         Files.createDirectories(manifestsDir);
         Files.createDirectories(stagingDir);
 
         Map<String, EnvironmentManifest.Entry> entries = new TreeMap<>();
+        Map<String, CachedFile> nextCache = new HashMap<>();
+        int copiedFiles = 0;
+        long copiedBytes = 0;
+        int reusedFiles = 0;
         for (Path source : listIncludedFiles()) {
             String relative = pathPolicy.normalize(sourceRoot.relativize(source).toString());
-            entries.put(relative, materializeStableBlob(source));
+            CachedFile cached = sourceCache.get(relative);
+            BasicFileAttributes observed = Files.readAttributes(source, BasicFileAttributes.class);
+            boolean blobPresent = cached != null && Files.isRegularFile(blobPath(cached.entry().sha256()))
+                    && Files.size(blobPath(cached.entry().sha256())) == cached.entry().size();
+            boolean affected = verifyAll || changedPaths.stream().anyMatch(path ->
+                    relative.equalsIgnoreCase(path)
+                            || relative.regionMatches(true, 0, path + "/", 0, path.length() + 1));
+            CachedFile next;
+            if (blobPresent && !affected && sameSourceVersion(cached.attributes(), observed)) {
+                next = cached;
+                reusedFiles++;
+            } else if (blobPresent && matchesCachedContent(source, observed, cached.entry())) {
+                // 重复通知/mtime 改变不代表内容改变：哈希相同就复用，不重复写完整 JAR。
+                next = new CachedFile(observed, cached.entry());
+                reusedFiles++;
+            } else {
+                next = materializeStableBlob(source);
+                copiedFiles++;
+                copiedBytes += next.entry().size();
+            }
+            nextCache.put(relative, next);
+            entries.put(relative, next.entry());
         }
         EnvironmentSnapshot snapshot = new EnvironmentSnapshot(
                 new EnvironmentManifest(entries), System.currentTimeMillis());
-        persistSnapshot(snapshot);
+        if (lastBuilt != null && lastBuilt.snapshotId().equals(snapshot.snapshotId())
+                && Files.isRegularFile(manifestsDir.resolve(snapshot.snapshotId() + ".json"))) {
+            snapshot = lastBuilt;
+            snapshot.touch();
+        } else {
+            persistSnapshot(snapshot);
+        }
+        sourceCache = nextCache;
+        lastBuilt = snapshot;
+        lastBuildStats = new BuildStats(copiedFiles, copiedBytes, reusedFiles);
         return snapshot;
+    }
+
+    private boolean matchesCachedContent(Path source, BasicFileAttributes before,
+                                         EnvironmentManifest.Entry entry) throws IOException {
+        if (before.size() != entry.size()) return false;
+        String hash = Sha256.hexOfFile(source);
+        BasicFileAttributes after = Files.readAttributes(source, BasicFileAttributes.class);
+        return sameSourceVersion(before, after) && entry.sha256().equals(hash);
     }
 
     /**
@@ -93,6 +156,8 @@ public final class EnvironmentSnapshotStore {
         Files.createDirectories(blobsDir);
         Files.createDirectories(manifestsDir);
         Map<String, EnvironmentSnapshot> loaded = new TreeMap<>();
+        int invalid = 0;
+        int quarantined = 0;
         try (Stream<Path> files = Files.list(manifestsDir)) {
             for (Path manifestFile : files
                     .filter(Files::isRegularFile)
@@ -109,11 +174,22 @@ public final class EnvironmentSnapshotStore {
                     validateSnapshotBlobs(snapshot);
                     loaded.put(snapshot.snapshotId(), snapshot);
                 } catch (Exception e) {
-                    LOGGER.warn("环境快照清单无效，已跳过: {} ({})",
-                            manifestFile, e.toString());
+                    invalid++;
+                    // 只移动无效清单并保留原文，绝不删除世界或 WAL；下次启动不再逐份解析。
+                    try {
+                        Path quarantine = repositoryRoot.resolve("quarantine");
+                        Files.createDirectories(quarantine);
+                        Files.move(manifestFile, quarantine.resolve(
+                                manifestFile.getFileName() + "." + UUID.randomUUID()));
+                        quarantined++;
+                    } catch (IOException moveFailure) {
+                        LOGGER.warn("无法隔离无效环境清单 {}: {}", manifestFile, moveFailure.toString());
+                    }
+                    LOGGER.debug("无效环境快照: {} ({})", manifestFile, e.toString());
                 }
             }
         }
+        if (invalid > 0) LOGGER.warn("已跳过 {} 份无效环境快照清单，其中 {} 份已隔离保留", invalid, quarantined);
         return loaded;
     }
 
@@ -291,14 +367,19 @@ public final class EnvironmentSnapshotStore {
             return List.of();
         }
         List<Path> files = new ArrayList<>();
-        try (Stream<Path> walk = Files.walk(sourceRoot)) {
-            walk.filter(Files::isRegularFile).forEach(path -> {
+        Files.walkFileTree(sourceRoot, new SimpleFileVisitor<>() {
+            @Override public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attributes) {
+                String relative = pathPolicy.normalize(sourceRoot.relativize(directory).toString());
+                return relative.isEmpty() || pathPolicy.includes(relative)
+                        ? FileVisitResult.CONTINUE : FileVisitResult.SKIP_SUBTREE;
+            }
+
+            @Override public FileVisitResult visitFile(Path path, BasicFileAttributes attributes) {
                 String relative = pathPolicy.normalize(sourceRoot.relativize(path).toString());
-                if (pathPolicy.includes(relative)) {
-                    files.add(path);
-                }
-            });
-        }
+                if (Files.isRegularFile(path) && pathPolicy.includes(relative)) files.add(path);
+                return FileVisitResult.CONTINUE;
+            }
+        });
         files.sort(Comparator.comparing(
                 path -> pathPolicy.normalize(sourceRoot.relativize(path).toString())));
         return files;
@@ -309,7 +390,7 @@ public final class EnvironmentSnapshotStore {
      * Vanilla 常用临时文件原子替换 level.dat，fileKey 能识别“路径相同但文件已换代”；
      * 普通原地写则由大小/修改时间识别。变化时丢弃本次结果并重试。
      */
-    private EnvironmentManifest.Entry materializeStableBlob(Path source) throws IOException {
+    private CachedFile materializeStableBlob(Path source) throws IOException {
         IOException lastFailure = null;
         for (int attempt = 1; attempt <= MAX_STABLE_COPY_ATTEMPTS; attempt++) {
             Path staged = stagingDir.resolve(UUID.randomUUID() + ".blob.tmp");
@@ -327,7 +408,7 @@ public final class EnvironmentSnapshotStore {
 
                 Path blob = blobPath(copied.sha256());
                 publishBlob(staged, blob);
-                return new EnvironmentManifest.Entry(copied.sha256(), copied.size());
+                return new CachedFile(after, new EnvironmentManifest.Entry(copied.sha256(), copied.size()));
             } catch (IOException e) {
                 lastFailure = e;
             } finally {
@@ -394,4 +475,6 @@ public final class EnvironmentSnapshotStore {
 
     private record CopyResult(String sha256, long size) {
     }
+
+    private record CachedFile(BasicFileAttributes attributes, EnvironmentManifest.Entry entry) { }
 }

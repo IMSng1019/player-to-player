@@ -9,6 +9,7 @@ import imsng.player_to_player.registry.ChunkRegistry;
 import imsng.player_to_player.server.GroupTable;
 import imsng.player_to_player.server.HelloHandler;
 import imsng.player_to_player.util.JsonUtil;
+import imsng.player_to_player.util.ThreadPools;
 import imsng.player_to_player.world.WorldIdentity;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.core.registries.Registries;
@@ -32,12 +33,16 @@ import java.util.*;
 /**
  * 中心的世界元数据协调器。所有世界对象只在服务器线程读写；网络线程仅投递任务。
  * 离散请求先得到原版字段结果，再写入带 force 的日志，只有提交成功才返回成功响应。
- * 自然时间每秒检查点，恢复先应用日志领先于原版 level.dat 的状态。
+ * 自然时间每秒采样，压缩与检查点刷盘在后台单飞执行，恢复先应用日志领先于原版
+ * level.dat 的状态；离散提交、任期切换及关闭仍保持原有的同步耐久屏障。
  */
 public final class MetadataService implements AutoCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger("player_to_player/metadata");
     private static volatile MetadataService current;
     private final MinecraftServer server;
+    private final MetadataCheckpointWriter checkpoints;
+    /** 对外可见版本在主线程收割后才更新，不能把后台已写完但尚未发布的版本用于切换。 */
+    private volatile MetadataSnapshot publishedSnapshot;
     private final GroupTable groups;
     private final ChunkRegistry registry;
     private final imsng.player_to_player.registry.PlayerTable players;
@@ -52,7 +57,7 @@ public final class MetadataService implements AutoCloseable {
         StaleTerm() { super("写入任期已过期，请重新获取快照"); }
     }
     private volatile long ticks;
-    private boolean closed;
+    private volatile boolean closed;
     private boolean executingRequest;
     private String topology = "";
     private UUID dragonOwner;
@@ -95,6 +100,11 @@ public final class MetadataService implements AutoCloseable {
         server.getWorldData().overworldData().setGameTime(store.snapshot().data().getLong("Time"));
         MetadataRuntime.setCommittedData(server, store.snapshot().data());
         schedules = new MetadataSchedules(this, server, groups, registry);
+        publishedSnapshot = store.snapshot();
+        checkpoints = new MetadataCheckpointWriter(ThreadPools.io(), patch -> {
+            MetadataRuntime.setCommittedData(server, store.snapshot().data());
+            publish(patch);
+        });
         current = this;
         handlers.on(MessageType.METADATA_SNAPSHOT_REQUEST, (c, m) -> enqueue(c, m, () -> snapshot(c, m)));
         handlers.on(MessageType.METADATA_CATCHUP, (c, m) -> enqueue(c, m, () -> catchup(c, m)));
@@ -108,6 +118,9 @@ public final class MetadataService implements AutoCloseable {
         server.execute(() -> {
             try {
                 if (closed) throw new IllegalStateException("元数据服务已关闭");
+                // 离散变更需要强顺序；快照、确认及每秒state只读已发布版本，不能为了
+                // 一个读请求把后台fsync重新变成主线程等待。已完成结果仍先按序收割。
+                finishCheckpoints(message.type() == MessageType.METADATA_CHANGE);
                 Exception[] failure = {null};
                 // 会话检查和实际提交必须处于同一个会话锁内，不能在检查之后让新HELLO
                 // 替换当前连接，再由旧连接排队的任务修改新会话世界。
@@ -133,14 +146,14 @@ public final class MetadataService implements AutoCloseable {
 
     private void checkWorld(JsonObject request, boolean initial) {
         String id = JsonUtil.getString(request, "worldId", "");
-        MetadataSnapshot snapshot = store.snapshot();
+        MetadataSnapshot snapshot = publishedSnapshot;
         if (!(initial && id.isEmpty()) && !snapshot.worldId().equals(id)) throw new IllegalArgumentException("世界身份不匹配");
         if (!initial && JsonUtil.getLong(request, "term", -1) != snapshot.term()) throw new StaleTerm();
     }
 
     private void snapshot(ControlConnection connection, ControlMessage request) throws IOException {
         checkWorld(request.json(), true);
-        MetadataSnapshot snapshot = store.snapshot();
+        MetadataSnapshot snapshot = publishedSnapshot;
         JsonObject header = header(snapshot);
         // 全量快照是有界补齐的可靠回退；客户端仍使用连续补丁推进正常增量。
         connection.send(request.reply(MessageType.METADATA_SNAPSHOT, header,
@@ -150,9 +163,9 @@ public final class MetadataService implements AutoCloseable {
     private void acknowledge(ControlConnection connection, ControlMessage request) {
         checkWorld(request.json(), false);
         long version = JsonUtil.getLong(request.json(), "version", -1);
-        if (version < 0 || version > store.snapshot().version()) throw new IllegalArgumentException("确认版本非法");
+        if (version < 0 || version > publishedSnapshot.version()) throw new IllegalArgumentException("确认版本非法");
         acknowledgements.merge(connection.peerId(), version, Math::max);
-        JsonObject reply = header(store.snapshot());
+        JsonObject reply = header(publishedSnapshot);
         reply.addProperty("accepted", true);
         connection.send(request.reply(MessageType.METADATA_ACK, reply, null));
     }
@@ -160,8 +173,10 @@ public final class MetadataService implements AutoCloseable {
     /** 连续日志窗口可用时只传缺失补丁；任期变化、窗口淘汰或合包过大均明确退回快照。 */
     private void catchup(ControlConnection connection, ControlMessage request) throws IOException {
         checkWorld(request.json(), true);
-        MetadataSnapshot latest = store.snapshot();
-        if (JsonUtil.getLong(request.json(), "term", -1) != latest.term()) {
+        MetadataSnapshot latest = publishedSnapshot;
+        // 补丁历史仍由写锁保护。在途写入期间用协议已有的完整快照回退，不读取尚未
+        // 发布的版本，也不等待持锁的压缩/force；随后新补丁会继续按版本顺序广播。
+        if (checkpoints.isPending() || JsonUtil.getLong(request.json(), "term", -1) != latest.term()) {
             snapshot(connection, request);
             return;
         }
@@ -321,15 +336,16 @@ public final class MetadataService implements AutoCloseable {
                         p.getBoolean("eligible"), p.getBoolean("deep"), p.getBoolean("canSkip")));
             }
             sleepReports.put(group, new SleepReport(ticks, List.copyOf(players)));
-            transferSafety.put(group, new SafetyReport(ticks, store.snapshot().term(), report.getBoolean("transferSafe")));
-            if (group.equals(dragonOwner) && report.contains("DragonFight", Tag.TAG_COMPOUND)) {
+            transferSafety.put(group, new SafetyReport(ticks, publishedSnapshot.term(), report.getBoolean("transferSafe")));
+            if (group.equals(dragonOwner) && report.contains("DragonFight", Tag.TAG_COMPOUND)
+                    && !Objects.equals(report.get("DragonFight"), publishedSnapshot.data().get("DragonFight"))) {
                 CompoundTag data = collect();
                 data.put("DragonFight", report.getCompound("DragonFight").copy());
                 commitData(data, UUID.randomUUID().toString(), false);
                 MetadataRuntime.apply(server, store.snapshot().data());
             }
         }
-        JsonObject reply = header(store.snapshot());
+        JsonObject reply = header(publishedSnapshot);
         reply.addProperty("accepted", true);
         connection.send(request.reply(MessageType.METADATA_ACK, reply, null));
     }
@@ -342,8 +358,10 @@ public final class MetadataService implements AutoCloseable {
     private void tick() {
         ticks++;
         try {
+            finishCheckpoints(false);
             String view = groups.primariesSnapshot().toString();
             if (!view.equals(topology)) {
+                finishCheckpoints(true);
                 topology = view;
                 store.advanceTerm();
                 acknowledgements.clear();
@@ -362,17 +380,16 @@ public final class MetadataService implements AutoCloseable {
             if (ticks % 20 == 0) {
                 updateDragonOwner();
                 decideSleep();
-                commitData(collect(), UUID.randomUUID().toString(), true);
+                // 慢盘时至多保留一份在途样本。中间自然时间样本可合并，下一周期重新
+                // 采集最新运行态；不能先采集并排队，否则会覆盖其后执行的离散命令。
+                if (!checkpoints.isPending()) {
+                    commitData(collect(), UUID.randomUUID().toString(), true);
+                }
             }
             if (MetadataRuntime.advanceTraderChance(server) && !traderPending) dispatchTrader();
         } catch (Exception error) {
             // 无法确认权威状态时不继续推进，断开控制面令所有计算端进入暂停门控。
-            LOGGER.error("世界元数据推进/耐久提交失败，关闭元数据会话", error);
-            closed = true;
-            for (UUID primary : groups.primariesSnapshot().values()) {
-                ControlConnection connection = HelloHandler.connectionOf(primary);
-                if (connection != null) connection.close();
-            }
+            failMetadata(error);
         }
     }
 
@@ -447,7 +464,10 @@ public final class MetadataService implements AutoCloseable {
         }));
     }
 
-    CompoundTag collect() {
+    CompoundTag collect() throws IOException {
+        // 只有主线程采集世界对象。先合并已确认的自然检查点，保留其内部路由/镜像字段；
+        // 离散操作可以等待一次在途写入，普通周期采样则由 tick 的单飞检查避免等待。
+        finishCheckpoints(true);
         CompoundTag data = store.snapshot().data();
         CompoundTag captured = MetadataRuntime.capture(server);
         for (String field : new ArrayList<>(data.getAllKeys())) {
@@ -471,6 +491,7 @@ public final class MetadataService implements AutoCloseable {
     }
 
     void commitData(CompoundTag data, String operation, boolean checkpoint) throws IOException {
+        finishCheckpoints(true);
         MetadataSnapshot previous = store.snapshot();
         CompoundTag before = previous.data();
         CompoundTag changed = new CompoundTag();
@@ -481,13 +502,18 @@ public final class MetadataService implements AutoCloseable {
         Set<String> removed = new HashSet<>(before.getAllKeys());
         removed.removeAll(data.getAllKeys());
         if (changed.isEmpty() && removed.isEmpty()) return;
-        MetadataPatch patch = checkpoint ? store.checkpointChanges(changed, removed)
-                : store.commit(previous.worldId(), previous.version(), previous.term(), operation, changed, removed);
+        if (checkpoint) {
+            // changed/removed 是本次采集独占的副本，后台不再访问服务器对象或可变运行态。
+            checkpoints.submit(() -> store.checkpointChanges(changed, removed));
+            return;
+        }
+        MetadataPatch patch = store.commit(previous.worldId(), previous.version(), previous.term(), operation, changed, removed);
         MetadataRuntime.setCommittedData(server, store.snapshot().data());
         publish(patch);
     }
 
     private void publish(MetadataPatch patch) throws IOException {
+        publishedSnapshot = store.snapshot();
         ControlMessage message = ControlMessage.of(MessageType.METADATA_PATCH, header(store.snapshot()),
                 MetadataWire.encode(MetadataWire.patchToTag(patch)));
         for (UUID primary : groups.primariesSnapshot().values()) {
@@ -498,6 +524,7 @@ public final class MetadataService implements AutoCloseable {
 
     private void broadcastSnapshot() throws IOException {
         var snapshot = store.snapshot();
+        publishedSnapshot = snapshot;
         var message = ControlMessage.of(MessageType.METADATA_SNAPSHOT, header(snapshot), MetadataWire.encode(MetadataWire.snapshotToTag(snapshot)));
         for (UUID primary : groups.primariesSnapshot().values()) {
             var connection = HelloHandler.connectionOf(primary);
@@ -529,10 +556,10 @@ public final class MetadataService implements AutoCloseable {
         return header;
     }
 
-    public static CompoundTag committedData() { var service = current; return service == null ? null : service.store.snapshot().data(); }
+    public static CompoundTag committedData() { var service = current; return service == null ? null : service.publishedSnapshot.data(); }
     public static boolean isAuthorityActive(MinecraftServer server) { var service = current; return service != null && service.server == server; }
-    public static long version() { var service = current; return service == null ? -1 : service.store.snapshot().version(); }
-    public static long term() { var service = current; return service == null ? -1 : service.store.snapshot().term(); }
+    public static long version() { var service = current; return service == null ? -1 : service.publishedSnapshot.version(); }
+    public static long term() { var service = current; return service == null ? -1 : service.publishedSnapshot.term(); }
     /** 原COMMAND_RELAY入口仍负责玩家权限校验，此上下文只用于计划事件的稳定路由。 */
     public static void beginLocalCommand(UUID group, UUID player, CommandSourceStack source) {
         var service = current;
@@ -557,8 +584,9 @@ public final class MetadataService implements AutoCloseable {
     public static boolean transferAllowed(UUID group) {
         var service = current;
         if (service == null) return true;
+        if (service.closed || service.checkpoints.isPending()) return false;
         SafetyReport report = service.transferSafety.get(group);
-        return report != null && report.safe() && report.term() == service.store.snapshot().term()
+        return report != null && report.safe() && report.term() == service.publishedSnapshot.term()
                 && service.ticks - report.tick() <= 60;
     }
 
@@ -570,10 +598,47 @@ public final class MetadataService implements AutoCloseable {
         } catch (IOException error) { throw new IllegalStateException("全局命令未能耐久提交", error); }
     }
 
-    @Override public void close() throws IOException {
-        if (current == this) current = null;
-        if (!closed) commitData(collect(), UUID.randomUUID().toString(), true);
+    /** 失败会封停全服务，而不只是丢弃一次自然采样后继续接受更新。 */
+    private void finishCheckpoints(boolean wait) throws IOException {
+        try {
+            if (wait) checkpoints.drain();
+            else checkpoints.poll();
+        } catch (IOException error) {
+            failMetadata(error);
+            throw error;
+        }
+    }
+
+    private void failMetadata(Exception error) {
+        if (closed) return;
+        LOGGER.error("世界元数据推进/耐久提交失败，关闭元数据会话", error);
         closed = true;
-        store.close();
+        for (UUID primary : groups.primariesSnapshot().values()) {
+            ControlConnection connection = HelloHandler.connectionOf(primary);
+            if (connection != null) connection.close();
+        }
+    }
+
+    @Override public void close() throws IOException {
+        IOException failure = null;
+        try {
+            if (!closed) {
+                finishCheckpoints(true);
+                commitData(collect(), UUID.randomUUID().toString(), true);
+            }
+            checkpoints.close(); // 最终采样先耐久完成，随后才允许关闭 WAL 文件句柄。
+        } catch (IOException error) {
+            failure = error;
+            failMetadata(error);
+        } finally {
+            closed = true;
+            if (current == this) current = null;
+            try { store.close(); }
+            catch (IOException error) {
+                if (failure == null) failure = error;
+                else failure.addSuppressed(error);
+            }
+        }
+        if (failure != null) throw failure;
     }
 }
