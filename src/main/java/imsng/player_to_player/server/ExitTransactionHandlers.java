@@ -55,6 +55,9 @@ public final class ExitTransactionHandlers {
 
         default void cancelUnpersisted(ExitManifest manifest) {
         }
+
+        /** 已持久化保护后、退出许可回复前的成员确认；调用时不持HELLO会话条带锁。 */
+        default void awaitHandoff(ExitManifest manifest) { }
     }
 
     public interface ChunkSink {
@@ -113,6 +116,9 @@ public final class ExitTransactionHandlers {
     @FunctionalInterface
     public interface CommitCleanup {
         void cleanup(ExitManifest manifest);
+
+        /** 完成标记已耐久落盘，此后不会再执行 cleanup，可回收其幂等接管状态。 */
+        default void completed(ExitManifest manifest) { }
     }
 
     private final ExitTransactionLedger ledger;
@@ -350,6 +356,8 @@ public final class ExitTransactionHandlers {
             JsonObject out = new JsonObject();
             java.util.concurrent.atomic.AtomicReference<ExitManifest> cleanupAfterReply =
                     new java.util.concurrent.atomic.AtomicReference<>();
+            java.util.concurrent.atomic.AtomicReference<ExitManifest> handoffBeforeReply =
+                    new java.util.concurrent.atomic.AtomicReference<>();
             boolean current = sessionGuard.run(connection, () -> {
                 try {
                 UUID currentPeer = connection.peerId();
@@ -383,6 +391,7 @@ public final class ExitTransactionHandlers {
                         // ledger pending 已耐久后再把注册表校准并持久化；失败不回 ACK，
                         // 客户端重放 BEGIN 时会重复保护，不能在半保护状态下断开。
                         pendingProtection.protect(effective);
+                        handoffBeforeReply.set(effective);
                     } else if (newlyAuthorized && !ledger.isProtected(currentPeer)) {
                         pendingProtection.cancelUnpersisted(effective);
                     }
@@ -404,6 +413,18 @@ public final class ExitTransactionHandlers {
                 out.addProperty("committed", false);
             }
             try {
+                ExitManifest handoff = handoffBeforeReply.get();
+                if (current && handoff != null) {
+                    try {
+                        // ACK只依赖网络收包，不能在HELLO条带锁内等：其他成员可能恰好
+                        // 哈希到同一条带，断连/重连会卡住其Netty事件循环并延迟ACK。
+                        pendingProtection.awaitHandoff(handoff);
+                    } catch (RuntimeException failure) {
+                        LOGGER.warn("退出成员等待尚未确认，保留耐久保护并等待BEGIN重试", failure);
+                        out.addProperty("accepted", false);
+                        out.addProperty("committed", false);
+                    }
+                }
                 connection.send(message.reply(MessageType.EXIT_BEGIN, out, null));
                 ExitManifest cleanupManifest = cleanupAfterReply.get();
                 if (cleanupManifest != null) {
@@ -741,6 +762,7 @@ public final class ExitTransactionHandlers {
     /** 调用方已经取得 shutdownId 专属屏障。 */
     private void ensureCleanupCompleteOnce(ExitManifest manifest) {
         if (ledger.isCleanupComplete(manifest.clientId(), manifest.shutdownId())) {
+            cleanup.completed(manifest);
             discardCompletedBestEffort(manifest);
             return;
         }
@@ -765,6 +787,7 @@ public final class ExitTransactionHandlers {
                 manifest.clientId(), manifest.shutdownId())) {
             throw new IllegalStateException("退出事务清理状态落盘失败");
         }
+        cleanup.completed(manifest);
         discardCompletedBestEffort(manifest);
     }
 

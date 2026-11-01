@@ -70,6 +70,7 @@ public final class ConnectionIdentity {
     static void forget(UUID clientId) {
         if (clientId != null) {
             DECLARATIONS.remove(clientId);
+            PermissionRelay.forgetProfile(clientId);
         }
     }
 

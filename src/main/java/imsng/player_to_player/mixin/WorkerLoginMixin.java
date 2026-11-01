@@ -42,6 +42,7 @@ public abstract class WorkerLoginMixin {
         if (!WorkerBootstrap.isWorker()) return original;
         WorkerIdentityTable.Identity identity = player_to_player$workerIdentity;
         if (identity == null) throw new IllegalStateException("子服登录缺少已验证身份");
-        return new GameProfile(identity.playerId(), identity.playerName());
+        // 只重建 UUID/name 会丢弃正版 textures，原版 SkinManager 因而只能显示默认皮肤。
+        return identity.profile();
     }
 }

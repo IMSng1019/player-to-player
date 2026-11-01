@@ -1,4 +1,4 @@
-package imsng.player_to_player.client.mixin;
+package imsng.player_to_player.mixin;
 
 import imsng.player_to_player.group.CommandRelayClient;
 import net.minecraft.network.chat.LastSeenMessages;
@@ -12,8 +12,9 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * 玩家指令的拦截面（Phase 4 全量上链；口径见
- * {@code docs/plans/2026-10-15-command-routing-fix-plan.md} 附录 P）。
+ * 玩家指令的公共服务端拦截面（独立计算进程不会加载 client mixin，故必须位于 main）。
+ * Phase 4 全量上链；口径见
+ * {@code docs/plans/2026-10-15-command-routing-fix-plan.md} 附录 P。
  *
  * <p>注入 {@code ServerGamePacketListenerImpl.performChatCommand}（私有）里
  * <b>本地执行那一次调用之前</b>的 {@code Commands.performCommand} 调用点

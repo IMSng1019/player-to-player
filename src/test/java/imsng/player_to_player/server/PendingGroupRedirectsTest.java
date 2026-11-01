@@ -43,4 +43,16 @@ class PendingGroupRedirectsTest {
         assertNull(redirects.expire(group, old));
         assertSame(current, redirects.ready(group));
     }
+
+    @Test void lateReadinessAndFailureCannotTargetMembersWhoHaveAlreadyChangedGroup() {
+        GroupTable groups = new GroupTable();
+        groups.createGroup(group);
+        UUID member = followers.iterator().next();
+        groups.addSecondary(group, member);
+        var pending = redirects.register(group, followers);
+        assertEquals(followers, pending.currentMembers(group, groups::groupOf));
+        groups.createGroup(member);
+        assertTrue(pending.currentMembers(group, groups::groupOf).isEmpty(),
+                "旧组的READY/超时只能通知仍在该组的成员，不能把已进新世界的人再次切走");
+    }
 }

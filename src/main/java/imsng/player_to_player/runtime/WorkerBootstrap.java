@@ -169,7 +169,8 @@ public final class WorkerBootstrap {
                     handler.handle(new RemoteControl(), forwarded);
                 }
                 case "authorize_socket" -> IDENTITIES.grant(message.json().get("port").getAsInt(),
-                        UUID.fromString(message.json().get("playerId").getAsString()), message.json().get("playerName").getAsString());
+                        PlayerProfileWire.read(UUID.fromString(message.json().get("playerId").getAsString()),
+                                message.json().get("playerName").getAsString(), message.json().get("properties")));
                 case "exit_begin" -> {
                     return GroupRuntime.beginExitDrain(UUID.fromString(message.json().get("shutdownId").getAsString()))
                             .thenApply(manifest -> ControlMessage.of(MessageType.WORKER_EVENT, manifest.toJson()));

@@ -16,6 +16,9 @@ import java.util.UUID;
 
 /** 已校验环境到独立计算实例的安装边界。 */
 public final class RuntimeInstallation {
+    /** 只保留本机 Loader 已完成的派生缓存；临时文件、启动依赖和配置不能由旧实例继承。 */
+    private static final Set<String> LOADER_CACHES = Set.of(".fabric/remappedJars", ".fabric/processedMods");
+    private static final String CACHE_IDENTITY = "player-to-player/loader-cache.identity";
     /** 这些值影响组世界演算；网络监听、认证、RCON 等必须由本机宿主控制。 */
     public static final Set<String> WORLD_SETTINGS = Set.of("difficulty", "gamemode", "hardcore",
             "pvp", "view-distance", "simulation-distance", "allow-nether", "spawn-animals",
@@ -33,6 +36,16 @@ public final class RuntimeInstallation {
      */
     public static Path install(Path environment, Path runtime, String worldPath,
                                Map<String, String> properties) throws IOException {
+        return install(environment, runtime, worldPath, properties, "");
+    }
+
+    /**
+     * 同一运行版本重新进入时，保留上一次本机生成的 Fabric 派生缓存，避免每次都重映射
+     * 游戏与预处理模组。完整环境指纹或 Java 运行时变化时自动冷启动；源环境仍重新安装、
+     * 由调用方按冻结清单复验，绝不把旧配置、旧模组或世界状态当作新环境。
+     */
+    public static Path install(Path environment, Path runtime, String worldPath,
+                               Map<String, String> properties, String runtimeHash) throws IOException {
         Path source = environment.toAbsolutePath().normalize();
         Path target = runtime.toAbsolutePath().normalize();
         requireNoLinks(source);
@@ -66,6 +79,7 @@ public final class RuntimeInstallation {
                     return FileVisitResult.CONTINUE;
                 }
             });
+            reuseLoaderCaches(target, staging, runtimeHash);
             writeSettings(staging, properties);
             if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
                 move(target, backup);
@@ -99,6 +113,64 @@ public final class RuntimeInstallation {
         } finally {
             if (Files.exists(staging, LinkOption.NOFOLLOW_LINKS)) removeStaging(staging);
         }
+    }
+
+    private static void reuseLoaderCaches(Path previous, Path staging, String runtimeHash) throws IOException {
+        // 未给出受校验的版本时保留原有冷安装行为。标记放在不参与环境上传的管理目录。
+        if (runtimeHash == null || runtimeHash.isBlank()) return;
+        String identity = cacheIdentity(runtimeHash);
+        Path oldIdentity = previous.resolve(CACHE_IDENTITY);
+        requireNoLinks(oldIdentity);
+        int[] reused = {0};
+        if (Files.isRegularFile(oldIdentity, LinkOption.NOFOLLOW_LINKS)
+                && identity.equals(Files.readString(oldIdentity))) {
+            for (String relative : LOADER_CACHES) {
+                Path source = previous.resolve(relative);
+                if (!Files.exists(source, LinkOption.NOFOLLOW_LINKS)) continue;
+                requireNoLinks(source);
+                if (!Files.isDirectory(source, LinkOption.NOFOLLOW_LINKS))
+                    throw new IOException("本机 Loader 缓存不是普通目录: " + relative);
+                Path destination = staging.resolve(relative);
+                // 冻结源环境若明确带有该路径，以源环境为准，不能用本机内容覆盖它。
+                if (Files.exists(destination, LinkOption.NOFOLLOW_LINKS)) continue;
+                Files.walkFileTree(source, new SimpleFileVisitor<>() {
+                    @Override public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs)
+                            throws IOException {
+                        requireNoLinks(dir);
+                        Files.createDirectories(destination.resolve(source.relativize(dir)));
+                        return FileVisitResult.CONTINUE;
+                    }
+                    @Override public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
+                            throws IOException {
+                        if (!attrs.isRegularFile() || attrs.isSymbolicLink())
+                            throw new IOException("本机 Loader 缓存包含非常规文件: " + source.relativize(file));
+                        // 独立复制，保持 Loader 用于判定缓存新鲜度的mtime；禁止共享可写inode。
+                        Files.copy(file, destination.resolve(source.relativize(file)), StandardCopyOption.COPY_ATTRIBUTES);
+                        reused[0]++;
+                        return FileVisitResult.CONTINUE;
+                    }
+                });
+            }
+        }
+        org.slf4j.LoggerFactory.getLogger("player_to_player/runtime")
+                .info("运行环境安装: 本机 Loader 缓存复用文件数={}", reused[0]);
+    }
+
+    /**
+     * 只有计算进程完成真实 READY、权限重放与元数据确认后才认证本次缓存。
+     * 安装目录刚写完不代表 Loader 完成，进程崩溃/取消留下的半成品下次必须冷重建。
+     */
+    public static void markReady(Path runtime, String runtimeHash) throws IOException {
+        if (runtimeHash == null || runtimeHash.isBlank()) return;
+        Path marker = runtime.toAbsolutePath().normalize().resolve(CACHE_IDENTITY);
+        requireNoLinks(marker);
+        Files.createDirectories(marker.getParent());
+        Files.writeString(marker, cacheIdentity(runtimeHash));
+    }
+
+    private static String cacheIdentity(String runtimeHash) {
+        return runtimeHash + "\n" + System.getProperty("java.runtime.version", "")
+                + "\n" + System.getProperty("java.vendor", "") + "\n" + System.getProperty("java.vm.name", "");
     }
 
     private static String normalizedWorldPath(String path) throws IOException {

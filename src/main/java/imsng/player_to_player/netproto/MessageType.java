@@ -190,7 +190,9 @@ public enum MessageType {
     CHAT_RELAY(71),
     /**
      * 权限下发（S→C，单向，无应答）：把<b>该组全部成员</b>在物理服务端 ops 名单上的
-     * 真实权限等级推给该组主客户端（json: groupId, members:[{uuid, name, level}]）。
+     * 真实权限等级推给该组全部成员（json: groupId, members:[{uuid, name, level, properties?}],
+     * onlinePlayers?:[{uuid, name}]）。properties 为原版认证资料；onlinePlayers 只用于跨组补全。
+     * 两个字段均为加性字段，旧节点可忽略；权限仍只授权 members 中的本组成员。
      * <p>
      * 主客户端据此在<b>自己的集成服务端</b>里按名单精确落权（本地权限位 = 真实等级，
      * 不做钳制）—— F3+F4 的游戏模式切换、指令补全树、以及未被拦截的执行路径

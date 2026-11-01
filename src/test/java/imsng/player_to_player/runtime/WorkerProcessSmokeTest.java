@@ -129,10 +129,36 @@ class WorkerProcessSmokeTest {
                 assertEquals(0, readVarInt(new DataInputStream(new ByteArrayInputStream(readFrame(unauthorized)))));
             }
             int bridge = WorkerProcess.openLocalPlayerBridge();
+            // 用中心服同格式的已认证资料驱动父进程缓存、IPC授权与真实原版登录包。
+            // 此处不访问真实账号；验证签名原样传输，签名真伪仍由原版客户端负责校验。
+            var profile = new com.mojang.authlib.GameProfile(context.clientId(), context.playerName());
+            profile.getProperties().put("textures", new com.mojang.authlib.properties.Property(
+                    "textures", "signed-skin-fixture", "mojang-signature-fixture"));
+            JsonObject member = new JsonObject();
+            member.addProperty("uuid", context.clientId().toString());
+            member.addProperty("name", context.playerName());
+            member.addProperty("level", 2);
+            member.add("properties", PlayerProfileWire.properties(profile));
+            var members = new com.google.gson.JsonArray(); members.add(member);
+            JsonObject permissions = new JsonObject();
+            permissions.addProperty("groupId", context.groupId().toString()); permissions.add("members", members);
+            JsonObject oldGroup = permissions.deepCopy();
+            oldGroup.addProperty("groupId", UUID.randomUUID().toString());
+            WorkerProcess.updatePermissions(oldGroup);
             try (Socket authorized = new Socket("127.0.0.1", bridge)) {
-                authorized.setSoTimeout(15000);
+                authorized.setSoTimeout(300);
                 loginHello(authorized, bridge, context.playerName(), UUID.randomUUID());
-                assertEquals(context.clientId(), readLoginIdentity(authorized));
+                assertThrows(java.net.SocketTimeoutException.class, () -> authorized.getInputStream().read(),
+                        "新主不能用旧组名单或空profile先行登录；应等待本组已认证资料");
+                WorkerProcess.updatePermissions(permissions);
+                authorized.setSoTimeout(15000);
+                var loginProfile = readLoginProfile(authorized);
+                assertEquals(context.clientId(), loginProfile.getId());
+                assertEquals(context.playerName(), loginProfile.getName());
+                var textures = loginProfile.getProperties().get("textures");
+                assertEquals(1, textures.size(), "真实登录包必须保留签名皮肤属性");
+                assertEquals("signed-skin-fixture", textures.iterator().next().value());
+                assertEquals("mojang-signature-fixture", textures.iterator().next().signature());
             }
             assertEquals(0, claims.get(), "没有玩家时子服不得申请原版出生点常加载区块");
             // 用已持久化的权威玩家文件驱动真正的child退出尾部发布，核对stop事件和
@@ -247,7 +273,7 @@ class WorkerProcessSmokeTest {
         out.writeLong(claimedId.getMostSignificantBits()); out.writeLong(claimedId.getLeastSignificantBits());
         writeFrame(socket, bytes.toByteArray());
     }
-    private static UUID readLoginIdentity(Socket socket) throws IOException {
+    private static com.mojang.authlib.GameProfile readLoginProfile(Socket socket) throws IOException {
         boolean compression = false;
         for (int packets = 0; packets < 16; packets++) {
             byte[] frame = readFrame(socket);
@@ -257,7 +283,18 @@ class WorkerProcessSmokeTest {
                 input = expanded == 0 ? input : new DataInputStream(new java.util.zip.InflaterInputStream(input));
             }
             int id = readVarInt(input);
-            if (id == 2) return new UUID(input.readLong(), input.readLong());
+            if (id == 2) {
+                UUID playerId = new UUID(input.readLong(), input.readLong());
+                var profile = new com.mojang.authlib.GameProfile(playerId, readString(input));
+                int propertyCount = readVarInt(input);
+                if (propertyCount < 0 || propertyCount > 16) throw new IOException("非法测试profile属性数量");
+                for (int i = 0; i < propertyCount; i++) {
+                    String name = readString(input), value = readString(input);
+                    String signature = input.readBoolean() ? readString(input) : null;
+                    profile.getProperties().put(name, new com.mojang.authlib.properties.Property(name, value, signature));
+                }
+                return profile;
+            }
             if (id == 3) { readVarInt(input); compression = true; continue; }
             if (id == 4) {
                 int query = readVarInt(input);
@@ -288,6 +325,14 @@ class WorkerProcessSmokeTest {
     }
     private static void writeString(DataOutputStream output, String text) throws IOException {
         byte[] bytes = text.getBytes(StandardCharsets.UTF_8); writeVarInt(output, bytes.length); output.write(bytes);
+    }
+
+    private static String readString(DataInputStream input) throws IOException {
+        int size = readVarInt(input);
+        if (size < 0 || size > 32768) throw new IOException("非法测试登录字符串长度");
+        byte[] bytes = input.readNBytes(size);
+        if (bytes.length != size) throw new EOFException();
+        return new String(bytes, StandardCharsets.UTF_8);
     }
 
     private void createServerOnlyFixture(Path jarFile) throws Exception {

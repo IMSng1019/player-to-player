@@ -200,6 +200,9 @@ public final class P2PServerService {
         // 合并/分离协调器（Phase 3）：MERGE_REQUEST/PROGRESS + SPLIT_REQUEST
         MergeCoordinator merges = MergeCoordinator.register(
                 control, config, registry, groups, computes, players, permissions);
+        PrimaryExitHandoff exitHandoff = new PrimaryExitHandoff(config, groups, computes, players,
+                HelloHandler::connectionOf, permissions::push, merges::queueFollowers);
+        merges.setExitHandoffGate(exitHandoff::isExiting);
         // 主客户端耐久退出：pending 元数据先落盘保护组占用，最终数据齐全并刷盘后
         // committed；客户端断线/服务端重启均可用同一 shutdownId 幂等恢复。
         ExitTransactionLedger exitLedger = new ExitTransactionLedger(
@@ -278,15 +281,35 @@ public final class P2PServerService {
                             return null;
                         }
                     }
-                    // 退出冻结与合并/分离不能并行；先中止涉及该组的预同步会话。
-                    merges.abortInvolving(requested.groupId());
-                    Set<imsng.player_to_player.registry.ChunkKey> currentClaims =
-                            new HashSet<>(registry.freezeOrRecoverForExit(
-                                    requested.groupId(), requested.chunks(),
-                                    requested.playerIds(), recoverOrphan));
-                    return new imsng.player_to_player.group.ExitManifest(
-                            requested.shutdownId(), requested.clientId(),
-                            requested.groupId(), currentMembers, currentClaims);
+                    // 先关闭新合并/分离入口，再中止已有会话，避免 abort 与 freeze 之间
+                    // 插入一轮新合并。登记失败或授权失效时只撤销本事务自己的门槛。
+                    exitHandoff.reserve(requested);
+                    try {
+                        merges.abortInvolving(requested.groupId());
+                        if (!recoverOrphan) {
+                            // reserve与ROLE的检查/加成员共用组表写锁；在abort完成后重取
+                            // 最终成员，纳入恰在reserve之前完成准入的玩家，不能沿用旧快照。
+                            currentMembers = groups.withMutationLock(() -> {
+                                if (!peerId.equals(groups.primaryOf(requested.groupId()))) return null;
+                                Set<UUID> members = groups.membersOf(requested.groupId());
+                                return members.containsAll(requested.playerIds()) ? members : null;
+                            });
+                            if (currentMembers == null) {
+                                exitHandoff.cancelUnpersisted(requested);
+                                return null;
+                            }
+                        }
+                        Set<imsng.player_to_player.registry.ChunkKey> currentClaims =
+                                new HashSet<>(registry.freezeOrRecoverForExit(
+                                        requested.groupId(), requested.chunks(),
+                                        requested.playerIds(), recoverOrphan));
+                        return new imsng.player_to_player.group.ExitManifest(
+                                requested.shutdownId(), requested.clientId(),
+                                requested.groupId(), currentMembers, currentClaims);
+                    } catch (RuntimeException failure) {
+                        exitHandoff.cancelUnpersisted(requested);
+                        throw failure;
+                    }
                 },
                 new ExitTransactionHandlers.PendingProtection() {
                     @Override
@@ -296,17 +319,32 @@ public final class P2PServerService {
                     }
 
                     @Override
+                    public void awaitHandoff(imsng.player_to_player.group.ExitManifest manifest) {
+                        // 每个仍在线成员先确认已保留控制会话并退出旧游戏连接；
+                        // 该屏障完成之前不能返回 EXIT_BEGIN 许可原主停止计算进程。
+                        exitHandoff.prepare(manifest);
+                    }
+
+                    @Override
                     public void cancelUnpersisted(
                             imsng.player_to_player.group.ExitManifest manifest) {
                         registry.cancelExitProtection(manifest.groupId());
+                        exitHandoff.cancelUnpersisted(manifest);
                     }
                 },
                 exitPayloads,
                 chunkData::flushAll,
-                manifest -> {
-                    registry.completeExitDurably(
-                            manifest.groupId(), manifest.chunks());
-                    groups.removeClient(manifest.clientId());
+                new ExitTransactionHandlers.CommitCleanup() {
+                    @Override
+                    public void cleanup(imsng.player_to_player.group.ExitManifest manifest) {
+                        exitHandoff.complete(manifest, () -> registry.completeExitDurably(
+                                manifest.groupId(), manifest.chunks()));
+                    }
+
+                    @Override
+                    public void completed(imsng.player_to_player.group.ExitManifest manifest) {
+                        exitHandoff.forget(manifest);
+                    }
                 },
                 imsng.player_to_player.util.ThreadPools.io(),
                 // BEGIN 屏障任务必须与业务帧分池：它排在 io 队列里时，池内等待该屏障的
@@ -331,7 +369,8 @@ public final class P2PServerService {
                             registry.discardDisconnectRecoveryDurably(clientId);
                             exits.awaitPendingBegins(clientId);
                         },
-                        exits::abandonPendingForRejoinNow, players, permissions));
+                        exits::abandonPendingForRejoinNow, players, permissions,
+                        exitHandoff::isExiting));
         // 启动网络入口前恢复 pending 冻结，并补做 committed 的暂存应用/清理。
         // committed 是必须完成的耐久意图，磁盘暂时不可用时不能跳过后开放新会话。
         int recoveryAttempt = 0;

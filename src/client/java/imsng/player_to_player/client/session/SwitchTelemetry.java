@@ -20,18 +20,28 @@ public final class SwitchTelemetry {
         active = new WorkflowTrace(reason, id == null ? UUID.randomUUID().toString() : id);
         joined = false;
         preparingInitialJoin = "join".equals(reason);
-        displayStatus = "split".equals(reason) ? "正在等待原组保存并卸载交接区域" : "正在连接服务端";
+        displayStatus = switch (reason) {
+            case "split" -> "正在等待原组保存并卸载交接区域";
+            case "primary_exit" -> "主客户端正在退出，等待保存后接管组世界";
+            default -> "正在连接服务端";
+        };
     }
 
     public static synchronized void mark(String phase) {
         if (active != null) active.mark(phase);
         displayStatus = switch (phase) {
-            case "env_begin" -> "正在校验和同步世界环境";
-            case "env_ready", "role_begin" -> "正在分配组内角色";
+            case "env_begin", "environment_begin" -> "正在校验和同步世界环境";
+            case "env_ready", "environment_ready", "role_begin" -> "正在分配组内角色";
             case "player_state_begin", "player_state_ready" -> "正在准备玩家状态";
             case "transport_begin", "transport_prepared" -> "正在准备组内连接";
             case "disconnect_begin" -> "正在保存并退出旧世界";
             case "local_load_begin", "login_begin" -> "正在加载目标世界";
+            case "local_save_prepared", "worker_metadata_begin" -> "正在同步世界元数据";
+            case "worker_install_begin" -> "正在准备组世界运行环境";
+            case "worker_verify_begin" -> "正在校验组世界运行文件";
+            case "worker_jvm_started" -> "正在启动组世界，加载模组和数据包";
+            case "worker_server_ready" -> "正在确认组世界权限与最新状态";
+            case "worker_ready" -> "组世界已就绪，正在连接";
             default -> displayStatus;
         };
         if ("disconnect_begin".equals(phase)) preparingInitialJoin = false;

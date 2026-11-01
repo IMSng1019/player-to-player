@@ -1,6 +1,7 @@
 package imsng.player_to_player.runtime;
 
 import com.google.gson.JsonObject;
+import com.mojang.authlib.GameProfile;
 import imsng.player_to_player.core.NodeContext;
 import imsng.player_to_player.group.*;
 import imsng.player_to_player.env.EnvironmentManifest;
@@ -41,7 +42,7 @@ public final class WorkerProcess {
     private static volatile java.util.function.Function<Path, CompletableFuture<Void>> stoppedFlush =
             path -> CompletableFuture.completedFuture(null);
     private static final Object MEMBER_LOCK = new Object();
-    private static volatile Map<UUID, String> members = Map.of();
+    private static volatile Map<UUID, GameProfile> members = Map.of();
     private WorkerProcess() { }
 
     private static final class Session {
@@ -85,18 +86,32 @@ public final class WorkerProcess {
 
     /** 必须在首次 ROLE_REQUEST 前注册，权限提前到达时也缓存并在子服就绪前重放。 */
     public static void registerForwarders(ControlClient client, ControlConnection remote) {
-        registeredRemote = remote;
+        synchronized (MEMBER_LOCK) {
+            registeredRemote = remote;
+            permissions = null;
+            members = Map.of();
+            PlayerDirectory.SESSION.reset();
+            MEMBER_LOCK.notifyAll();
+        }
         client.onDisconnect(connection -> {
+            synchronized (MEMBER_LOCK) {
+                if (connection == remote && registeredRemote == remote) {
+                    registeredRemote = null;
+                    permissions = null;
+                    members = Map.of();
+                    PlayerDirectory.SESSION.reset();
+                    MEMBER_LOCK.notifyAll();
+                }
+            }
             Session session = current;
             if (connection == remote && session != null && session.remote == remote && session.rpc.connection() != null)
                 session.rpc.request("metadata_disconnect", null).exceptionally(error -> {
                     LOGGER.error("中心连接断开后的模拟暂停未获子进程确认", error); return null;
                 });
         });
-        synchronized (MEMBER_LOCK) { permissions = null; members = Map.of(); MEMBER_LOCK.notifyAll(); }
         for (MessageType type : PUSH_TYPES) client.on(type, (connection, message) -> {
             if (registeredRemote != remote) return;
-            if (type == MessageType.PERMISSION_RELAY) cachePermissions(message.json());
+            if (type == MessageType.PERMISSION_RELAY && !cachePermissions(remote, message.json())) return;
             Session session = current;
             if (session != null && session.remote == remote && !session.retired && session.rpc.connection() != null) {
                 session.rpc.request(WorkerEnvelope.wrap("remote_push", message))
@@ -104,16 +119,26 @@ public final class WorkerProcess {
             }
         });
     }
-    private static void cachePermissions(JsonObject json) {
-        Map<UUID, String> next = new HashMap<>();
+    private static boolean cachePermissions(ControlConnection expectedRemote, JsonObject json) {
+        Map<UUID, GameProfile> next = new HashMap<>();
         if (json.has("members")) for (var value : json.getAsJsonArray("members")) {
             JsonObject member = value.getAsJsonObject();
-            next.put(UUID.fromString(member.get("uuid").getAsString()), member.get("name").getAsString());
+            UUID playerId = UUID.fromString(member.get("uuid").getAsString());
+            next.put(playerId, PlayerProfileWire.read(playerId, member.get("name").getAsString(), member.get("properties")));
         }
-        synchronized (MEMBER_LOCK) { permissions = json.deepCopy(); members = Map.copyOf(next); MEMBER_LOCK.notifyAll(); }
+        synchronized (MEMBER_LOCK) {
+            // 解析期间可能已经换服/断线，提交必须与注册及清理共用同一把锁再核对一次。
+            // expectedRemote=null 仅供本机显式更新入口，不用于远端消息分发。
+            if (expectedRemote != null && registeredRemote != expectedRemote) return false;
+            permissions = json.deepCopy();
+            members = Map.copyOf(next);
+            PlayerDirectory.SESSION.update(json);
+            MEMBER_LOCK.notifyAll();
+            return true;
+        }
     }
     public static void updatePermissions(JsonObject json) {
-        cachePermissions(json);
+        cachePermissions(null, json);
         Session session = current;
         if (session != null && session.rpc.connection() != null)
             session.rpc.request(WorkerEnvelope.wrap("remote_push", ControlMessage.of(MessageType.PERMISSION_RELAY, json)));
@@ -146,6 +171,15 @@ public final class WorkerProcess {
                             String saveName, String identity, UUID group, ControlConnection remote,
                             Map<String, String> properties, EnvironmentManifest primaryManifest,
                             String runtimeHash) throws Exception {
+        return start(worldFolder, environment, worldPath, savesRoot, saveName, identity, group, remote,
+                properties, primaryManifest, runtimeHash, phase -> { });
+    }
+
+    /** 启动阶段进度交给宿主显示；公共运行层不引用任何客户端界面类。 */
+    public static int start(Path worldFolder, Path environment, String worldPath, Path savesRoot,
+                            String saveName, String identity, UUID group, ControlConnection remote,
+                            Map<String, String> properties, EnvironmentManifest primaryManifest,
+                            String runtimeHash, Consumer<String> progress) throws Exception {
         Path runtimeRoot = worldFolder.resolve("runtime");
         Session session = new Session(group, remote, runtimeRoot);
         session.saveDirectory = savesRoot.resolve(saveName).toAbsolutePath().normalize();
@@ -153,6 +187,7 @@ public final class WorkerProcess {
             if (current != null) throw new IllegalStateException("旧计算进程尚未结束，拒绝并发打开同一世界");
             current = session;
         }
+        var startup = new imsng.player_to_player.util.WorkflowTrace("worker_start", session.id.toString());
         try {
             session.rpc.register(session.listener);
             session.listener.on(MessageType.HELLO, (connection, message) -> {
@@ -182,6 +217,7 @@ public final class WorkerProcess {
             });
             session.listener.start();
             requireStarting(session);
+            startupPhase(startup, progress, "worker_metadata_begin");
             int gamePort;
             try (ServerSocket reserve = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) { gamePort = reserve.getLocalPort(); }
             Map<String, String> localProperties = new HashMap<>(properties);
@@ -191,9 +227,12 @@ public final class WorkerProcess {
             MetadataFiles.prepareSave(environment.resolve(worldPath), session.saveDirectory, metadata, System.currentTimeMillis());
             applyMetadataProperties(localProperties, metadata);
             localProperties.put("p2p.local-port", Integer.toString(gamePort));
-            Path working = RuntimeInstallation.install(environment, runtimeRoot.resolve("primary"), worldPath, localProperties);
+            startupPhase(startup, progress, "worker_install_begin");
+            Path working = RuntimeInstallation.install(environment, runtimeRoot.resolve("primary"), worldPath,
+                    localProperties, runtimeHash);
             requireStarting(session);
             session.workingDirectory = working;
+            startupPhase(startup, progress, "worker_verify_begin");
             WorkerEnvironmentProof.verifyInstalled(working, savesRoot.resolve(saveName), worldPath, primaryManifest);
             if (runtimeHash == null || runtimeHash.isBlank()) throw new IOException("缺少环境运行版本");
             session.expectedRuntimeHash = runtimeHash;
@@ -226,22 +265,40 @@ public final class WorkerProcess {
                 session.ready.completeExceptionally(error);
                 if (!session.stopped.isDone() && !recoverExitBundle(session)) session.stopped.completeExceptionally(error);
             });
+            startupPhase(startup, progress, "worker_jvm_started");
             int port = session.ready.get(180, TimeUnit.SECONDS);
             requireStarting(session);
             if (port != gamePort) throw new IOException("计算进程报告了不匹配的游戏端口");
+            startupPhase(startup, progress, "worker_server_ready");
             JsonObject cached = permissions;
             if (cached != null) session.rpc.request(WorkerEnvelope.wrap("remote_push",
                     ControlMessage.of(MessageType.PERMISSION_RELAY, cached))).get(20, TimeUnit.SECONDS);
             // READY仅证明服务端已启动；还需通过运行时RPC补齐启动期间的变化并取得中心ACK。
             synchronizeMetadata().get(30, TimeUnit.SECONDS);
             synchronized (session) { requireStarting(session); session.gamePort = port; }
+            try { RuntimeInstallation.markReady(working, runtimeHash); }
+            catch (IOException cacheFailure) {
+                // 缓存只用于下次加速；标记失败按冷启动回退，不能拒绝已安全就绪的世界。
+                LOGGER.warn("本机 Loader 缓存未获复用标记，下次启动将重新生成", cacheFailure);
+            }
+            startupPhase(startup, progress, "worker_ready");
+            startup.finish("ready");
             LOGGER.info("独立计算服务端已就绪: runtime={} port={}", session.id, port);
             return port;
         } catch (Exception error) {
+            startup.finish("failed");
             session.launchFinished.complete(null);
             closeFailed(session);
             throw error;
         } finally { session.launchFinished.complete(null); }
+    }
+
+    private static void startupPhase(imsng.player_to_player.util.WorkflowTrace trace,
+                                     Consumer<String> progress, String phase) {
+        trace.mark(phase);
+        // 界面只是观察者；显示回调异常不得跳过或破坏实际安装、校验与就绪屏障。
+        try { progress.accept(phase); }
+        catch (RuntimeException error) { LOGGER.debug("计算服务端启动进度显示失败: {}", phase, error); }
     }
 
     /** 与 level.dat 重叠的原版启动参数始终取自本次快照，其余运行参数继续用环境预检值。 */
@@ -402,29 +459,28 @@ public final class WorkerProcess {
         Session session = requireSession();
         if (!socket.getInetAddress().isLoopbackAddress() || socket.getPort() != session.gamePort)
             throw new IOException("游戏连接目标不属于当前计算进程");
-        String name;
-        if (playerId.equals(NodeContext.get().clientId())) name = NodeContext.get().playerName();
-        else {
-            // 中心服务的ROLE_ASSIGN/MERGE_COMMIT先于下一server tick的权限名单推送。
-            // 已认证P2P身份可短暂等待权威名单，绝不猜测名字或把时序抖动当永久拒绝。
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-            synchronized (MEMBER_LOCK) {
-                while (true) {
-                    if (current != session || session.retired || session.closing)
-                        throw new IOException("等待授权期间计算进程已切换");
-                    JsonObject cached = permissions;
-                    boolean sameGroup = cached != null && session.group.toString().equals(JsonUtil.getString(cached, "groupId", ""));
-                    name = sameGroup ? members.get(playerId) : null;
-                    if (name != null) break;
-                    long remaining = deadline - System.nanoTime();
-                    if (remaining <= 0) throw new IOException("等待服务端组成员授权超时: " + playerId);
-                    try { TimeUnit.NANOSECONDS.timedWait(MEMBER_LOCK, remaining); }
-                    catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new IOException("等待玩家授权被中断", error); }
-                }
+        GameProfile profile;
+        // ROLE_ASSIGN/MERGE_COMMIT先于下一server tick的权限名单推送。房主本人也必须
+        // 等待本组资料；否则新主可能带着空profile先登录，后来补到的皮肤再也进不了登录包。
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        synchronized (MEMBER_LOCK) {
+            while (true) {
+                if (current != session || session.retired || session.closing)
+                    throw new IOException("等待授权期间计算进程已切换");
+                JsonObject cached = permissions;
+                boolean sameGroup = cached != null && session.group.toString().equals(JsonUtil.getString(cached, "groupId", ""));
+                profile = sameGroup ? members.get(playerId) : null;
+                if (profile != null) break;
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) throw new IOException("等待服务端组成员授权超时: " + playerId);
+                try { TimeUnit.NANOSECONDS.timedWait(MEMBER_LOCK, remaining); }
+                catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new IOException("等待玩家授权被中断", error); }
             }
         }
         JsonObject json = new JsonObject(); json.addProperty("port", socket.getLocalPort());
-        json.addProperty("playerId", playerId.toString()); json.addProperty("playerName", name);
+        json.addProperty("playerId", playerId.toString()); json.addProperty("playerName", profile.getName());
+        // 纹理值和签名来自中心服原版登录资料，与端口授权一起传递，不能仅传 UUID/name。
+        json.add("properties", PlayerProfileWire.properties(profile));
         try { session.rpc.request("authorize_socket", json).get(5, TimeUnit.SECONDS); }
         catch (Exception error) { throw new IOException("游戏连接身份登记失败", error); }
     }

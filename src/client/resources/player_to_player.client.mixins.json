@@ -5,7 +5,7 @@
 	"client": [
 		"ClientLoginAccess",
 		"ConnectScreenMixin",
-		"CommandDispatchMixin",
+		"ClientSuggestionProviderMixin",
 		"MinecraftExitMixin",
 		"PauseScreenAccessor",
 		"PauseScreenExitMixin"

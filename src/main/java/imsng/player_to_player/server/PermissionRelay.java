@@ -6,6 +6,7 @@ import com.mojang.authlib.GameProfile;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.MessageType;
+import imsng.player_to_player.netproto.PlayerProfileWire;
 import imsng.player_to_player.util.ThreadPools;
 import net.minecraft.server.MinecraftServer;
 import org.slf4j.Logger;
@@ -55,6 +56,23 @@ public final class PermissionRelay {
     /** 周期兜底间隔（秒）：ops 名单变化极低频，5 秒足够"服务端 /op 之后立刻能用"。 */
     private static final int SWEEP_INTERVAL_SECONDS = 5;
 
+    /**
+     * 原版物理服登录认证后取得的资料。游戏连接切到组服后原版 PlayerList 会移除玩家，
+     * 因此资料必须保留到控制会话结束，不能在每次下发时只查物理服当前在线实体。
+     */
+    private static final Map<UUID, GameProfile> AUTHENTICATED_PROFILES = new ConcurrentHashMap<>();
+
+    public static void rememberProfile(GameProfile profile) {
+        AUTHENTICATED_PROFILES.put(profile.getId(), PlayerProfileWire.copy(profile));
+    }
+
+    static void forgetProfile(UUID playerId) { AUTHENTICATED_PROFILES.remove(playerId); }
+
+    private static GameProfile profileOf(UUID playerId, String name) {
+        GameProfile profile = AUTHENTICATED_PROFILES.get(playerId);
+        return profile != null && name.equals(profile.getName()) ? profile : new GameProfile(playerId, name);
+    }
+
     /** 名单数组构造（PERMISSION_RELAY 帧与 HELLO_ACK 附带的名单共用）。 */
     private static JsonArray buildMemberArray(List<MemberPermission> list) {
         JsonArray array = new JsonArray();
@@ -63,6 +81,7 @@ public final class PermissionRelay {
             row.addProperty("uuid", member.playerId().toString());
             row.addProperty("name", member.playerName());
             row.addProperty("level", member.level());
+            row.add("properties", PlayerProfileWire.properties(profileOf(member.playerId(), member.playerName())));
             array.add(row);
         }
         return array;
@@ -113,6 +132,7 @@ public final class PermissionRelay {
         }
         lastPushed.clear();
         levelSnapshot.clear();
+        AUTHENTICATED_PROFILES.clear();
     }
 
     /** 该客户端的真实权限等级快照；未收录返回 null（调用方按 0 处理）。 */
@@ -139,7 +159,8 @@ public final class PermissionRelay {
             return;
         }
         lastPushed.remove(groupId);
-        push(groupId);
+        // 角色就绪同时意味着全局在线目录变化，其他组也应马上看到新玩家名字。
+        pushAll();
     }
 
     /** 调度一次下发（任意线程；实际计算在服务器主线程）。 */
@@ -189,9 +210,10 @@ public final class PermissionRelay {
 
     private void sweepNow() {
         Set<UUID> liveMembers = new java.util.HashSet<>();
+        JsonArray directory = onlineDirectory();
         for (UUID groupId : groups.primariesSnapshot().keySet()) {
             liveMembers.addAll(groups.membersOf(groupId));
-            pushNow(groupId);
+            pushNow(groupId, directory);
         }
         // 已解散的组清掉签名、离线的成员清掉等级快照，防 map 无限增长
         lastPushed.keySet().removeIf(groupId -> !groups.exists(groupId));
@@ -200,40 +222,66 @@ public final class PermissionRelay {
 
     /**
      * 计算并下发一个组的权限名单（必须在服务器主线程；幂等，无变化不发）。
-     * 下发给该组<b>主客户端</b>的控制连接 —— 只有它持有集成服务端，落权在它那里做。
+     * 每个成员都接收同一快照：主客户端用于子服落权/认证，副客户端用于本地名字补全。
      */
     private void pushNow(UUID groupId) {
+        pushNow(groupId, onlineDirectory());
+    }
+
+    /** 全局名字来自仍有控制连接的组成员，目录不携带其他组玩家的权限或皮肤。 */
+    private JsonArray onlineDirectory() {
+        java.util.SortedSet<UUID> players = new java.util.TreeSet<>();
+        for (UUID groupId : groups.primariesSnapshot().keySet()) players.addAll(groups.membersOf(groupId));
+        JsonArray directory = new JsonArray();
+        for (UUID playerId : players) {
+            String name = ConnectionIdentity.nameOf(playerId);
+            ControlConnection connection = HelloHandler.connectionOf(playerId);
+            if (name == null || !name.matches("[A-Za-z0-9_]{1,16}") || connection == null || !connection.isOpen()) continue;
+            JsonObject row = new JsonObject();
+            row.addProperty("uuid", playerId.toString());
+            row.addProperty("name", name);
+            directory.add(row);
+        }
+        return directory;
+    }
+
+    private void pushNow(UUID groupId, JsonArray directory) {
         Set<UUID> members = groups.membersOf(groupId);
         if (members.isEmpty()) {
             return;
         }
         List<MemberPermission> list = new ArrayList<>(members.size());
-        StringBuilder signature = new StringBuilder();
-        for (UUID member : members) {
+        for (UUID member : new java.util.TreeSet<>(members)) {
             String name = ConnectionIdentity.nameOf(member);
+            // 新的原版JOIN可能早于旧控制连接cleanup；若旧cleanup删了刚捕获的资料，
+            // 在物理服玩家尚未切离前从真实PlayerList补回。这里本就在服务器主线程。
+            var vanillaPlayer = server.getPlayerList().getPlayer(member);
+            if (vanillaPlayer != null) rememberProfile(vanillaPlayer.getGameProfile());
             // 客户端约定 clientId == 玩家档案 UUID，故这里等价于按玩家档案查 ops 名单
             int level = server.getProfilePermissions(new GameProfile(member,
                     name != null ? name : "?"));
             list.add(new MemberPermission(member, name != null ? name : "?", level));
-            signature.append(member).append(':').append(name).append(':').append(level)
-                    .append(','); // 名字进签名：改名也算变化（落权第二判据是名字）
             levelSnapshot.put(member, level);
         }
-        String sig = signature.toString();
+        JsonObject out = new JsonObject();
+        out.addProperty("groupId", groupId.toString());
+        out.add("members", buildMemberArray(list));
+        out.add("onlinePlayers", directory);
+        // 全局名单和已认证纹理也参与去重：其他组进出、皮肤资料到达都需要推送。
+        String sig = out.toString();
         if (sig.equals(lastPushed.get(groupId))) {
             return; // 无变化：不发（周期兜底因此完全静默）
         }
 
-        UUID primary = groups.primaryOf(groupId);
-        ControlConnection conn = primary != null ? HelloHandler.connectionOf(primary) : null;
-        if (conn == null || !conn.isOpen()) {
-            return; // 主客户端不在线：它重新 HELLO 时会再推
+        boolean sent = false;
+        for (UUID member : members) {
+            ControlConnection conn = HelloHandler.connectionOf(member);
+            if (conn != null && conn.isOpen()) {
+                conn.send(ControlMessage.of(MessageType.PERMISSION_RELAY, out));
+                sent = true;
+            }
         }
-
-        JsonObject out = new JsonObject();
-        out.addProperty("groupId", groupId.toString());
-        out.add("members", buildMemberArray(list));
-        conn.send(ControlMessage.of(MessageType.PERMISSION_RELAY, out));
+        if (!sent) return;
         lastPushed.put(groupId, sig);
         LOGGER.info("权限已下发: 组 {} → {} 名成员（{}）", groupId, list.size(),
                 list.stream().map(m -> m.playerName() + "=" + m.level()).toList());

@@ -21,6 +21,7 @@ import imsng.player_to_player.env.ModPrefixResolver;
 import imsng.player_to_player.group.ChatRelay;
 import imsng.player_to_player.group.CommandRelayClient;
 import imsng.player_to_player.group.GroupRuntime;
+import imsng.player_to_player.group.GroupHandoffPreparation;
 import imsng.player_to_player.group.ExitTransactionClient;
 import imsng.player_to_player.group.LocalPermissions;
 import imsng.player_to_player.group.PlayerDataClient;
@@ -123,6 +124,12 @@ public final class WorldSession {
     /** 分离等待只属于当前物理服会话；迟到通知不能把其他世界切走。 */
     private static volatile UUID pendingSplit;
     private static volatile long pendingSplitDeadline;
+    private static final GroupHandoffPreparation EXIT_HANDOFF = new GroupHandoffPreparation();
+
+    private static void clearPendingTransition() {
+        pendingSplit = null;
+        EXIT_HANDOFF.clear();
+    }
 
     private static void handleSplitPrepare(ControlConnection conn, ControlMessage message) {
         if (!isCurrentConnection(conn)) return;
@@ -132,9 +139,41 @@ public final class WorldSession {
             id = UUID.fromString(JsonUtil.getString(message.json(), "splitId", ""));
             source = UUID.fromString(JsonUtil.getString(message.json(), "groupId", ""));
         } catch (IllegalArgumentException invalid) { return; }
+        boolean primaryExit = "primary_exit".equals(JsonUtil.getString(message.json(), "reason", ""));
         Minecraft client = Minecraft.getInstance();
         client.execute(() -> {
             NodeContext context = NodeContext.get();
+            if (primaryExit) {
+                if (!isCurrentConnection(conn)) return;
+                boolean accepted = false;
+                try {
+                    // ConnectScreen 的半登录连接由原版界面管理，level=null 时切走界面
+                    // 不会取消它；先拒绝本轮，让 EXIT_BEGIN 重试等待登录完成。已经完成
+                    // 的同一交接虽无 level，仍须幂等 ACK，避免丢包导致原主永远无法退出。
+                    if (context.clientRole() == ClientRole.SECONDARY && source.equals(context.groupId())
+                            && (client.level != null || EXIT_HANDOFF.isPrepared())) {
+                        accepted = EXIT_HANDOFF.prepare(id, source, () -> {
+                            pendingSplit = id;
+                            pendingSplitDeadline = System.currentTimeMillis() + 180_000;
+                            SwitchTelemetry.begin("primary_exit", id.toString());
+                            // 必须先在切换作用域内断开旧游戏连接，保留中心控制会话；
+                            // ACK 之后旧主才可停服，不能让普通 DISCONNECT 抢先拆掉本会话。
+                            WorldSwitcher.disconnectForSwitchNow(client);
+                            client.setScreen(new JoinProgressScreen());
+                        });
+                    }
+                } catch (RuntimeException failure) {
+                    clearPendingTransition();
+                    LOGGER.warn("主客户端退出交接准备失败，尚未允许原主停服", failure);
+                }
+                if (!isCurrentConnection(conn)) return;
+                JsonObject acknowledgement = new JsonObject();
+                acknowledgement.addProperty("accepted", accepted);
+                acknowledgement.addProperty("splitId", id.toString());
+                acknowledgement.addProperty("groupId", source.toString());
+                conn.send(message.reply(MessageType.SPLIT_PREPARE, acknowledgement, null));
+                return;
+            }
             if (!isCurrentConnection(conn) || context.clientRole() != ClientRole.SECONDARY
                     || !source.equals(context.groupId()) || id.equals(pendingSplit)) return;
             pendingSplit = id;
@@ -156,7 +195,7 @@ public final class WorldSession {
 
     public static void cancelWaiting() {
         Minecraft client = Minecraft.getInstance();
-        pendingSplit = null;
+        clearPendingTransition();
         teardownSession();
         if (client.level != null) {
             client.level.disconnect();
@@ -182,7 +221,7 @@ public final class WorldSession {
                     && WorldSwitcher.isTunnelAddress(currentServer.ip));
             if (client.level != null && inGroupWorld
                     && !(client.screen instanceof JoinProgressScreen)) return;
-            pendingSplit = null;
+            clearPendingTransition();
             teardownSession();
             if (client.level != null) {
                 client.level.disconnect();
@@ -203,7 +242,7 @@ public final class WorldSession {
         ServerData serverData = client.getCurrentServer();
         if (serverData == null || client.isLocalServer()) {
             if (WorkerProcess.isRunning()) {
-                pendingSplit = null;
+                clearPendingTransition();
                 SwitchTelemetry.joined();
             }
             LOGGER.info("单人或本地联机世界，P2P 会话不启动");
@@ -213,7 +252,7 @@ public final class WorldSession {
         // 副客户端经 127.0.0.1 隧道口连接主客户端（Phase 2）：这是组内连接，
         // 与物理服务端的会话仍然活跃，绝不能对隧道口再开一个会话
         if (WorldSwitcher.isTunnelAddress(rawAddress)) {
-            pendingSplit = null;
+            clearPendingTransition();
             SwitchTelemetry.joined();
             LOGGER.info("经 P2P 隧道加入主客户端组世界，物理服务端会话保持");
             return;
@@ -288,7 +327,7 @@ public final class WorldSession {
             SwitchTelemetry.finish("session_closed");
             EnvironmentLiveUpdates.stop();
             WorkerProcess.closeSession();
-            pendingSplit = null;
+            clearPendingTransition();
             generation++; // 使仍在后台跑的建连/重试流程过期
             ControlClient cc = controlClient;
             controlClient = null;

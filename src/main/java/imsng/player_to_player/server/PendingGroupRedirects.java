@@ -14,6 +14,15 @@ final class PendingGroupRedirects {
         private final Set<UUID> members;
         private Entry(Set<UUID> members) { this.members = Set.copyOf(members); }
         Set<UUID> members() { return members; }
+        Set<UUID> currentMembers(UUID group, java.util.function.Function<UUID, UUID> groupOf) {
+            // READY/超时到达时原成员可能已退出、重新连接或迁入另一组；旧通知不能
+            // 越过当前权威归属把新世界切走。发送者还需在实际send前再核对一次归属。
+            Set<UUID> current = new java.util.HashSet<>();
+            for (UUID member : members) {
+                if (group.equals(groupOf.apply(member))) current.add(member);
+            }
+            return Set.copyOf(current);
+        }
     }
 
     private final Map<UUID, Entry> pending = new ConcurrentHashMap<>();

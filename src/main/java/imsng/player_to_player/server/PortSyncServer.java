@@ -76,6 +76,8 @@ public final class PortSyncServer {
         if (player == null) {
             return;
         }
+        // 此处取得的是原版登录流程已经认证的 profile，必须在切离物理服前保留纹理签名。
+        PermissionRelay.rememberProfile(player.getGameProfile());
         try {
             ServerPlayNetworking.send(player,
                     new PortSyncPacket(ports.controlPort(), ports.relayPort()));

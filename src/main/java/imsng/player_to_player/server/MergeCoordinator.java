@@ -116,6 +116,7 @@ public final class MergeCoordinator {
     private final Map<UUID, MergeSession> sessions = new ConcurrentHashMap<>();
 
     public boolean isTransitioning(UUID group) {
+        if (groupUnavailable.test(group)) return true;
         if (splits.involvesGroup(group)) return true;
         for (MergeSession session : sessions.values())
             if (session.state != State.COMMITTED && session.state != State.ABORTED && session.involves(group)) return true;
@@ -145,6 +146,8 @@ public final class MergeCoordinator {
     /** 权限下发：合并/分离改变组成员后重推两边的名单（本地权限位跟着组走）。 */
     private final PermissionRelay permissions;
     private final SplitCoordinator splits;
+    /** 退出保护开始后不再建立新的合并/分离；直到旧组表退役才解除这一门槛。 */
+    private volatile java.util.function.Predicate<UUID> groupUnavailable;
 
     private MergeCoordinator(GlobalConfig config, ChunkRegistry registry, GroupTable groups,
                              ComputeTable computes, PlayerTable players,
@@ -155,12 +158,20 @@ public final class MergeCoordinator {
         this.computes = computes;
         this.players = players;
         this.permissions = permissions;
+        this.groupUnavailable = registry::isExitFrozen;
         this.splits = new SplitCoordinator(config, registry, groups, computes, players,
-                HelloHandler::connectionOf, permissions::push, (newGroup, followers) -> {
-                    PendingGroupRedirects.Entry pending = pendingRedirects.register(newGroup, followers);
-                    ThreadPools.scheduler().schedule(() -> failPendingRedirects(newGroup, pending),
-                            REDIRECT_FLUSH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-                });
+                HelloHandler::connectionOf, permissions::push, this::queueFollowers);
+    }
+
+    void setExitHandoffGate(java.util.function.Predicate<UUID> exiting) {
+        groupUnavailable = group -> registry.isExitFrozen(group) || exiting.test(group);
+    }
+
+    /** 正常分离与主客户端退出共用就绪屏障，先登记再发布新主角色。 */
+    void queueFollowers(UUID newGroup, Set<UUID> followers) {
+        PendingGroupRedirects.Entry pending = pendingRedirects.register(newGroup, followers);
+        ThreadPools.scheduler().schedule(() -> failPendingRedirects(newGroup, pending),
+                REDIRECT_FLUSH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
 
     /**
@@ -203,6 +214,10 @@ public final class MergeCoordinator {
         }
         if (targetGroup.equals(requesterGroup)) {
             conn.send(error(msg, "self_merge", "不能与本组合并"));
+            return;
+        }
+        if (groupUnavailable.test(requesterGroup) || groupUnavailable.test(targetGroup)) {
+            conn.send(error(msg, "group_exiting", "组正在完成主客户端退出交接，暂不允许合并"));
             return;
         }
         if (splits.involvesGroup(requesterGroup) || splits.involvesGroup(targetGroup)) {
@@ -547,6 +562,10 @@ public final class MergeCoordinator {
     private synchronized void handleSplitRequest(ControlConnection conn, ControlMessage msg) {
         UUID source = conn.peerId();
         if ("prepare".equals(JsonUtil.getString(msg.json(), "phase", ""))) {
+            if (groupUnavailable.test(source)) {
+                conn.send(error(msg, "group_exiting", "组正在完成主客户端退出交接，暂不允许分离"));
+                return;
+            }
             for (MergeSession session : sessions.values()) {
                 if (session.state != State.ABORTED && session.involves(source)) {
                     conn.send(error(msg, "busy", "该组已有合并事务"));
@@ -578,7 +597,7 @@ public final class MergeCoordinator {
         if (pending == null || pending.members().isEmpty()) {
             return;
         }
-        Set<UUID> followers = pending.members();
+        Set<UUID> followers = pending.currentMembers(newGroupId, groups::groupOf);
         UUID newPrimary = groups.primaryOf(newGroupId);
         if (newPrimary == null) {
             LOGGER.warn("重定向冲刷时新组 {} 已不存在，放弃（触发: {}）", newGroupId, cause);
@@ -591,7 +610,7 @@ public final class MergeCoordinator {
         int sent = 0;
         for (UUID follower : followers) {
             ControlConnection c = HelloHandler.connectionOf(follower);
-            if (c != null && c.isOpen()) {
+            if (c != null && c.isOpen() && newGroupId.equals(groups.groupOf(follower))) {
                 c.send(ControlMessage.of(MessageType.ROLE_ASSIGN, assign.deepCopy()));
                 sent++;
             }
@@ -604,12 +623,12 @@ public final class MergeCoordinator {
     private void failPendingRedirects(UUID group, PendingGroupRedirects.Entry expected) {
         PendingGroupRedirects.Entry pending = pendingRedirects.expire(group, expected);
         if (pending == null) return;
-        Set<UUID> followers = pending.members();
+        Set<UUID> followers = pending.currentMembers(group, groups::groupOf);
         JsonObject failure = new JsonObject();
         failure.addProperty("message", "分离后的主客户端尚未就绪，请稍后重新连接。");
         for (UUID member : followers) {
             ControlConnection connection = HelloHandler.connectionOf(member);
-            if (connection != null && connection.isOpen())
+            if (connection != null && connection.isOpen() && group.equals(groups.groupOf(member)))
                 connection.send(ControlMessage.of(MessageType.SPLIT_FAILED, failure.deepCopy()));
         }
     }

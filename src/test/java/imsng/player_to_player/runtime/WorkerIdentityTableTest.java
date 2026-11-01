@@ -6,6 +6,21 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.*;
 
 class WorkerIdentityTableTest {
+    @Test void authenticatedTextureSignatureSurvivesLoginAndIsDetachedFromMutableSource() throws Exception {
+        var profile = new com.mojang.authlib.GameProfile(UUID.randomUUID(), "Alice");
+        profile.getProperties().put("textures", new com.mojang.authlib.properties.Property("textures", "skin-data", "signature"));
+        WorkerIdentityTable table = new WorkerIdentityTable();
+        table.grant(41234, profile);
+        profile.getProperties().clear();
+        var identity = table.consume(new InetSocketAddress("127.0.0.1", 41234), "Alice");
+        assertNotNull(identity);
+        var restored = identity.profile();
+        var texture = restored.getProperties().get("textures").iterator().next();
+        assertEquals("skin-data", texture.value());
+        assertEquals("signature", texture.signature());
+        assertEquals(profile.getId(), restored.getId());
+    }
+
     @Test void loginGrantIsBoundToSocketAndConsumedOnlyOnce() throws Exception {
         Class<?> type = assertDoesNotThrow(() -> Class.forName(
                 "imsng.player_to_player.runtime.WorkerIdentityTable"),

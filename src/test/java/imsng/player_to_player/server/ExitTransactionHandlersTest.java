@@ -381,6 +381,7 @@ class ExitTransactionHandlersTest {
         ExitTransactionLedger ledger = new ExitTransactionLedger(persistence);
         RecordingPayloadStore payloads = new RecordingPayloadStore();
         AtomicInteger cleanups = new AtomicInteger();
+        AtomicInteger finalized = new AtomicInteger();
         ExitTransactionHandlers handlers = new ExitTransactionHandlers(
                 ledger,
                 (peer, requested) -> requested,
@@ -389,7 +390,16 @@ class ExitTransactionHandlersTest {
                 payloads,
                 () -> {
                 },
-                ignored -> cleanups.incrementAndGet(),
+                new ExitTransactionHandlers.CommitCleanup() {
+                    @Override
+                    public void cleanup(ExitManifest value) { cleanups.incrementAndGet(); }
+                    @Override
+                    public void completed(ExitManifest value) {
+                        assertTrue(ledger.isCleanupComplete(value.clientId(), value.shutdownId()),
+                                "只有cleanupComplete已耐久落盘，才允许回收防重放接管记录");
+                        finalized.incrementAndGet();
+                    }
+                },
                 Runnable::run);
         FakeRegistry registry = new FakeRegistry();
         handlers.register(registry);
@@ -402,12 +412,48 @@ class ExitTransactionHandlersTest {
         registry.handle(connection, ControlMessage.of(
                 MessageType.EXIT_COMMIT, commitJson(Set.of(CHUNK))));
         assertFalse(connection.last().json().get("committed").getAsBoolean());
+        assertEquals(0, finalized.get(), "完成标记落盘失败时必须无限期保留接管阶段");
         registry.handle(connection, ControlMessage.of(
                 MessageType.EXIT_COMMIT, commitJson(Set.of(CHUNK))));
 
         assertTrue(connection.last().json().get("committed").getAsBoolean());
         assertEquals(1, payloads.applies);
         assertEquals(2, cleanups.get());
+        assertEquals(1, finalized.get());
+    }
+
+    @Test
+    void handoffAcknowledgementsWaitOutsideSessionLockAndBeforeBeginReply() throws Exception {
+        ExitTransactionLedger ledger = new ExitTransactionLedger(new InMemoryPersistence());
+        java.util.concurrent.atomic.AtomicBoolean locked = new java.util.concurrent.atomic.AtomicBoolean();
+        AtomicInteger waits = new AtomicInteger();
+        FakeConnection connection = new FakeConnection(CLIENT_ID);
+        ExitTransactionHandlers handlers = new ExitTransactionHandlers(ledger,
+                (peer, requested) -> requested,
+                new ExitTransactionHandlers.PendingProtection() {
+                    @Override
+                    public void protect(ExitManifest value) { assertTrue(locked.get()); }
+                    @Override
+                    public void awaitHandoff(ExitManifest value) {
+                        assertFalse(locked.get(), "不能持HELLO条带锁等待其他成员的网络ACK");
+                        assertTrue(ledger.isProtected(CLIENT_ID));
+                        assertEquals(waits.get(), connection.sent.size(), "成员确认之前不能回BEGIN许可");
+                        if (waits.incrementAndGet() == 1) throw new IllegalStateException("ACK not ready");
+                    }
+                }, new RecordingPayloadStore(), () -> { }, ignored -> { }, Runnable::run,
+                (active, action) -> {
+                    locked.set(true);
+                    try { return action.getAsBoolean(); }
+                    finally { locked.set(false); }
+                });
+        FakeRegistry registry = new FakeRegistry();
+        handlers.register(registry);
+        registry.handle(connection, ControlMessage.of(MessageType.EXIT_BEGIN, manifest().toJson()));
+        assertFalse(connection.last().json().get("accepted").getAsBoolean());
+        assertTrue(ledger.isProtected(CLIENT_ID), "ACK未确认时保留耐久退出，重试不能放开旧所有权");
+        registry.handle(connection, ControlMessage.of(MessageType.EXIT_BEGIN, manifest().toJson()));
+        assertTrue(connection.last().json().get("accepted").getAsBoolean());
+        assertEquals(2, waits.get());
     }
 
     @Test

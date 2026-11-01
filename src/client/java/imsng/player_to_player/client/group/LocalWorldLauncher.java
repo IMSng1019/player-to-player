@@ -111,7 +111,10 @@ public final class LocalWorldLauncher {
                         world.savesRoot(), world.saveName(), world.worldIdentity(), groupId, conn,
                         WorldSession.runtimeProperties(),
                         EnvironmentPreflightClient.prepared().environments().primaryManifest(),
-                        EnvironmentPreflightClient.prepared().info().runtimeHash());
+                        EnvironmentPreflightClient.prepared().info().runtimeHash(), phase -> {
+                            // 取消后迟到的旧 JVM 进度不能覆盖新世界的准备提示。
+                            if (WorldSession.isCurrentConnection(conn)) SwitchTelemetry.mark(phase);
+                        });
                 if (!WorldSession.isCurrentConnection(conn)) { WorkerProcess.closeSession(); return; }
                 GroupHost.startWorker(gamePort, conn, groupId);
                 int bridgePort = WorkerProcess.openLocalPlayerBridge();

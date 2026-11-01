@@ -9,6 +9,8 @@
 		"ChunkMapSplitAccess",
 		"ChunkStorageMixin",
 		"DistanceManagerAccess",
+		"CommandDispatchMixin",
+		"CommandSourceSuggestionsMixin",
 		"DedicatedServerConsoleMixin",
 		"EntityPortalMixin",
 		"MinecraftServerMixin",

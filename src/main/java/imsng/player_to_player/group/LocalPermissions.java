@@ -92,6 +92,7 @@ public final class LocalPermissions {
             return; // 入站数据不可信：缺字段直接忽略，保持旧名单
         }
         STATE.replace(group, next);
+        PlayerDirectory.SESSION.update(json);
         LOGGER.info("收到权限名单: 组 {} → {} 名成员", group, next.size());
         applyScheduled(GroupRuntime.server());
     }
@@ -128,6 +129,7 @@ public final class LocalPermissions {
     /** 会话拆除时清缓存（条目本身随集成服务端实例销毁，无需文件清理）。 */
     public static void reset() {
         STATE.resetSession();
+        PlayerDirectory.SESSION.reset();
         JOIN_RECHECKS.clear();
     }
 

@@ -74,12 +74,23 @@ public final class RoleAssignHandler implements MessageHandler {
     private final PlayerTable players;
     /** 权限下发：组成员变化后重推该组名单（本地权限位按名单落地）。 */
     private final PermissionRelay permissions;
+    private final java.util.function.Predicate<UUID> groupExiting;
 
     public RoleAssignHandler(MinecraftServer server, GlobalConfig config, ChunkRegistry registry,
                              GroupTable groups, ComputeTable computeTable,
                              Consumer<UUID> awaitPendingExit,
                              ToIntFunction<UUID> abandonPendingExitNow,
                              PlayerTable players, PermissionRelay permissions) {
+        this(server, config, registry, groups, computeTable, awaitPendingExit,
+                abandonPendingExitNow, players, permissions, registry::isExitFrozen);
+    }
+
+    public RoleAssignHandler(MinecraftServer server, GlobalConfig config, ChunkRegistry registry,
+                             GroupTable groups, ComputeTable computeTable,
+                             Consumer<UUID> awaitPendingExit,
+                             ToIntFunction<UUID> abandonPendingExitNow,
+                             PlayerTable players, PermissionRelay permissions,
+                             java.util.function.Predicate<UUID> groupExiting) {
         this.server = server;
         this.config = config;
         this.registry = registry;
@@ -89,6 +100,7 @@ public final class RoleAssignHandler implements MessageHandler {
         this.abandonPendingExitNow = abandonPendingExitNow;
         this.players = players;
         this.permissions = permissions;
+        this.groupExiting = groupExiting;
     }
 
     @Override
@@ -241,7 +253,9 @@ public final class RoleAssignHandler implements MessageHandler {
     /** 单区块的在线占用组；空闲/离线/是请求方自己则返回 null。 */
     private UUID onlineOwnerOf(ChunkKey key, UUID peer) {
         UUID owner = registry.ownerOf(key);
-        if (owner == null || owner.equals(peer) || !groups.exists(owner)) {
+        // 退出清单已固定，不能再向即将停服的旧主塞入未收到等待通知的新成员。
+        if (owner == null || owner.equals(peer) || !groups.exists(owner)
+                || registry.isExitFrozen(owner) || groupExiting.test(owner)) {
             return null;
         }
         UUID primary = groups.primaryOf(owner);

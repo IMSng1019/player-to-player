@@ -1,5 +1,7 @@
 package imsng.player_to_player.runtime;
 
+import com.mojang.authlib.GameProfile;
+import imsng.player_to_player.netproto.PlayerProfileWire;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.Map;
@@ -13,11 +15,23 @@ import java.util.concurrent.TimeUnit;
  * 这保留全部原版/模组登录字节，同时避免离线 UUID 导致权威玩家背包和权限错位。
  */
 public final class WorkerIdentityTable {
-    public record Identity(UUID playerId, String playerName) { }
+    public record Identity(GameProfile profile) {
+        public Identity { profile = PlayerProfileWire.copy(profile); }
+        public UUID playerId() { return profile.getId(); }
+        public String playerName() { return profile.getName(); }
+        /** 不把缓存的可变 PropertyMap 暴露给原版或其他模组。 */
+        @Override public GameProfile profile() { return PlayerProfileWire.copy(profile); }
+    }
     private record Grant(Identity identity, long expires) { }
     private final Map<Integer, Grant> grants = new ConcurrentHashMap<>();
 
     public void grant(int port, UUID playerId, String playerName) {
+        grant(port, new GameProfile(playerId, playerName));
+    }
+
+    public void grant(int port, GameProfile profile) {
+        UUID playerId = profile.getId();
+        String playerName = profile.getName();
         if (port <= 0 || port > 65535 || playerId == null || playerName == null
                 || !playerName.matches("[A-Za-z0-9_]{1,16}")) {
             throw new IllegalArgumentException("非法的游戏连接身份");
@@ -25,7 +39,7 @@ public final class WorkerIdentityTable {
         long now = System.nanoTime();
         grants.entrySet().removeIf(entry -> entry.getValue().expires < now);
         if (grants.size() >= 256) throw new IllegalStateException("待登录授权数量过多");
-        grants.put(port, new Grant(new Identity(playerId, playerName),
+        grants.put(port, new Grant(new Identity(profile),
                 now + TimeUnit.SECONDS.toNanos(30)));
     }
 
