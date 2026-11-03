@@ -73,7 +73,7 @@ import java.util.concurrent.CompletableFuture;
  * 本实现复用耐久写回与加载门控，因此会有明确的等待阶段；完整影子实例热备仍是
  * 后续架构工作。超时不强制移交所有权，改走排空后回滚，避免旧副本继续写入。
  * <p>
- * 线程模型：{@link #tick} 在集成服务端主线程（GroupServerHooks 每秒驱动一次），
+ * 线程模型：{@link #tick} 在集成服务端主线程（GroupServerHooks 约每秒驱动一次），
  * 只做矩形运算与计时；序列化在主线程（微秒级），上传/请求转 io 池。
  */
 public final class SplitMonitor {
@@ -89,8 +89,12 @@ public final class SplitMonitor {
     /** 源端准备过久时请求回滚；仍须排空旧holder后才能重连，服务端超时会展示明确失败界面。 */
     private static final long DRAIN_TIMEOUT_MILLIS = 60_000;
 
-    /** 候选计时：分量签名（成员 UUID 有序拼接）→ 首次检测到的时刻（仅主线程读写）。 */
-    private static final Map<String, Long> candidates = new HashMap<>();
+    /** 连续远离资格不因暂时准备失败重置；重试独立限速，仍不绕过任何迁移安全屏障。 */
+    private static final SplitCandidateTracker candidates = new SplitCandidateTracker(SPLIT_HOLD_MILLIS, 2_000);
+
+    /** 短重试不能把同一延期原因每两秒刷入日志；按候选与原因保留首条及每三十秒一条。 */
+    private record DeferredDiagnostic(String reason, long loggedAt) { }
+    private static final Map<String, DeferredDiagnostic> deferredDiagnostics = new HashMap<>();
 
     /** 分离请求已在途的分量签名（防重复发送；主线程标记，io 完成后回主线程摘除）。 */
     private static final Set<String> inFlight = new HashSet<>();
@@ -148,16 +152,20 @@ public final class SplitMonitor {
     /** 世界会话拆除时清空计时状态（幂等）。 */
     public static void reset() {
         candidates.clear();
+        deferredDiagnostics.clear();
         inFlight.clear();
         activeSplit = null;
     }
 
     /**
-     * 每秒一轮的分离检测（集成服务端主线程，GroupServerHooks 驱动；
+     * 约每秒一轮的分离检测（集成服务端主线程，GroupServerHooks 驱动；
      * 调用方已确认 server 是被接管的集成服务端）。
      */
     public static void tick(MinecraftServer server) {
         if (activeSplit != null) {
+            // prepare应答可能等待数秒；此时玩家仍在旧世界活动，必须继续观察接近或成员变化。
+            // 只采样和撤销旧资格，不允许第二笔事务；prepared后玩家已开始离组，按事务推进即可。
+            if (!activeSplit.prepared) sampleDepartingComponents(server);
             advanceSplit(server);
             return;
         }
@@ -167,46 +175,56 @@ public final class SplitMonitor {
         if (claims == null || conn == null || !conn.isOpen() || groupId == null) {
             return;
         }
-        List<ServerPlayer> players = server.getPlayerList().getPlayers();
-        if (players.size() < 2) {
-            candidates.clear(); // 只剩主客户端本人，无从分离
-            return;
-        }
-        UUID hostId = NodeContext.get().clientId(); // 主客户端的控制协议档案身份
-        if (players.stream().anyMatch(player -> canonicalId(player) == null)) {
-            candidates.clear(); // 名单尚未到达：不能凭离线UUID把玩家分到错误组。
-            return;
-        }
+        List<List<ServerPlayer>> components = sampleDepartingComponents(server);
         int viewDistance = server.getPlayerList().getViewDistance();
-        long now = System.currentTimeMillis();
-
-        // 连通分量划分（组内玩家数量级为个位数，O(n²) 并查集足够）
-        List<List<ServerPlayer>> components = computeComponents(players, viewDistance);
-        if (components.size() <= 1) {
-            candidates.clear(); // 全组仍连通：所有计时归零（规范要求"持续"）
-            return;
-        }
-        // 主客户端所在分量留守；其余每个分量都是独立的离组候选
-        Set<String> currentSignatures = new HashSet<>();
+        long now = System.nanoTime() / 1_000_000;
         for (List<ServerPlayer> component : components) {
-            if (component.stream().anyMatch(p -> hostId.equals(canonicalId(p)))) {
-                continue;
-            }
             String signature = signatureOf(component);
-            currentSignatures.add(signature);
-            if (inFlight.contains(signature)) {
-                continue;
-            }
-            Long since = candidates.putIfAbsent(signature, now);
-            if (since != null && now - since >= SPLIT_HOLD_MILLIS) {
-                candidates.remove(signature);
+            if (inFlight.contains(signature)) continue;
+            if (candidates.tryBegin(signature, now)) {
                 inFlight.add(signature);
                 initiateSplit(server, conn, claims, groupId, signature, component, viewDistance);
                 if (activeSplit != null) break;
             }
         }
-        // 成员构成变化 / 分量消失：对应计时归零
-        candidates.keySet().retainAll(currentSignatures);
+    }
+
+    /** 普通检测与prepare在途时共用拓扑采样，接近后再次远离必须重新取得十秒连续资格。 */
+    private static List<List<ServerPlayer>> sampleDepartingComponents(MinecraftServer server) {
+        List<ServerPlayer> players = server.getPlayerList().getPlayers();
+        if (players.size() < 2) {
+            candidates.clear(); // 只剩主客户端本人，无从分离
+            deferredDiagnostics.clear();
+            return List.of();
+        }
+        UUID hostId = NodeContext.get().clientId(); // 主客户端的控制协议档案身份
+        if (players.stream().anyMatch(player -> canonicalId(player) == null)) {
+            candidates.clear(); // 名单尚未到达：不能凭离线UUID把玩家分到错误组。
+            deferredDiagnostics.clear();
+            return List.of();
+        }
+        int viewDistance = server.getPlayerList().getViewDistance();
+
+        // 连通分量划分（组内玩家数量级为个位数，O(n²) 并查集足够）
+        List<List<ServerPlayer>> components = computeComponents(players, viewDistance);
+        if (components.size() <= 1) {
+            candidates.clear(); // 全组仍连通：所有计时归零（规范要求"持续"）
+            deferredDiagnostics.clear();
+            return List.of();
+        }
+        // 先收集全部候选再尝试准备：即使首个分量开始事务，也不能因提前break丢掉其他分量。
+        Set<String> currentSignatures = new HashSet<>();
+        List<List<ServerPlayer>> departing = new ArrayList<>();
+        for (List<ServerPlayer> component : components) {
+            if (component.stream().anyMatch(p -> hostId.equals(canonicalId(p)))) {
+                continue;
+            }
+            currentSignatures.add(signatureOf(component));
+            departing.add(component);
+        }
+        candidates.retainAll(currentSignatures);
+        deferredDiagnostics.keySet().retainAll(currentSignatures);
+        return departing;
     }
 
     // ------------------------------------------------------------ 判定
@@ -289,7 +307,7 @@ public final class SplitMonitor {
         String unsafeMetadata = metadataRejection(server, null);
         if (unsafeMetadata != null) {
             inFlight.remove(signature);
-            LOGGER.info("分离延期，保持原组运行: {}", unsafeMetadata);
+            logDeferred(signature, unsafeMetadata);
             return;
         }
         MetadataSnapshot metadata = MetadataClient.snapshot();
@@ -315,12 +333,12 @@ public final class SplitMonitor {
                     remainingDemand, specialTicketRegions(server));
         } catch (IllegalArgumentException | IllegalStateException unsafeTickets) {
             inFlight.remove(signature);
-            LOGGER.warn("分离延期：无法安全规划特殊票据范围: {}", unsafeTickets.toString());
+            logDeferred(signature, "无法安全规划特殊票据范围: " + unsafeTickets);
             return;
         }
         if (planned.isEmpty()) {
             inFlight.remove(signature);
-            LOGGER.info("分离延期：完整加载岛仍与留组需求或特殊票据相连，保持当前组");
+            logDeferred(signature, "完整加载岛仍与留组需求或特殊票据相连，或尚无可交接的占用区域");
             return;
         }
         SplitOperation operation = new SplitOperation(server, conn, claims, groupId,
@@ -512,8 +530,9 @@ public final class SplitMonitor {
             if (!operation.prepared && ("prepare".equals(sentPhase)
                     || ("status".equals(sentPhase) && "unknown_split".equals(code)))) {
                 // 服务端明确拒绝prepare时未创建事务/暂停玩家，和网络超时的未知结果不同。
-                LOGGER.info("分离准备被拒，保持原组: split={} code={}", operation.splitId, code);
-                finishSplit(operation, false);
+                logDeferred(operation.signature, "分离准备被拒: " + code);
+                // 未建立准备事务，玩家和拓扑没有切换；短暂元数据/边界繁忙不能抹掉十秒资格。
+                finishSplit(operation, false, false);
                 return;
             }
             if ("commit".equals(sentPhase)) {
@@ -534,10 +553,12 @@ public final class SplitMonitor {
         String phase = JsonUtil.getString(reply.json(), "phase", "");
         operation.resolveStatus = false;
         if ("committed".equals(phase)) {
-            finishSplit(operation, true);
-        } else if ("cancelled".equals(phase) || "rollback".equals(phase)
-                || (!JsonUtil.getBoolean(reply.json(), "granted", false) && "prepare".equals(sentPhase))) {
-            finishSplit(operation, false);
+            finishSplit(operation, true, true);
+        } else if ("cancelled".equals(phase) || "rollback".equals(phase)) {
+            finishSplit(operation, false, true);
+        } else if (!JsonUtil.getBoolean(reply.json(), "granted", false) && "prepare".equals(sentPhase)) {
+            logDeferred(operation.signature, "分离准备未获批准");
+            finishSplit(operation, false, false);
         } else if ("prepared".equals(phase) || "cancel_requested".equals(phase)) {
             if (!operation.prepared) {
                 operation.prepared = true;
@@ -567,14 +588,26 @@ public final class SplitMonitor {
         }
     }
 
-    private static void finishSplit(SplitOperation operation, boolean committed) {
+    private static void finishSplit(SplitOperation operation, boolean committed, boolean resetCandidates) {
         if (operation.drainStarted) operation.claims.cancelSplitDrain();
         if (operation.ownsTickFreeze && !GroupRuntime.isExitDraining()) GroupRuntime.setTickFrozen(false);
         activeSplit = null;
         inFlight.remove(operation.signature);
-        candidates.clear();
+        if (resetCandidates) {
+            candidates.clear();
+            deferredDiagnostics.clear();
+        }
+        if (!resetCandidates) return; // 未创建事务的拒绝已通过节流日志记录，不误报“回滚完成”。
         LOGGER.info("分离事务{}: split={} 离组人数={}（旧区块经最终写回释放，无直接所有权迁移）",
                 committed ? "提交完成" : "已回滚", operation.splitId, operation.departing.size());
+    }
+
+    private static void logDeferred(String signature, String reason) {
+        long now = System.nanoTime() / 1_000_000;
+        DeferredDiagnostic previous = deferredDiagnostics.get(signature);
+        if (previous != null && previous.reason().equals(reason) && now - previous.loggedAt() < 30_000) return;
+        deferredDiagnostics.put(signature, new DeferredDiagnostic(reason, now));
+        LOGGER.info("分离延期，保持原组运行并短间隔重试: members={} reason={}", signature, reason);
     }
 
     /** 本地真实运行对象是最终依据，不能把中心最近一次字段报告当作当前复活中间态的证明。 */

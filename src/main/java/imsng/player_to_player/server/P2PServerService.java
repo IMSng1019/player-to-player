@@ -285,7 +285,9 @@ public final class P2PServerService {
                     // 插入一轮新合并。登记失败或授权失效时只撤销本事务自己的门槛。
                     exitHandoff.reserve(requested);
                     try {
-                        merges.abortInvolving(requested.groupId());
+                        // 正常退出接替未提交的分离等待；异常断线的 abortInvolving 会给
+                        // 离组成员发送 SPLIT_FAILED，导致其先退出控制会话而漏掉接管。
+                        merges.preparePrimaryExit(requested.groupId());
                         if (!recoverOrphan) {
                             // reserve与ROLE的检查/加成员共用组表写锁；在abort完成后重取
                             // 最终成员，纳入恰在reserve之前完成准入的玩家，不能沿用旧快照。

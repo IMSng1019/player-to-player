@@ -92,6 +92,56 @@ class SplitCoordinatorTest {
         assertEquals("cancel_requested", connections.get(source).last().json().get("phase").getAsString());
     }
 
+    @Test void normalPrimaryExitTakesOverPreparedSplitWithoutDisconnectingWaitingMembers() {
+        registry.tryClaim(chunk, source);
+        send("prepare");
+        // 复现现场：离组端已退出游戏连接等待分离，原主此时开始正常退出。
+        // 正常退出应继续把这些在线成员纳入接管，不能先用 SPLIT_FAILED 踢掉他们。
+        coordinator.supersedeForPrimaryExit(source);
+
+        assertEquals(MessageType.SPLIT_PREPARE, connections.get(member).last().type(),
+                "正常退出必须接替分离等待，不能关闭成员控制会话");
+        assertEquals(MessageType.SPLIT_PREPARE, connections.get(follower).last().type());
+        assertEquals(source, groups.groupOf(member));
+        assertEquals(source, registry.ownerOf(chunk), "退出耐久提交前原主仍持有区块");
+        send("commit");
+        assertEquals("cancelled", connections.get(source).last().json().get("phase").getAsString());
+        assertEquals(source, groups.groupOf(member), "迟到分离提交不得抢先发布新组");
+        coordinator.requestTimeout(split);
+        coordinator.supersedeForPrimaryExit(source);
+        coordinator.abortInvolving(source);
+        assertEquals(MessageType.SPLIT_PREPARE, connections.get(member).last().type(),
+                "旧超时、重复退出及随后原主断线都不能再给已接替的分离发失败通知");
+        assertFalse(coordinator.involvesGroup(source));
+        assertTrue(registry.tryClaim(new ChunkKey(chunk.dimension(), 1, 0), source).granted(),
+                "旧分离预约已撤销，全部占用后续由退出事务统一冻结和释放");
+    }
+
+    @Test void actualPrimaryDisconnectStillFailsThePreparedSplit() {
+        registry.tryClaim(chunk, source);
+        send("prepare");
+        coordinator.abortInvolving(source);
+        assertEquals(MessageType.SPLIT_FAILED, connections.get(member).last().type());
+        assertEquals(source, registry.ownerOf(chunk), "异常掉线的区块仍须交由耐久清理，不可直接释放");
+    }
+
+    @Test void normalExitCannotCancelASplitThatAlreadyCommitted() {
+        send("prepare");
+        send("commit");
+        UUID newGroup = groups.groupOf(member);
+        int memberNotifications = connections.get(member).messages.size();
+        int followerNotifications = connections.get(follower).messages.size();
+
+        coordinator.supersedeForPrimaryExit(source);
+        coordinator.requestTimeout(split);
+        send("status");
+
+        assertEquals("committed", connections.get(source).last().json().get("phase").getAsString());
+        assertEquals(newGroup, groups.groupOf(member));
+        assertEquals(memberNotifications, connections.get(member).messages.size());
+        assertEquals(followerNotifications, connections.get(follower).messages.size());
+    }
+
     @Test void permissionPushFailureDoesNotReclassifyCommittedSplitOrSkipRolePublication() {
         send("prepare");
         failPermissionPush = true;

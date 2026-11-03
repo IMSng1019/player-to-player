@@ -13,6 +13,39 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 class ClientLocalSettingsTest {
     @TempDir Path root;
 
+    @Test void isolatedClientInheritsAndKeepsItsPersonalMultiplayerServerList() throws Exception {
+        Path launcher = Files.createDirectories(root.resolve("launcher"));
+        // servers.dat 是二进制 NBT；必须逐字节保留，不按 options.txt 的文本格式解析。
+        byte[] original = {10, 0, 0, 9, 0, 7, 115, 101, 114, 118, 101, 114, 115, 10, 0, 0, 0, 0, 0};
+        Files.write(launcher.resolve("servers.dat"), original);
+        Path world = root.resolve("world-a");
+        Path first = runtime(world, "first");
+        ClientLocalSettings.prepare(world, launcher, first);
+        assertTrue(Files.exists(first.resolve("servers.dat")), "隔离客户端不能丢失启动器里的多人服务器栏");
+        assertArrayEquals(original, Files.readAllBytes(first.resolve("servers.dat")));
+
+        byte[] edited = {10, 0, 0, 0};
+        Files.write(first.resolve("servers.dat"), edited);
+        Files.write(first.resolve("servers.dat_old"), original);
+        assertTrue(ClientLocalSettings.saveCurrent(first));
+        Path next = runtime(world, "next");
+        ClientLocalSettings.prepare(world, launcher, next);
+        assertArrayEquals(edited, Files.readAllBytes(next.resolve("servers.dat")));
+        assertArrayEquals(original, Files.readAllBytes(next.resolve("servers.dat_old")));
+        assertArrayEquals(original, Files.readAllBytes(launcher.resolve("servers.dat")),
+                "隔离环境内的列表修改不能反向覆盖原启动器");
+    }
+
+    @Test void serverListAndItsBackupNeverJoinTheSharedEnvironmentOrUploadAllowlist() {
+        var policy = EnvironmentPathPolicy.create(java.util.List.of());
+        for (String path : java.util.List.of("servers.dat", "servers.dat_old", "SERVERS.DAT")) {
+            assertFalse(policy.includes(path));
+            assertFalse(EnvironmentRuntimeIdentity.isRuntimePath(path, "world"));
+            assertFalse(EnvironmentUploadStore.allowed(path, java.util.List.of(path)),
+                    "即使管理员误把个人服务器栏加入允许表，也不能上传其他服务器地址");
+        }
+    }
+
     @Test void firstInstallationInheritsPersonalOptionsWithoutCopyingSharedConfigOrAccounts() throws Exception {
         Path launcher = Files.createDirectories(root.resolve("launcher"));
         String options = "lang:zh_cn\nsoundCategory_master:0.15\nkey_key.forward:key.keyboard.up\n"
@@ -158,7 +191,9 @@ class ClientLocalSettingsTest {
         assertTrue(ClientLocalSettings.isLocalPath("optionsof.txt"));
         assertTrue(ClientLocalSettings.isLocalPath("optionsshaders.txt"));
         assertFalse(ClientLocalSettings.isLocalPath("config/options.txt"));
-        assertFalse(ClientLocalSettings.isLocalPath("servers.dat"));
+        assertTrue(ClientLocalSettings.isLocalPath("servers.dat"));
+        assertTrue(ClientLocalSettings.isLocalPath("servers.dat_old"));
+        assertFalse(ClientLocalSettings.isLocalPath("config/servers.dat"));
         assertFalse(ClientLocalSettings.isLocalPath("../options.txt"));
     }
 

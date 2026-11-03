@@ -252,6 +252,25 @@ final class SplitCoordinator {
         }
     }
 
+    /**
+     * 正常退出接替尚未提交的分离。调用方已经封住原组的新准入/合并/分离入口，接下来
+     * 由耐久退出事务冻结全部占用并逐个取得成员等待 ACK。这里仅撤销旧分离预约，
+     * 绝不能发送 SPLIT_FAILED 或让成员重连即将停止的原主，否则成员会先关闭控制会话，
+     * 从后续退出选举中丢失。组表和实际区块占用始终留给退出事务完成耐久清理。
+     */
+    synchronized void supersedeForPrimaryExit(UUID source) {
+        for (Transaction tx : List.copyOf(transactions.values())) {
+            if (!tx.active() || !tx.source.equals(source)) continue;
+            registry.cancelSplit(tx.id, tx.source);
+            tx.phase = "cancelled";
+            // 取消旧超时，并保留终态供在途 prepare/commit/status 幂等查询。
+            // 已提交的分离不在 active 集合中，新组不再属于本次原主退出的范围。
+            finishLater(tx);
+            LOGGER.info("正常退出已接替分离，保留成员控制会话: split={} group={} members={}",
+                    tx.id, source, tx.departing.size());
+        }
+    }
+
     private void cancel(Transaction tx, boolean reconnect, String reason) {
         // 准备阶段组表从未改变。源确认排空后重连原主；源掉线时只显示失败，
         // 剩余 claim 仍由既有耐久断连清理回收，不能在此直接释放实际区块。

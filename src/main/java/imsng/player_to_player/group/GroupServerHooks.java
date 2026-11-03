@@ -45,6 +45,9 @@ public final class GroupServerHooks {
     /** 位置上报间隔（tick）：1 秒一次，注册表侧玩家表对时效要求不高。 */
     private static final int POS_REPORT_INTERVAL_TICKS = 20;
 
+    /** 与中心每20tick元数据检查点错开，避免分离准备的周期重试持续撞上同一写入窗口。 */
+    static final int SPLIT_CHECK_INTERVAL_TICKS = 23;
+
     /** END_SERVER_TICK 计数器（仅服务器主线程读写）。 */
     private static int tickCounter;
 
@@ -194,11 +197,11 @@ public final class GroupServerHooks {
         if (!GroupRuntime.isManagedServer(server)) {
             return;
         }
-        if (++tickCounter % POS_REPORT_INTERVAL_TICKS != 0) {
+        ++tickCounter;
+        if (tickCounter % SPLIT_CHECK_INTERVAL_TICKS == 0) SplitMonitor.tick(server);
+        if (tickCounter % POS_REPORT_INTERVAL_TICKS != 0) {
             return;
         }
-        // 分离检测（Phase 3）：每秒一轮的渲染区域交集判定（矩形运算，微秒级）
-        SplitMonitor.tick(server);
         ControlConnection conn = GroupRuntime.conn();
         if (conn == null || !conn.isOpen()) {
             return;

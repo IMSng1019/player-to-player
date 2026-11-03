@@ -33,6 +33,13 @@ public final class SecondaryJoiner {
     /** 原版断开完成后才通知旧主关闭 LAN；登录完成由独立阶段计时记录。 */
     public static void activate(Minecraft minecraft, ControlConnection conn, UUID primary,
                                 PreparedTunnel prepared, Runnable disconnected) throws Exception {
+        activate(minecraft, conn, primary, prepared, () -> true, disconnected);
+    }
+
+    /** 最终渲染切换可附加事务门槛；后台准备完不代表当前交接仍允许使用这条隧道。 */
+    public static void activate(Minecraft minecraft, ControlConnection conn, UUID primary,
+                                PreparedTunnel prepared, java.util.function.BooleanSupplier beforeSwitch,
+                                Runnable disconnected) throws Exception {
         if (!WorldSession.isCurrentConnection(conn)) {
             prepared.close();
             throw new IllegalStateException("世界会话已过期");
@@ -44,6 +51,10 @@ public final class SecondaryJoiner {
                 return;
             }
             try {
+                if (!beforeSwitch.getAsBoolean()) {
+                    prepared.close();
+                    return;
+                }
                 WorldSwitcher.markTunnelPort(port);
                 WorldSwitcher.switchToTunnel(minecraft, port, primary.toString());
                 disconnected.run();

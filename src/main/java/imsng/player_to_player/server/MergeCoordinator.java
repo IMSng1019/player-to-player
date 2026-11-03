@@ -530,6 +530,16 @@ public final class MergeCoordinator {
      */
     public synchronized void abortInvolving(UUID clientId) {
         splits.abortInvolving(clientId);
+        abortMergesInvolving(clientId);
+    }
+
+    /** 正常退出仍需接管全部在线成员，不能复用异常掉线对分离成员发送失败的路径。 */
+    synchronized void preparePrimaryExit(UUID groupId) {
+        splits.supersedeForPrimaryExit(groupId);
+        abortMergesInvolving(groupId);
+    }
+
+    private void abortMergesInvolving(UUID clientId) {
         if (clientId == null) {
             return;
         }

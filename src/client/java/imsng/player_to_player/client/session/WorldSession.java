@@ -124,11 +124,11 @@ public final class WorldSession {
     /** 分离等待只属于当前物理服会话；迟到通知不能把其他世界切走。 */
     private static volatile UUID pendingSplit;
     private static volatile long pendingSplitDeadline;
-    private static final GroupHandoffPreparation EXIT_HANDOFF = new GroupHandoffPreparation();
+    private static final GroupHandoffPreparation HANDOFF_PREPARATION = new GroupHandoffPreparation();
 
     private static void clearPendingTransition() {
         pendingSplit = null;
-        EXIT_HANDOFF.clear();
+        HANDOFF_PREPARATION.clear();
     }
 
     private static void handleSplitPrepare(ControlConnection conn, ControlMessage message) {
@@ -148,11 +148,11 @@ public final class WorldSession {
                 boolean accepted = false;
                 try {
                     // ConnectScreen 的半登录连接由原版界面管理，level=null 时切走界面
-                    // 不会取消它；先拒绝本轮，让 EXIT_BEGIN 重试等待登录完成。已经完成
-                    // 的同一交接虽无 level，仍须幂等 ACK，避免丢包导致原主永远无法退出。
+                    // 不会取消它；先拒绝本轮，让 EXIT_BEGIN 重试等待登录完成。已完成的
+                    // 普通分离等待也没有 level，但允许同源退出接替；同一退出重试幂等 ACK。
                     if (context.clientRole() == ClientRole.SECONDARY && source.equals(context.groupId())
-                            && (client.level != null || EXIT_HANDOFF.isPrepared())) {
-                        accepted = EXIT_HANDOFF.prepare(id, source, () -> {
+                            && (client.level != null || HANDOFF_PREPARATION.isPrepared())) {
+                        accepted = HANDOFF_PREPARATION.prepare(id, source, () -> {
                             pendingSplit = id;
                             pendingSplitDeadline = System.currentTimeMillis() + 180_000;
                             SwitchTelemetry.begin("primary_exit", id.toString());
@@ -176,13 +176,16 @@ public final class WorldSession {
             }
             if (!isCurrentConnection(conn) || context.clientRole() != ClientRole.SECONDARY
                     || !source.equals(context.groupId()) || id.equals(pendingSplit)) return;
-            pendingSplit = id;
-            pendingSplitDeadline = System.currentTimeMillis() + 180_000;
-            SwitchTelemetry.begin("split", id.toString());
-            // 全体离组成员都先关闭旧游戏连接（包括尚未指定的新副客户端），
-            // 这样原组的 PLAYER 票据才能撤销，避免等待新主就绪的循环依赖。
-            WorldSwitcher.disconnectForSwitchNow(client);
-            client.setScreen(new JoinProgressScreen());
+            HANDOFF_PREPARATION.prepareSplit(id, source, () -> {
+                pendingSplit = id;
+                pendingSplitDeadline = System.currentTimeMillis() + 180_000;
+                SwitchTelemetry.begin("split", id.toString());
+                // 全体离组成员都先关闭旧游戏连接（包括尚未指定的新副客户端），
+                // 这样原组的 PLAYER 票据才能撤销，避免等待新主就绪的循环依赖。
+                // 与退出使用同一状态机，迟到的普通分离不能覆盖更优先的退出等待。
+                WorldSwitcher.disconnectForSwitchNow(client);
+                client.setScreen(new JoinProgressScreen());
+            });
         });
     }
 
@@ -499,7 +502,8 @@ public final class WorldSession {
             // 不会与 requestRoleAndSwitch 的 reply 路径冲突 —— 带 _rid 的应答
             // 在连接层被 pending future 消费，永远不进处理器分发）
             cc.on(MessageType.ROLE_ASSIGN, (c, m) ->
-                    handleUnsolicitedRoleAssign(conn, worldFolder, worldName, m));
+                    Minecraft.getInstance().execute(() ->
+                            handleUnsolicitedRoleAssign(conn, worldFolder, worldName, m)));
             cc.on(MessageType.SPLIT_PREPARE, (c, m) -> handleSplitPrepare(conn, m));
             cc.on(MessageType.SPLIT_ABORT, (c, m) -> {
                 if (!isCurrentConnection(conn)) return;
@@ -508,10 +512,17 @@ public final class WorldSession {
                 catch (IllegalArgumentException ignored) { }
             });
             cc.on(MessageType.SPLIT_FAILED, (c, m) -> {
-                if (!isCurrentConnection(conn) || pendingSplit == null) return;
-                String id = JsonUtil.getString(m.json(), "splitId", "");
-                if (!id.isEmpty() && !pendingSplit.toString().equals(id)) return;
-                transitionFailed(conn, JsonUtil.getString(m.json(), "message", "分离交接失败"));
+                UUID waitingWhenReceived = pendingSplit;
+                // 必须在渲染线程真正处理时复核事务号：Netty 收到失败到界面任务执行
+                // 之间，普通分离可能已被主客户端退出接替，旧失败不能拆掉新等待会话。
+                Minecraft.getInstance().execute(() -> {
+                    if (!isCurrentConnection(conn) || pendingSplit == null) return;
+                    String id = JsonUtil.getString(m.json(), "splitId", "");
+                    // 新主未就绪的全组通知沿用无事务号协议，只能结束接收时的那轮等待。
+                    if (id.isEmpty() ? !pendingSplit.equals(waitingWhenReceived)
+                            : !pendingSplit.toString().equals(id)) return;
+                    transitionFailed(conn, JsonUtil.getString(m.json(), "message", "分离交接失败"));
+                });
             });
             String relayAddress = JsonUtil.getString(ackJson, "relayAddress", "");
             int relayPort = JsonUtil.getInt(ackJson, "relayPort", 0);
@@ -697,7 +708,7 @@ public final class WorldSession {
     // ------------------------------------------------------ 角色申请与世界切换
 
     /**
-     * 服务端主动推送的 ROLE_ASSIGN（Phase 3 分离晋升；Netty 线程 → 重活转 io）。
+     * 服务端主动推送的 ROLE_ASSIGN（渲染线程核对交接意图，再将重活转后台）。
      * <p>
      * 单端分离达标后服务端把离组副客户端晋升为主（SplitMonitor → SPLIT_ACK →
      * 服务端直发 ROLE_ASSIGN(primary)）：本端此刻还连着原主的隧道世界，需要
@@ -708,57 +719,70 @@ public final class WorldSession {
                                                     String worldName, ControlMessage msg) {
         if (!isCurrentConnection(conn)) return;
         String role = JsonUtil.getString(msg.json(), "role", "");
+        if (!"secondary".equals(role) && !"primary".equals(role)) return;
+        NodeContext ctx = NodeContext.get();
+        if ("primary".equals(role) && ctx.clientRole() == ClientRole.PRIMARY) return;
+        UUID assignedGroup;
+        UUID primary;
+        try {
+            assignedGroup = UUID.fromString(JsonUtil.getString(msg.json(), "groupId", ""));
+            primary = UUID.fromString(JsonUtil.getString(msg.json(), "primaryClientId", ""));
+        } catch (IllegalArgumentException invalid) { return; }
+        UUID transaction = pendingSplit;
+        if (transaction == null) return;
+        String assignedTransaction = JsonUtil.getString(msg.json(), "splitId", "");
+        if (!assignedTransaction.isEmpty() && !transaction.toString().equals(assignedTransaction)) return;
+        // 跟随新主的旧协议没有splitId，绑定当前等待；退出等待仍禁止重连原source。
+        // 在隧道准备阶段保留旧组身份，退出通知才能核对来源并接替尚未登录的回滚。
+        var intent = HANDOFF_PREPARATION.reserveConnection(transaction, assignedGroup);
+        if (intent == null) return;
         if ("secondary".equals(role)) {
-            UUID primary;
-            UUID assignedGroup;
-            try {
-                primary = UUID.fromString(JsonUtil.getString(msg.json(), "primaryClientId", ""));
-                assignedGroup = UUID.fromString(JsonUtil.getString(msg.json(), "groupId", ""));
-            } catch (IllegalArgumentException invalid) { return; }
             ThreadPools.startBlocking("split-follow", () -> {
                 try {
-                    if (!isCurrentConnection(conn)) return;
-                    NodeContext context = NodeContext.get();
-                    context.setGroupId(assignedGroup);
-                    context.setClientRole(ClientRole.SECONDARY);
+                    if (!isCurrentConnection(conn) || !HANDOFF_PREPARATION.isCurrentConnection(intent)) return;
                     var prepared = SecondaryJoiner.prepare(conn, primary, UUID.randomUUID());
-                    SecondaryJoiner.activate(Minecraft.getInstance(), conn, primary, prepared, () -> { });
+                    SecondaryJoiner.activate(Minecraft.getInstance(), conn, primary, prepared, () -> {
+                        // 这一段紧邻原版ConnectScreen启动，且与退出准备同在渲染线程。
+                        // 若旧后台任务已被退出接替，既不连接旧主，也不覆盖NodeContext。
+                        if (!HANDOFF_PREPARATION.beginConnecting(intent)) return false;
+                        ctx.setGroupId(assignedGroup);
+                        ctx.setClientRole(ClientRole.SECONDARY);
+                        return true;
+                    }, () -> { });
                 } catch (Exception failure) {
                     LOGGER.error("分离副客户端连接失败", failure);
-                    transitionFailed(conn, "无法连接组内主客户端，请稍后重新连接。");
+                    failConnectionIntent(conn, intent, "无法连接组内主客户端，请稍后重新连接。");
                 }
             });
             return;
         }
-        if (!"primary".equals(role)) {
-            return;
-        }
-        NodeContext ctx = NodeContext.get();
-        if (ctx.clientRole() == ClientRole.PRIMARY) {
-            return; // 已是主客户端：重复/迟到推送，忽略
-        }
-        UUID groupId;
-        try {
-            groupId = UUID.fromString(JsonUtil.getString(msg.json(), "groupId", ""));
-        } catch (IllegalArgumentException e) {
-            return;
-        }
+        // 新主的worker启动即开始接管，不能再被旧组的迟到准备通知覆盖。
+        if (!HANDOFF_PREPARATION.beginConnecting(intent)) return;
         ThreadPools.startBlocking("split-promote", () -> {
             try {
-                SwitchTelemetry.begin("split", groupId.toString());
+                SwitchTelemetry.begin("split", assignedGroup.toString());
                 LocalWorldLauncher.PreparedWorld prepared = prepareAuthoritativeWorld(
                         conn, worldFolder, worldName);
-                if (!isCurrentConnection(conn)) return;
-                ctx.setGroupId(groupId);
+                if (!isCurrentConnection(conn) || !HANDOFF_PREPARATION.isCurrentConnection(intent)) return;
+                ctx.setGroupId(assignedGroup);
                 ctx.setClientRole(ClientRole.PRIMARY);
                 LOGGER.info("收到分离晋升指派: 本端成为组 {} 的主客户端，切换到本地组世界",
-                        groupId);
+                        assignedGroup);
                 LocalWorldLauncher.launchPrepared(
-                        Minecraft.getInstance(), conn, prepared, groupId);
+                        Minecraft.getInstance(), conn, prepared, assignedGroup);
             } catch (Exception e) {
                 LOGGER.error("分离晋升前准备权威玩家状态失败", e);
-                transitionFailed(conn, "准备分离后的世界失败，请检查日志后重新连接。");
+                failConnectionIntent(conn, intent, "准备分离后的世界失败，请检查日志后重新连接。");
             }
+        });
+    }
+
+    /** 旧隧道/旧角色准备的迟到失败不能关闭已被新退出事务接替的等待。 */
+    private static void failConnectionIntent(ControlConnection conn,
+                                             GroupHandoffPreparation.ConnectionIntent intent, String reason) {
+        Minecraft.getInstance().execute(() -> {
+            if (isCurrentConnection(conn) && HANDOFF_PREPARATION.isCurrentConnection(intent))
+                transitionFailed(conn, reason);
         });
     }
 

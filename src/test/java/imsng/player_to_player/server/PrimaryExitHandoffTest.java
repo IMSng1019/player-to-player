@@ -5,10 +5,14 @@ import imsng.player_to_player.compute.ComputeScore;
 import imsng.player_to_player.compute.ComputeTable;
 import imsng.player_to_player.config.GlobalConfig;
 import imsng.player_to_player.group.ExitManifest;
+import imsng.player_to_player.group.GroupHandoffPreparation;
 import imsng.player_to_player.netproto.ControlConnection;
 import imsng.player_to_player.netproto.ControlMessage;
 import imsng.player_to_player.netproto.MessageType;
 import imsng.player_to_player.registry.PlayerTable;
+import imsng.player_to_player.registry.ChunkKey;
+import imsng.player_to_player.registry.ChunkRegistry;
+import imsng.player_to_player.registry.SplitRegion;
 import org.junit.jupiter.api.Test;
 
 import java.net.SocketAddress;
@@ -174,6 +178,52 @@ class PrimaryExitHandoffTest {
         assertTrue(connections.get(successor).messages.isEmpty());
     }
 
+    @Test void mergedGroupExitRetainsBothFormerPrimaryAndNeverPrimaryWhileSplitIsWaiting() {
+        // 与现场角色一致：successor 原先独立为主，follower 从未做主；合并后三人同组。
+        groups.createGroup(successor);
+        assertNotNull(groups.mergeGroups(primary, successor, primary));
+        var registry = new ChunkRegistry(null, null);
+        var chunk = new ChunkKey("minecraft:overworld", 625, 625);
+        assertTrue(registry.tryClaim(chunk, primary).granted());
+        var exiting = new ExitManifest(manifest.shutdownId(), primary, primary,
+                manifest.playerIds(), Set.of(chunk));
+        var splits = new SplitCoordinator(new GlobalConfig(), registry, groups, computes, players,
+                connections::get, ignored -> { }, (group, members) -> fail("未提交分离不得重定向"));
+        UUID splitId = UUID.randomUUID();
+        JsonObject prepare = new JsonObject();
+        prepare.addProperty("phase", "prepare");
+        prepare.addProperty("splitId", splitId.toString());
+        prepare.addProperty("groupId", primary.toString());
+        var departing = new com.google.gson.JsonArray(); departing.add(follower.toString());
+        prepare.add("departingClientIds", departing);
+        var regions = new com.google.gson.JsonArray();
+        regions.add(new SplitRegion(chunk.dimension(), 620, 630, 620, 630).toJson());
+        prepare.add("regions", regions);
+        try {
+            splits.handle(connections.get(primary), ControlMessage.of(MessageType.SPLIT_REQUEST, prepare));
+            assertTrue(connections.get(follower).preparation.isPrepared());
+
+            handoff.reserve(exiting);
+            splits.supersedeForPrimaryExit(primary);
+            registry.freezeOrRecoverForExit(primary, exiting.chunks(), exiting.playerIds(), false);
+            handoff.prepare(exiting);
+            assertTrue(connections.get(follower).isOpen(), "正在分离的纯副端必须继续参加退出选举");
+            assertTrue(connections.get(successor).preparation.isPrepared());
+            handoff.complete(exiting, () -> registry.completeExitDurably(primary, exiting.chunks()));
+
+            assertEquals(successor, groups.groupOf(successor));
+            assertEquals(successor, groups.groupOf(follower));
+            assertNull(registry.ownerOf(chunk), "新主角色只在旧所有权耐久释放后发布");
+            assertEquals("primary", players.get(successor).role());
+            assertEquals("secondary", players.get(follower).role());
+            assertTrue(events.contains("followers"));
+            assertTrue(events.contains("role"));
+            assertTrue(events.indexOf("followers") < events.indexOf("role"));
+        } finally {
+            splits.shutdown();
+        }
+    }
+
     private static ControlMessage ack(ControlMessage request) {
         JsonObject json = request.json().deepCopy();
         json.addProperty("accepted", true);
@@ -184,6 +234,7 @@ class PrimaryExitHandoffTest {
         final UUID peer;
         final List<ControlMessage> messages = new ArrayList<>();
         final CompletableFuture<ControlMessage> requested = new CompletableFuture<>();
+        final GroupHandoffPreparation preparation = new GroupHandoffPreparation();
         CompletableFuture<ControlMessage> reply;
         boolean open = true;
         boolean failSends;
@@ -191,11 +242,21 @@ class PrimaryExitHandoffTest {
         public void send(ControlMessage message) {
             if (failSends) throw new IllegalStateException("send failed");
             messages.add(message);
+            if (message.type() == MessageType.SPLIT_PREPARE) {
+                preparation.prepareSplit(UUID.fromString(message.json().get("splitId").getAsString()),
+                        UUID.fromString(message.json().get("groupId").getAsString()), () -> { });
+            }
+            if (message.type() == MessageType.SPLIT_FAILED) open = false;
             if (message.type() == MessageType.ROLE_ASSIGN) events.add("role");
         }
         public CompletableFuture<ControlMessage> request(ControlMessage message) {
             requested.complete(message);
-            return reply != null ? reply : CompletableFuture.completedFuture(ack(message));
+            if (reply != null) return reply;
+            ControlMessage acknowledgement = ack(message);
+            boolean prepared = preparation.prepare(UUID.fromString(message.json().get("splitId").getAsString()),
+                    UUID.fromString(message.json().get("groupId").getAsString()), () -> { });
+            acknowledgement.json().addProperty("accepted", prepared);
+            return CompletableFuture.completedFuture(acknowledgement);
         }
         public SocketAddress remoteAddress() { return null; }
         public UUID peerId() { return peer; }

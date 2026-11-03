@@ -12,8 +12,9 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * 渲染客户端的本机偏好。语言、音量、按键和无障碍引导都在 options.txt 中，不能因为
- * 服务端环境更新而恢复默认值。配置存放于世界自己的 client-settings，既不上传给
+ * 渲染客户端的本机偏好。语言、音量、按键和无障碍引导都在 options.txt 中，服务器
+ * 收藏列表则存于 servers.dat，不能因为服务端环境更新而恢复默认值或变成空列表。
+ * 配置存放于世界自己的 client-settings，既不上传给
  * 服务端，也不反向覆盖启动器目录；同一玩家访问不同服务器时可保留各自的偏好。
  *
  * <p>这里只复制明确的个人选项文件。模组 config 仍由环境同步管理，不能把整个本机
@@ -21,7 +22,10 @@ import java.util.Locale;
  * 不解析或重新序列化键值，避免丢失模组追加的选项与未来版本的字段。
  */
 public final class ClientLocalSettings {
-    private static final List<String> FILES = List.of("options.txt", "optionsof.txt", "optionsshaders.txt");
+    // 原版保存服务器栏时也会生成 servers.dat_old；它含同一份个人地址信息，必须与
+    // 正本一起排除环境扫描/上传，并按原始二进制字节继承，不能混入服务端共享文件。
+    private static final List<String> FILES = List.of("options.txt", "optionsof.txt", "optionsshaders.txt",
+            "servers.dat", "servers.dat_old");
     private static final int MAX_FILE_BYTES = 4 * 1024 * 1024;
     private static final String PROFILE_DIRECTORY = "client-settings";
 
