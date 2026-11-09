@@ -41,6 +41,8 @@ public final class MetadataService implements AutoCloseable {
     private static volatile MetadataService current;
     private final MinecraftServer server;
     private final MetadataCheckpointWriter checkpoints;
+    /** 分离必须与已提交的检查点按序执行，不能靠网络重试碰撞一个无检查点的瞬间。 */
+    private final MetadataTransferTasks transferTasks;
     /** 对外可见版本在主线程收割后才更新，不能把后台已写完但尚未发布的版本用于切换。 */
     private volatile MetadataSnapshot publishedSnapshot;
     private final GroupTable groups;
@@ -105,12 +107,42 @@ public final class MetadataService implements AutoCloseable {
             MetadataRuntime.setCommittedData(server, store.snapshot().data());
             publish(patch);
         });
+        transferTasks = new MetadataTransferTasks(server::execute,
+                () -> current == this && !closed, () -> finishCheckpoints(true));
         current = this;
         handlers.on(MessageType.METADATA_SNAPSHOT_REQUEST, (c, m) -> enqueue(c, m, () -> snapshot(c, m)));
         handlers.on(MessageType.METADATA_CATCHUP, (c, m) -> enqueue(c, m, () -> catchup(c, m)));
         handlers.on(MessageType.METADATA_ACK, (c, m) -> enqueue(c, m, () -> acknowledge(c, m)));
         handlers.on(MessageType.METADATA_CHANGE, (c, m) -> enqueue(c, m, () -> change(c, m)));
         handlers.on(MessageType.METADATA_EVENT, (c, m) -> enqueue(c, m, () -> event(c, m)));
+    }
+
+    /**
+     * 在注册分离消息时绑定当前中心实例。所有阶段都进入同一主线程队列，避免取消或
+     * 状态查询越过尚未执行的准备请求。先发布检查点，再加会话/协调器锁；既不移除
+     * transferAllowed 的安全条件，也不让入站线程持锁等待主线程或磁盘。
+     *
+     * <p>没有元数据服务的独立协调器测试保留原入口；一旦绑定了真实实例，即使该实例
+     * 随后关闭或被替换，旧处理器也只能明确拒绝，不能因 current 变空而绕过屏障。</p>
+     */
+    public static MessageHandler orderedTransferHandler(MessageHandler handler) {
+        Objects.requireNonNull(handler);
+        MetadataService service = current;
+        if (service == null) return handler;
+        return (connection, message) -> service.transferTasks.execute(
+                action -> HelloHandler.withCurrentSession(connection, () -> {
+                    action.run();
+                    return true;
+                }),
+                () -> handler.handle(connection, message),
+                failure -> {
+                    JsonObject reply = new JsonObject();
+                    reply.addProperty("code", "metadata_transfer_unavailable");
+                    reply.addProperty("message", failure.getMessage());
+                    connection.send(message.reply(MessageType.ERROR, reply, null));
+                    LOGGER.warn("分离元数据发布屏障未完成，保持原组: phase={} reason={}",
+                            JsonUtil.getString(message.json(), "phase", ""), failure.toString());
+                });
     }
 
     @FunctionalInterface private interface Task { void run() throws Exception; }

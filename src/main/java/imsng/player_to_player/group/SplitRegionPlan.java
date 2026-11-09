@@ -10,10 +10,47 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.HashMap;
+import java.util.Map;
 
 /** 分离区域的纯几何规划，不读取 Minecraft 实例或修改所有权。 */
 final class SplitRegionPlan {
     private SplitRegionPlan() { }
+
+    /** 重载只能清掉历史生成依赖，不能消除当前两组必需的加载/光照邻域。 */
+    static boolean reloadDemandSeparated(Collection<SplitRegion> departing, Collection<SplitRegion> remaining) {
+        return !departing.isEmpty() && !remaining.isEmpty()
+                && departing.stream().noneMatch(a -> remaining.stream().anyMatch(a::overlaps));
+    }
+
+    /**
+     * 渲染区域已经分开，但原版仍用 PLAYER 传播等级保留旧世代外圈时，不能从这个
+     * 连通岛中直接截一半。预约整个原组的范围，让所有游戏连接暂离，由原版撤销
+     * PLAYER 票据并完成最终写回/卸载；随后两组从已生成的存档重新建立加载需求。
+     * 独立特殊票据不会随玩家离开而消失，因此此退路必须拒绝它们，不能强拆传送门桥。
+     */
+    static Optional<List<SplitRegion>> planReload(Set<ChunkKey> tracked,
+                                                 Collection<SplitRegion> playerDemand,
+                                                 Collection<SplitRegion> specialTickets) {
+        if (tracked.isEmpty() || playerDemand.isEmpty() || !specialTickets.isEmpty()) return Optional.empty();
+        Map<String, SplitRegion> bounds = new HashMap<>();
+        try {
+            for (ChunkKey key : tracked) {
+                include(bounds, new SplitRegion(key.dimension(), key.x(), key.x(), key.z(), key.z()));
+            }
+            // 准备通知到达之前玩家仍可移动；与普通准备一致，保留当前世代需求边缘。
+            for (SplitRegion demand : playerDemand) include(bounds, demand);
+        } catch (IllegalArgumentException tooLarge) {
+            return Optional.empty(); // 保留协议对预约范围大小的上限，不用溢出的矩形移交世界。
+        }
+        return Optional.of(List.copyOf(bounds.values()));
+    }
+
+    private static void include(Map<String, SplitRegion> bounds, SplitRegion region) {
+        bounds.merge(region.dimension(), region, (a, b) -> new SplitRegion(a.dimension(),
+                Math.min(a.minX(), b.minX()), Math.max(a.maxX(), b.maxX()),
+                Math.min(a.minZ(), b.minZ()), Math.max(a.maxZ(), b.maxZ())));
+    }
 
     static Optional<List<SplitRegion>> plan(Set<ChunkKey> tracked,
                                            Collection<SplitRegion> departing,

@@ -241,7 +241,7 @@ class WorkerProcessSmokeTest {
     }
 
     /** 不借用本机真实世界：fixture包含1.20.4三维度原版生成器与字段类型。 */
-    private static MetadataSnapshot metadataFixture() throws Exception {
+    static MetadataSnapshot metadataFixture() throws Exception {
         var data = net.minecraft.nbt.TagParser.parseTag("""
                 {DataVersion:3700,version:19133,Version:{Id:3700,Name:"1.20.4",Snapshot:0b,Series:"main"},
                  LevelName:"metadata-smoke",GameType:0,Difficulty:2b,hardcore:0b,allowCommands:1b,

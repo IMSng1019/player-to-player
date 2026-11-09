@@ -59,16 +59,24 @@ final class SplitCoordinator {
         final ControlConnection sourceConnection;
         final Set<UUID> members, departing;
         final MetadataFence metadata;
+        /** 世代外圈相连时全部成员退出游戏连接，但源控制连接与worker继续排空。 */
+        final boolean reloadSource;
+        boolean sourceResumed;
+        /** 正常退出接替或源会话断开后，迟到source_ready绝不能复活旧源。 */
+        boolean resumeSuppressed;
         String phase = "prepared";
         ScheduledFuture<?> timeout;
         Transaction(UUID id, UUID source, UUID newPrimary, ControlConnection sourceConnection,
-                    Set<UUID> members, Set<UUID> departing, MetadataFence metadata) {
+                    Set<UUID> members, Set<UUID> departing, MetadataFence metadata, boolean reloadSource) {
             this.id = id; this.source = source; this.newPrimary = newPrimary;
             this.sourceConnection = sourceConnection;
             this.members = Set.copyOf(members); this.departing = Set.copyOf(departing);
             this.metadata = metadata;
+            this.reloadSource = reloadSource;
         }
         boolean active() { return phase.equals("prepared") || phase.equals("cancel_requested"); }
+        Set<UUID> pausedMembers() { return reloadSource ? members : departing; }
+        boolean waitingForSource() { return reloadSource && !sourceResumed && !resumeSuppressed && !active(); }
     }
 
     SplitCoordinator(GlobalConfig config, ChunkRegistry registry, GroupTable groups,
@@ -91,7 +99,8 @@ final class SplitCoordinator {
     }
 
     synchronized boolean involvesGroup(UUID group) {
-        return transactions.values().stream().anyMatch(tx -> tx.active() && tx.source.equals(group));
+        return transactions.values().stream().anyMatch(tx -> (tx.active() || tx.waitingForSource())
+                && tx.source.equals(group));
     }
 
     synchronized void handle(ControlConnection connection, ControlMessage request) {
@@ -113,6 +122,12 @@ final class SplitCoordinator {
             }
             if (!tx.source.equals(source) || tx.sourceConnection != connection) {
                 reject(connection, request, "wrong_source", "分离事务不属于本连接"); return;
+            }
+            // 终态查询仍可幂等应答，但重新接待必须由旧worker显式确认其围栏已经解除。
+            // 必须放在通用“终态直接reply”之前，不能把早到/失效source_ready当成功。
+            if (phase.equals("source_ready")) {
+                resumeSource(connection, request, tx);
+                return;
             }
             if (phase.equals("status") || phase.equals("prepare") || !tx.active()) {
                 reply(connection, request, tx); return;
@@ -201,14 +216,53 @@ final class SplitCoordinator {
         var election = computes.selectPrimaryOrRelaxed(departing, config.minFreeMemoryBytes);
         UUID newPrimary = election != null ? election.clientId()
                 : departing.stream().min(UUID::compareTo).orElseThrow();
-        Transaction tx = new Transaction(id, source, newPrimary, connection, members, departing, metadata);
+        boolean reloadSource = JsonUtil.getBoolean(request.json(), "reloadSource", false);
+        Transaction tx = new Transaction(id, source, newPrimary, connection, members, departing, metadata, reloadSource);
         transactions.put(id, tx);
         tx.timeout = ThreadPools.scheduler().schedule(() -> requestTimeout(id), 120, TimeUnit.SECONDS);
         reply(connection, request, tx);
         JsonObject pause = new JsonObject();
         pause.addProperty("splitId", id.toString()); pause.addProperty("groupId", source.toString());
-        for (UUID member : departing) send(member, ControlMessage.of(MessageType.SPLIT_PREPARE, pause.deepCopy()));
-        LOGGER.info("分离准备: splitId={} 成员={} 范围={}，保持原有区块归属", id, departing.size(), regions.size());
+        if (reloadSource) pause.addProperty("reloadSource", true);
+        for (UUID member : tx.pausedMembers()) send(member, ControlMessage.of(MessageType.SPLIT_PREPARE, pause.deepCopy()));
+        LOGGER.info("分离准备: splitId={} 离组成员={} 暂停成员={} 范围={} reloadSource={}，保持原有区块归属",
+                id, departing.size(), tx.pausedMembers().size(), regions.size(), reloadSource);
+    }
+
+    /**
+     * 源worker收到commit/cancel后先解除本地加载围栏，再报告source_ready。
+     * 此时才允许留组玩家重连，避免主客户端自身过早登录被旧围栏永久挡住。
+     * 重复消息重发同一splitId的角色指派；客户端按连接意图去重，组表不再修改。
+     */
+    private void resumeSource(ControlConnection connection, ControlMessage request, Transaction tx) {
+        if (!tx.reloadSource || tx.active()
+                || !(tx.phase.equals("committed") || tx.phase.equals("cancelled"))) {
+            reject(connection, request, "invalid_phase", "仅全组重载分离的终态可以恢复原组");
+            return;
+        }
+        if (tx.resumeSuppressed || !tx.source.equals(groups.primaryOf(tx.source))
+                || !tx.source.equals(groups.groupOf(tx.source)) || !online(tx.source)) {
+            reject(connection, request, "source_resume_unavailable", "原组已退出、离线或被替换，不能恢复旧分离连接");
+            return;
+        }
+        // 一个已恢复事务的迟到重试不能跨越原组后来启动的新分离。
+        if (transactions.values().stream().anyMatch(other -> other != tx && other.source.equals(tx.source)
+                && (other.active() || other.waitingForSource()))) {
+            reject(connection, request, "busy", "原组已有更新的分离交接，旧恢复请求已失效");
+            return;
+        }
+        Set<UUID> resume = new HashSet<>(tx.members);
+        if (tx.phase.equals("committed")) resume.removeAll(tx.departing);
+        notifySafely(tx.id, "原组恢复权限", () -> permissionPush.accept(tx.source));
+        for (UUID member : resume) {
+            if (!tx.source.equals(groups.groupOf(member)) || !online(member)) continue;
+            boolean host = member.equals(tx.source);
+            sendRole(member, tx.source, host ? "primary" : "secondary", tx.id, host);
+        }
+        tx.sourceResumed = true;
+        reply(connection, request, tx);
+        LOGGER.info("分离原组已允许重连: splitId={} phase={} 原组={} 成员={}",
+                tx.id, tx.phase, tx.source, resume.size());
     }
 
     private static MetadataFence currentMetadataFence(UUID source) {
@@ -240,13 +294,24 @@ final class SplitCoordinator {
         JsonObject failure = new JsonObject(); failure.addProperty("splitId", id.toString());
         failure.addProperty("message", "分离交接超时，已停止进入新世界；旧区域正在安全收尾。");
         send(tx.source, ControlMessage.of(MessageType.SPLIT_ABORT, failure.deepCopy()));
+        // 全组重载时源客户端本身也在等待。超时先要求仍存活的worker安全取消，
+        // 不能用SPLIT_FAILED拆掉全部控制会话，否则取消后的source_ready再无成员可恢复。
+        if (tx.reloadSource) return;
         for (UUID member : tx.departing)
             send(member, ControlMessage.of(MessageType.SPLIT_FAILED, failure.deepCopy()));
     }
 
     synchronized void abortInvolving(UUID client) {
         for (Transaction tx : List.copyOf(transactions.values())) {
-            if (!tx.active() || (!tx.source.equals(client) && !tx.departing.contains(client))) continue;
+            if (tx.source.equals(client) && tx.reloadSource) {
+                boolean wasWaiting = tx.waitingForSource();
+                tx.resumeSuppressed = true;
+                if (!tx.active()) {
+                    if (wasWaiting) failPausedMembers(tx, "原主控制连接已断开");
+                    continue;
+                }
+            }
+            if (!tx.active() || (!tx.source.equals(client) && !tx.pausedMembers().contains(client))) continue;
             if (tx.source.equals(client)) cancel(tx, false, "原主控制连接已断开");
             else requestTimeout(tx.id);
         }
@@ -260,7 +325,11 @@ final class SplitCoordinator {
      */
     synchronized void supersedeForPrimaryExit(UUID source) {
         for (Transaction tx : List.copyOf(transactions.values())) {
-            if (!tx.active() || !tx.source.equals(source)) continue;
+            if (!tx.source.equals(source)) continue;
+            // 即使分离刚刚commit，源组仍可能尚未恢复。退出接替只禁止旧源重连，
+            // 绝不回滚已经成立的新组，也不向退出接管需要的成员发送失败。
+            if (tx.reloadSource) tx.resumeSuppressed = true;
+            if (!tx.active()) continue;
             registry.cancelSplit(tx.id, tx.source);
             tx.phase = "cancelled";
             // 取消旧超时，并保留终态供在途 prepare/commit/status 幂等查询。
@@ -277,6 +346,13 @@ final class SplitCoordinator {
         registry.cancelSplit(tx.id, tx.source);
         tx.phase = "cancelled";
         finishLater(tx);
+        if (tx.reloadSource) {
+            if (!reconnect) {
+                tx.resumeSuppressed = true;
+                failPausedMembers(tx, reason);
+            }
+            return; // 正常取消仍等旧worker解除围栏并报告source_ready后才恢复全部成员。
+        }
         for (UUID member : tx.departing) {
             if (reconnect && tx.source.equals(groups.groupOf(member)) && online(tx.source)) {
                 sendRole(member, tx.source, "secondary", tx.id);
@@ -285,6 +361,16 @@ final class SplitCoordinator {
                 failure.addProperty("message", reason);
                 send(member, ControlMessage.of(MessageType.SPLIT_FAILED, failure));
             }
+        }
+    }
+
+    /** 提交后只通知仍属于源组的等待成员，不能因旧源掉线打断已经成立的新组。 */
+    private void failPausedMembers(Transaction tx, String reason) {
+        for (UUID member : tx.pausedMembers()) {
+            if (!tx.source.equals(groups.groupOf(member))) continue;
+            JsonObject failure = new JsonObject(); failure.addProperty("splitId", tx.id.toString());
+            failure.addProperty("message", reason);
+            send(member, ControlMessage.of(MessageType.SPLIT_FAILED, failure));
         }
     }
 
@@ -330,10 +416,14 @@ final class SplitCoordinator {
         }
     }
     private void sendRole(UUID member, UUID primary, String role, UUID splitId) {
+        sendRole(member, primary, role, splitId, false);
+    }
+    private void sendRole(UUID member, UUID primary, String role, UUID splitId, boolean reuseWorker) {
         JsonObject assign = new JsonObject(); assign.addProperty("role", role);
         assign.addProperty("groupId", primary.toString());
         assign.addProperty("primaryClientId", primary.toString());
         assign.addProperty("splitId", splitId.toString());
+        if (reuseWorker) assign.addProperty("reuseWorker", true);
         send(member, ControlMessage.of(MessageType.ROLE_ASSIGN, assign));
     }
     private static void reply(ControlConnection connection, ControlMessage request, Transaction tx) {
@@ -341,6 +431,10 @@ final class SplitCoordinator {
         out.addProperty("phase", tx.phase); out.addProperty("splitId", tx.id.toString());
         out.addProperty("newGroupId", tx.newPrimary.toString());
         out.addProperty("newPrimaryClientId", tx.newPrimary.toString());
+        if (tx.reloadSource) {
+            out.addProperty("reloadSource", true);
+            out.addProperty("sourceResumed", tx.sourceResumed);
+        }
         if (tx.metadata.enabled()) {
             out.addProperty("metadataWorldId", tx.metadata.worldId());
             out.addProperty("metadataTerm", tx.metadata.term());

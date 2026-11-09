@@ -59,6 +59,7 @@ class MetadataProcessSmokeTest {
         config.nonEnvironmentPaths.add("metadata-smoke-status.json");
         config.nonEnvironmentPaths.add("metadata-smoke-status.tmp");
         config.nonEnvironmentPaths.add("console.log");
+        config.nonEnvironmentPaths.add("metadata-split-probe");
         config.save(centerRoot.resolve("player-to-player/config.json"));
 
         Process center = launchCenter(centerRoot);
@@ -166,6 +167,11 @@ class MetadataProcessSmokeTest {
             assertEquals(2277, a.dayTime()); assertEquals(2277, b.dayTime());
             report.addProperty("scheduledFunctionGlobalDelta", 77);
 
+            // 经真实网络入口运行两阶段分离；只注入检查点磁盘完成的时机，不替换
+            // transferAllowed、元数据版本屏障或SplitCoordinator的任何生产判断。
+            verifySplitWaitsForCheckpointPublication(a, centerRoot, environment, controlPort);
+            report.addProperty("splitWaitsForCheckpointPublication", true);
+
             MetadataSnapshot old = a.snapshot();
             a.remote.close();
             waitUntil("控制断线暂停计算", Duration.ofSeconds(10), () -> !a.ready());
@@ -197,6 +203,82 @@ class MetadataProcessSmokeTest {
             catch (IOException ignored) { }
             stopProcess(center);
         }
+    }
+
+    /**
+     * 仅控制连接的成员不加载区块，因此可以独立验证分离协调器在准备/提交处的发布屏障。
+     * 完整玩家移动与旧holder排空仍由分离专用冒烟覆盖，不能把本用例表述为图形联机验收。
+     */
+    private void verifySplitWaitsForCheckpointPublication(WorkerNode source, Path centerRoot,
+                                                         EnvironmentPreflightInfo environment,
+                                                         int controlPort) throws Exception {
+        Path probe = centerRoot.resolve("metadata-split-probe");
+        Files.createDirectories(probe);
+        UUID member = UUID.randomUUID(), split = UUID.randomUUID();
+        ControlClient follower = new ControlClient("127.0.0.1", controlPort);
+        CompletableFuture<ControlMessage> assigned = new CompletableFuture<>();
+        follower.on(MessageType.PERMISSION_RELAY, (connection, message) -> { });
+        follower.on(MessageType.SPLIT_PREPARE, (connection, message) -> { });
+        follower.on(MessageType.ROLE_ASSIGN, (connection, message) -> assigned.complete(message));
+        try {
+            ControlConnection remote = follower.connect();
+            JsonObject hello = new JsonObject();
+            hello.addProperty("version", Protocol.VERSION); hello.addProperty("clientId", member.toString());
+            hello.addProperty("playerName", "splitmember"); hello.addProperty("mode", "client");
+            hello.addProperty("runtimeHash", environment.runtimeHash());
+            assertAccepted(remote.request(ControlMessage.of(MessageType.HELLO, hello)).get(15, TimeUnit.SECONDS));
+            JsonObject membership = new JsonObject();
+            membership.addProperty("source", source.id.toString()); membership.addProperty("member", member.toString());
+            JsonUtil.writeFileAtomic(probe.resolve("member.json"), membership);
+            waitUntil("检查点分离探针成员已加入原组", Duration.ofSeconds(10),
+                    () -> Files.isRegularFile(probe.resolve("member-added")));
+            source.sync();
+
+            for (String phase : List.of("prepare", "commit")) {
+                MetadataSnapshot snapshot = source.snapshot();
+                JsonObject request = new JsonObject();
+                request.addProperty("phase", phase); request.addProperty("splitId", split.toString());
+                request.addProperty("groupId", source.id.toString());
+                request.addProperty("metadataWorldId", snapshot.worldId());
+                request.addProperty("metadataVersion", snapshot.version());
+                request.addProperty("metadataTerm", snapshot.term());
+                var members = new com.google.gson.JsonArray(); members.add(member.toString());
+                request.add("departingClientIds", members);
+                var regions = new com.google.gson.JsonArray();
+                regions.add(new imsng.player_to_player.registry.SplitRegion("minecraft:overworld",
+                        2048, 2048, 2048, 2048).toJson());
+                request.add("regions", regions);
+                Files.writeString(probe.resolve(phase + "-arm"), "arm");
+                waitUntil("中心真实检查点进入可控写入等待: " + phase, Duration.ofSeconds(10),
+                        () -> Files.isRegularFile(probe.resolve(phase + "-armed")));
+                CompletableFuture<ControlMessage> reply = source.remote.request(
+                        ControlMessage.of(MessageType.SPLIT_REQUEST, request));
+                reply.whenComplete((message, failure) -> {
+                    if (message != null) source.trace("split_probe_" + phase + "_reply", message);
+                    else source.traceFailure(failure);
+                });
+                try {
+                    assertThrows(TimeoutException.class, () -> reply.get(500, TimeUnit.MILLISECONDS),
+                            () -> "检查点在途应排队等待；过早返回的实际响应: "
+                                    + reply.handle((message, failure) -> failure != null ? failure.toString()
+                                            : message == null ? "null" : message.type() + " " + message.json())
+                                    .getNow("pending"));
+                } finally {
+                    Files.writeString(probe.resolve(phase + "-release"), "release");
+                }
+                ControlMessage result = reply.get(15, TimeUnit.SECONDS);
+                assertEquals(MessageType.SPLIT_ACK, result.type(), result.json().toString());
+                assertEquals(phase.equals("prepare") ? "prepared" : "committed",
+                        result.json().get("phase").getAsString(), result.json().toString());
+            }
+            assertEquals("primary", assigned.get(15, TimeUnit.SECONDS).json().get("role").getAsString());
+        } finally {
+            // 失败也必须解除测试注入的写入等待，否则后续停服会卡在同一个检查点。
+            Files.writeString(probe.resolve("prepare-release"), "release");
+            Files.writeString(probe.resolve("commit-release"), "release");
+            follower.close();
+        }
+        source.sync();
     }
 
     /** 每个实例对应一位父客户端；没有借用 WorkerProcess 的进程级单例，两个计算 JVM 真正并行运行。 */
@@ -394,9 +476,10 @@ class MetadataProcessSmokeTest {
                     private long samples;
                     public void onInitialize() {
                         net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents.END_SERVER_TICK.register(server -> {
-                            if (server.overworld() == null || ++samples % 5 != 0) return;
                             try {
                                 var root = net.fabricmc.loader.api.FabricLoader.getInstance().getGameDir();
+                                splitCheckpointProbe(root);
+                                if (server.overworld() == null || ++samples % 5 != 0) return;
                                 var json = new com.google.gson.JsonObject();
                                 json.addProperty("sample", samples / 5);
                                 json.addProperty("dayTime", server.overworld().getDayTime());
@@ -411,6 +494,54 @@ class MetadataProcessSmokeTest {
                                     java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
                             } catch (Exception failure) { throw new IllegalStateException(failure); }
                         });
+                    }
+
+                    // 测试专用：只控制真实checkpoint的完成时机，并准备一个没有区块的离组成员。
+                    // 分离请求仍走ControlServer注册的生产入口，不能用测试lambda替换迁移许可。
+                    private static void splitCheckpointProbe(java.nio.file.Path root) throws Exception {
+                        var probe = root.resolve("metadata-split-probe");
+                        if (!java.nio.file.Files.isDirectory(probe)) return;
+                        var current = imsng.player_to_player.metadata.MetadataService.class.getDeclaredField("current");
+                        current.setAccessible(true);
+                        var service = current.get(null);
+                        if (service == null) return;
+                        if (java.nio.file.Files.isRegularFile(probe.resolve("member.json"))
+                                && !java.nio.file.Files.exists(probe.resolve("member-added"))) {
+                            var member = imsng.player_to_player.util.JsonUtil.parseObject(
+                                    java.nio.file.Files.readString(probe.resolve("member.json")));
+                            var groupsField = service.getClass().getDeclaredField("groups"); groupsField.setAccessible(true);
+                            var groups = (imsng.player_to_player.server.GroupTable) groupsField.get(service);
+                            if (!groups.addSecondary(java.util.UUID.fromString(member.get("source").getAsString()),
+                                    java.util.UUID.fromString(member.get("member").getAsString())))
+                                throw new IllegalStateException("probe source group missing");
+                            java.nio.file.Files.writeString(probe.resolve("member-added"), "ready");
+                        }
+                        for (String phase : java.util.List.of("prepare", "commit")) {
+                            if (!java.nio.file.Files.exists(probe.resolve(phase + "-arm"))
+                                    || java.nio.file.Files.exists(probe.resolve(phase + "-submitted"))) continue;
+                            var field = service.getClass().getDeclaredField("checkpoints"); field.setAccessible(true);
+                            Object writer = field.get(service);
+                            var drain = writer.getClass().getDeclaredMethod("drain"); drain.setAccessible(true); drain.invoke(writer);
+                            var storeField = service.getClass().getDeclaredField("store"); storeField.setAccessible(true);
+                            var store = (imsng.player_to_player.metadata.MetadataStore) storeField.get(service);
+                            var writeType = Class.forName("imsng.player_to_player.metadata.MetadataCheckpointWriter$Write");
+                            Object write = java.lang.reflect.Proxy.newProxyInstance(writeType.getClassLoader(),
+                                    new Class<?>[] { writeType }, (proxy, method, args) -> {
+                                        if (!method.getName().equals("run")) throw new UnsupportedOperationException(method.getName());
+                                        java.nio.file.Files.writeString(probe.resolve(phase + "-armed"), "waiting");
+                                        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(20);
+                                        while (!java.nio.file.Files.exists(probe.resolve(phase + "-release"))) {
+                                            if (System.nanoTime() >= deadline) throw new java.io.IOException("split checkpoint probe timed out");
+                                            Thread.sleep(10);
+                                        }
+                                        var changes = new net.minecraft.nbt.CompoundTag();
+                                        changes.putString("__p2pSplitCheckpointProbe", phase);
+                                        return store.checkpointChanges(changes, java.util.Set.of());
+                                    });
+                            var submit = writer.getClass().getDeclaredMethod("submit", writeType); submit.setAccessible(true);
+                            java.nio.file.Files.writeString(probe.resolve(phase + "-submitted"), "submitted");
+                            if (!Boolean.TRUE.equals(submit.invoke(writer, write))) throw new IllegalStateException("probe checkpoint not submitted");
+                        }
                     }
                 }
                 """, StandardCharsets.UTF_8);

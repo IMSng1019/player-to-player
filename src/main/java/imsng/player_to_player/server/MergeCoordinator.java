@@ -187,7 +187,10 @@ public final class MergeCoordinator {
                 new MergeCoordinator(config, registry, groups, computes, players, permissions);
         reg.on(MessageType.MERGE_REQUEST, coordinator::handleMergeRequest);
         reg.on(MessageType.MERGE_PROGRESS, coordinator::handleProgress);
-        reg.on(MessageType.SPLIT_REQUEST, coordinator::handleSplitRequest);
+        // 分离入口先排到中心主线程并发布已有元数据检查点，再获取本协调器锁。
+        // 若直接在入站线程检查 isPending，合法的持续远离可能因每轮撞上检查点而饥饿。
+        reg.on(MessageType.SPLIT_REQUEST,
+                imsng.player_to_player.metadata.MetadataService.orderedTransferHandler(coordinator::handleSplitRequest));
         reg.on(MessageType.GROUP_WORLD_READY, coordinator::handleGroupWorldReady);
         return coordinator;
     }
@@ -571,7 +574,8 @@ public final class MergeCoordinator {
      */
     private synchronized void handleSplitRequest(ControlConnection conn, ControlMessage msg) {
         UUID source = conn.peerId();
-        if ("prepare".equals(JsonUtil.getString(msg.json(), "phase", ""))) {
+        String phase = JsonUtil.getString(msg.json(), "phase", "");
+        if ("prepare".equals(phase) || "source_ready".equals(phase)) {
             if (groupUnavailable.test(source)) {
                 conn.send(error(msg, "group_exiting", "组正在完成主客户端退出交接，暂不允许分离"));
                 return;

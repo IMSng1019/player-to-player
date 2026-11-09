@@ -23,6 +23,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.Ticket;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.chunk.ChunkStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -85,6 +86,8 @@ public final class SplitMonitor {
 
     /** 膨胀边距（"周围4格的周围4格" = 四邻十字形扩张两次 = 曼哈顿距离 2）。 */
     private static final int MARGIN_CHUNKS = 2;
+    /** 已生成区块重新加载仍需实体与光照邻域；保守留四圈，不能把活跃边缘当成历史世代外圈。 */
+    private static final int RELOAD_EDGE_CHUNKS = 4;
 
     /** 源端准备过久时请求回滚；仍须排空旧holder后才能重连，服务端超时会展示明确失败界面。 */
     private static final long DRAIN_TIMEOUT_MILLIS = 60_000;
@@ -101,6 +104,8 @@ public final class SplitMonitor {
 
     /** 同一个宿主一次只处理一个分离事务，避免两个分量同时争用票据/所有权边界。 */
     private static volatile SplitOperation activeSplit;
+    /** 终态已确认且本地加载围栏已解除后，才允许中心把暂离的源组玩家送回原 worker。 */
+    private static SplitOperation pendingSourceResume;
 
     private static final class SplitOperation {
         final UUID splitId = UUID.randomUUID();
@@ -110,6 +115,9 @@ public final class SplitMonitor {
         final UUID groupId;
         final String signature;
         final Map<UUID, ServerPlayer> departing;
+        final Map<UUID, ServerPlayer> participants;
+        final boolean reloadSource;
+        final Map<UUID, ChunkKey> participantLocations;
         final List<SplitRegion> regions;
         final Map<UUID, CompletableFuture<Void>> finalUploads = new HashMap<>();
         final long started = System.currentTimeMillis();
@@ -118,6 +126,7 @@ public final class SplitMonitor {
         long metadataVersion;
         volatile boolean cancelRequested;
         boolean prepared;
+        boolean sourceReloadConfirmed;
         boolean drainStarted;
         boolean ownsTickFreeze;
         boolean metadataFlushPending;
@@ -129,6 +138,7 @@ public final class SplitMonitor {
 
         SplitOperation(MinecraftServer server, ControlConnection connection, ChunkClaimClient claims,
                        UUID groupId, String signature, Map<UUID, ServerPlayer> departing,
+                       Map<UUID, ServerPlayer> participants, boolean reloadSource,
                        List<SplitRegion> regions, MetadataSnapshot metadata) {
             this.server = server;
             this.connection = connection;
@@ -136,6 +146,13 @@ public final class SplitMonitor {
             this.groupId = groupId;
             this.signature = signature;
             this.departing = Map.copyOf(departing);
+            this.participants = Map.copyOf(participants);
+            this.reloadSource = reloadSource;
+            Map<UUID, ChunkKey> locations = new HashMap<>();
+            participants.forEach((id, player) -> locations.put(id, new ChunkKey(
+                    player.serverLevel().dimension().location().toString(),
+                    player.chunkPosition().x, player.chunkPosition().z)));
+            this.participantLocations = Map.copyOf(locations);
             this.regions = List.copyOf(regions);
             this.metadataWorldId = metadata.worldId();
             this.metadataTerm = metadata.term();
@@ -155,6 +172,7 @@ public final class SplitMonitor {
         deferredDiagnostics.clear();
         inFlight.clear();
         activeSplit = null;
+        pendingSourceResume = null;
     }
 
     /**
@@ -162,6 +180,10 @@ public final class SplitMonitor {
      * 调用方已确认 server 是被接管的集成服务端）。
      */
     public static void tick(MinecraftServer server) {
+        if (pendingSourceResume != null) {
+            resumeSource(pendingSourceResume);
+            return;
+        }
         if (activeSplit != null) {
             // prepare应答可能等待数秒；此时玩家仍在旧世界活动，必须继续观察接近或成员变化。
             // 只采样和撤销旧资格，不允许第二笔事务；prepared后玩家已开始离组，按事务推进即可。
@@ -313,40 +335,67 @@ public final class SplitMonitor {
         MetadataSnapshot metadata = MetadataClient.snapshot();
         List<SplitRegion> departingDemand = new ArrayList<>();
         List<SplitRegion> remainingDemand = new ArrayList<>();
+        List<SplitRegion> departingReloadDemand = new ArrayList<>();
+        List<SplitRegion> remainingReloadDemand = new ArrayList<>();
         Map<UUID, ServerPlayer> departing = new HashMap<>();
+        Map<UUID, ServerPlayer> allPlayers = new HashMap<>();
         // 实际claim岛覆盖已发生的依赖，额外需求矩形覆盖准备消息在途时尚未补齐的世代边缘。
         int radius = viewDistance + ChunkStatus.maxDistance() + 2;
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            UUID id = canonicalId(player);
+            if (id == null) { inFlight.remove(signature); return; }
+            allPlayers.put(id, player);
             SplitRegion demand = playerDemand(player, radius);
+            SplitRegion reloadDemand = playerDemand(player, viewDistance + RELOAD_EDGE_CHUNKS);
             if (component.contains(player)) {
-                UUID id = canonicalId(player);
-                if (id == null) { inFlight.remove(signature); return; }
                 departing.put(id, player);
                 departingDemand.add(demand);
+                departingReloadDemand.add(reloadDemand);
             } else {
                 remainingDemand.add(demand);
+                remainingReloadDemand.add(reloadDemand);
             }
         }
         java.util.Optional<List<SplitRegion>> planned;
+        Set<ChunkKey> tracked = claims.trackedKeysSnapshot();
+        List<SplitRegion> specialTickets;
         try {
-            planned = SplitRegionPlan.plan(claims.trackedKeysSnapshot(), departingDemand,
-                    remainingDemand, specialTicketRegions(server));
+            specialTickets = specialTicketRegions(server);
+            planned = SplitRegionPlan.plan(tracked, departingDemand, remainingDemand, specialTickets);
         } catch (IllegalArgumentException | IllegalStateException unsafeTickets) {
             inFlight.remove(signature);
             logDeferred(signature, "无法安全规划特殊票据范围: " + unsafeTickets);
             return;
         }
+        boolean reloadSource = false;
+        if (planned.isEmpty() && SplitRegionPlan.reloadDemandSeparated(departingReloadDemand, remainingReloadDemand)) {
+            String notReady = reloadReadinessProblem(server, viewDistance);
+            if (notReady != null) {
+                inFlight.remove(signature);
+                logDeferred(signature, "等待普通加载范围完整生成后重建源组", notReady);
+                return;
+            }
+            List<SplitRegion> allDemand = new ArrayList<>(departingDemand);
+            allDemand.addAll(remainingDemand);
+            planned = SplitRegionPlan.planReload(tracked, allDemand, specialTickets);
+            reloadSource = planned.isPresent();
+        }
         if (planned.isEmpty()) {
             inFlight.remove(signature);
-            logDeferred(signature, "完整加载岛仍与留组需求或特殊票据相连，或尚无可交接的占用区域");
+            // 把实际规划输入留在计算进程日志中；只写“区域相连”无法区分生成依赖边缘、
+            // 旧占用尚未释放和传送门等特殊票据，容易把不同延期原因误认为距离计时失效。
+            logDeferred(signature, "完整加载岛尚不可交接", "tracked=" + tracked.size()
+                    + " departing=" + departingDemand + " remaining=" + remainingDemand
+                    + " specialTickets=" + specialTickets);
             return;
         }
         SplitOperation operation = new SplitOperation(server, conn, claims, groupId,
-                signature, departing, planned.get(), metadata);
+                signature, departing, reloadSource ? allPlayers : departing,
+                reloadSource, planned.get(), metadata);
         // 必须在发prepare前登记：离组端收到服务端通知后可能比prepared应答更早断线。
         activeSplit = operation;
-        LOGGER.info("分离开始准备: split={} 离组人数={} 完整区域={}",
-                operation.splitId, departing.size(), operation.regions);
+        LOGGER.info("分离开始准备: split={} 离组人数={} 重建源组加载={} 暂离人数={} 完整区域={}",
+                operation.splitId, departing.size(), reloadSource, operation.participants.size(), operation.regions);
         sendPhase(operation, "prepare");
     }
 
@@ -358,6 +407,34 @@ public final class SplitMonitor {
         ChunkPos pos = player.chunkPosition();
         return new SplitRegion(player.serverLevel().dimension().location().toString(),
                 pos.x - radius, pos.x + radius, pos.z - radius, pos.z + radius);
+    }
+
+    /**
+     * 重载的前提是普通 PLAYER 加载需求已经有完整 FULL 数据，而非只完成了玩家中心
+     * 一块。否则排空会取消外缘生成，重连又从 ProtoChunk 开始生成十二圈依赖，再次把
+     * 两组连接。此处仅做主线程只读检查；最终耐久性仍由正常卸载写回和 ACK 保证。
+     */
+    private static String reloadReadinessProblem(MinecraftServer server, int viewDistance) {
+        int radius = viewDistance + 2; // PLAYER 31 → FULL 33 的两圈原版必要依赖。
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (player.isSpectator() && !player.serverLevel().getGameRules()
+                    .getBoolean(GameRules.RULE_SPECTATORSGENERATECHUNKS)) continue;
+            ChunkPos center = player.chunkPosition();
+            var holders = ((ChunkMapSplitAccess) player.serverLevel().getChunkSource().chunkMap)
+                    .player_to_player$updatingChunks();
+            for (int x = center.x - radius; x <= center.x + radius; x++) {
+                for (int z = center.z - radius; z <= center.z + radius; z++) {
+                    var holder = holders.get(ChunkPos.asLong(x, z));
+                    var saved = holder == null ? null : holder.getChunkToSave();
+                    if (holder == null || holder.getFullChunk() == null || saved == null || !saved.isDone()
+                            || saved.isCompletedExceptionally() || saved.getNow(null) == null
+                            || saved.getNow(null).getStatus() != ChunkStatus.FULL) {
+                        return player.serverLevel().dimension().location() + " chunk=" + x + "," + z;
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     /**
@@ -390,7 +467,7 @@ public final class SplitMonitor {
     public static void onPlayerDisconnect(MinecraftServer server, ServerPlayer player) {
         SplitOperation operation = activeSplit;
         if (operation == null || operation.server != server) return;
-        for (Map.Entry<UUID, ServerPlayer> departing : operation.departing.entrySet()) {
+        for (Map.Entry<UUID, ServerPlayer> departing : operation.participants.entrySet()) {
             if (departing.getValue() != player) continue;
             PlayerStateUploadService uploads = GroupRuntime.playerUploads();
             if (uploads == null) {
@@ -400,6 +477,13 @@ public final class SplitMonitor {
             ChunkKey location = new ChunkKey(player.serverLevel().dimension().location().toString(),
                     player.chunkPosition().x, player.chunkPosition().z);
             if (!operation.contains(location)) operation.cancelRequested = true;
+            if (operation.reloadSource && !location.equals(operation.participantLocations.get(departing.getKey()))) {
+                // 准备通知在途时仍可能发生传送/跨区块移动；原先验证为FULL的范围此时
+                // 已不覆盖新落点。保留最终玩家状态并回滚重连，不能提交后再制造生成桥。
+                operation.cancelRequested = true;
+                LOGGER.info("重建源组期间玩家已离开准备区块，完成写回后取消分离: split={} player={}",
+                        operation.splitId, departing.getKey());
+            }
             try {
                 CompletableFuture<Void> saved = uploads.offerConfirmed(departing.getKey(),
                         player.saveWithoutId(new CompoundTag()));
@@ -448,12 +532,12 @@ public final class SplitMonitor {
         }
         boolean playersGone = server.getPlayerList().getPlayers().stream().noneMatch(player -> {
             UUID id = canonicalId(player);
-            return operation.departing.containsValue(player)
-                    || (id != null && operation.departing.containsKey(id));
+            return operation.participants.containsValue(player)
+                    || (id != null && operation.participants.containsKey(id));
         });
         boolean claimsGone = operation.claims.isSplitDrained();
         boolean holdersGone = holdersDrained(operation);
-        boolean playersSaved = operation.finalUploads.size() == operation.departing.size()
+        boolean playersSaved = operation.finalUploads.size() == operation.participants.size()
                 && operation.finalUploads.values().stream()
                 .allMatch(future -> future.isDone() && !future.isCompletedExceptionally());
         if (playersGone && claimsGone && holdersGone && (playersSaved || operation.cancelRequested)) {
@@ -505,6 +589,7 @@ public final class SplitMonitor {
             request.addProperty("metadataVersion", metadata.version());
         }
         if ("prepare".equals(phase)) {
+            request.addProperty("reloadSource", operation.reloadSource);
             JsonArray members = new JsonArray();
             operation.departing.keySet().forEach(id -> members.add(id.toString()));
             request.add("departingClientIds", members);
@@ -551,6 +636,10 @@ public final class SplitMonitor {
             return;
         }
         String phase = JsonUtil.getString(reply.json(), "phase", "");
+        // prepare的应答可能丢失；后续status直接返回终态时仍需恢复源组重连义务。
+        // 只接受本次明确请求过的能力，且确认单调，不让迟到的旧应答取消已承担的义务。
+        operation.sourceReloadConfirmed |= operation.reloadSource
+                && JsonUtil.getBoolean(reply.json(), "reloadSource", false);
         operation.resolveStatus = false;
         if ("committed".equals(phase)) {
             finishSplit(operation, true, true);
@@ -568,11 +657,12 @@ public final class SplitMonitor {
                 boolean sameBarrier = operation.metadataWorldId.equals(JsonUtil.getString(reply.json(),
                         "metadataWorldId", operation.metadataWorldId))
                         && operation.metadataTerm == JsonUtil.getLong(reply.json(), "metadataTerm", operation.metadataTerm);
-                if (metadataProblem != null || !sameBarrier || "cancel_requested".equals(phase)) {
+                if (metadataProblem != null || !sameBarrier || "cancel_requested".equals(phase)
+                        || (operation.reloadSource && !operation.sourceReloadConfirmed)) {
                     operation.cancelRequested = true;
                     operation.nextRequestAt = System.currentTimeMillis();
                     LOGGER.warn("分离尚未开始区域排空，取消失效准备: split={} reason={}", operation.splitId,
-                            metadataProblem != null ? metadataProblem : "准备任期变化或中心已请求取消");
+                            metadataProblem != null ? metadataProblem : "准备任期变化、中心请求取消或未确认全组重新加载能力");
                     return;
                 }
                 // 先冻结并提交模拟字段，再允许卸载它们所属区块。否则注册表释放后中心可能
@@ -592,6 +682,11 @@ public final class SplitMonitor {
         if (operation.drainStarted) operation.claims.cancelSplitDrain();
         if (operation.ownsTickFreeze && !GroupRuntime.isExitDraining()) GroupRuntime.setTickFrozen(false);
         activeSplit = null;
+        if (operation.sourceReloadConfirmed && resetCandidates && !GroupRuntime.isExitDraining()) {
+            pendingSourceResume = operation;
+            operation.requestInFlight = false;
+            operation.nextRequestAt = 0;
+        }
         inFlight.remove(operation.signature);
         if (resetCandidates) {
             candidates.clear();
@@ -602,12 +697,56 @@ public final class SplitMonitor {
                 committed ? "提交完成" : "已回滚", operation.splitId, operation.departing.size());
     }
 
+    /**
+     * 整组暂离后恢复的是同一个 worker。必须在收到终态、解除本地加载围栏之后再请求
+     * 重连；中心提前发 ROLE_ASSIGN 会使本地主玩家登录撞上自己的 splitDrainRegion。
+     * 应答丢失只重放相同事务，中心和客户端分别保持组表及连接意图幂等。
+     */
+    private static void resumeSource(SplitOperation operation) {
+        if (!GroupRuntime.isManagedServer(operation.server) || GroupRuntime.isExitDraining()
+                || GroupRuntime.conn() != operation.connection || !operation.connection.isOpen()) {
+            pendingSourceResume = null;
+            return;
+        }
+        if (operation.requestInFlight || System.currentTimeMillis() < operation.nextRequestAt) return;
+        operation.requestInFlight = true;
+        JsonObject request = new JsonObject();
+        request.addProperty("phase", "source_ready");
+        request.addProperty("splitId", operation.splitId.toString());
+        request.addProperty("groupId", operation.groupId.toString());
+        try {
+            operation.connection.request(ControlMessage.of(MessageType.SPLIT_REQUEST, request))
+                    .whenComplete((reply, failure) -> operation.server.execute(() -> {
+                        if (pendingSourceResume != operation) return;
+                        operation.requestInFlight = false;
+                        if (failure == null && reply != null && reply.type() == MessageType.SPLIT_ACK
+                                && JsonUtil.getBoolean(reply.json(), "sourceResumed", false)) {
+                            pendingSourceResume = null;
+                            LOGGER.info("分离后源组加载恢复已通知: split={} group={}", operation.splitId, operation.groupId);
+                        } else {
+                            operation.nextRequestAt = System.currentTimeMillis() + 2_000;
+                            logDeferred(operation.signature, "等待源组恢复确认", failure != null ? failure.toString()
+                                    : reply == null ? "无应答" : reply.json().toString());
+                        }
+                    }));
+        } catch (RuntimeException failure) {
+            operation.requestInFlight = false;
+            operation.nextRequestAt = System.currentTimeMillis() + 2_000;
+            logDeferred(operation.signature, "等待源组恢复确认", failure.toString());
+        }
+    }
+
     private static void logDeferred(String signature, String reason) {
+        logDeferred(signature, reason, "");
+    }
+
+    /** 按稳定的原因节流；区块数/位置变化只更新诊断详情，不能使每轮重试都刷日志。 */
+    private static void logDeferred(String signature, String reason, String detail) {
         long now = System.nanoTime() / 1_000_000;
         DeferredDiagnostic previous = deferredDiagnostics.get(signature);
         if (previous != null && previous.reason().equals(reason) && now - previous.loggedAt() < 30_000) return;
         deferredDiagnostics.put(signature, new DeferredDiagnostic(reason, now));
-        LOGGER.info("分离延期，保持原组运行并短间隔重试: members={} reason={}", signature, reason);
+        LOGGER.info("分离延期，保持原组运行并短间隔重试: members={} reason={} {}", signature, reason, detail);
     }
 
     /** 本地真实运行对象是最终依据，不能把中心最近一次字段报告当作当前复活中间态的证明。 */

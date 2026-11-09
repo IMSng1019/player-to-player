@@ -123,11 +123,14 @@ public final class WorldSession {
 
     /** 分离等待只属于当前物理服会话；迟到通知不能把其他世界切走。 */
     private static volatile UUID pendingSplit;
+    /** 只有明确要求源组重载的分离才能复用本机 worker；普通晋升/退出不得借此重连旧主。 */
+    private static volatile UUID pendingSourceReload;
     private static volatile long pendingSplitDeadline;
     private static final GroupHandoffPreparation HANDOFF_PREPARATION = new GroupHandoffPreparation();
 
     private static void clearPendingTransition() {
         pendingSplit = null;
+        pendingSourceReload = null;
         HANDOFF_PREPARATION.clear();
     }
 
@@ -140,6 +143,7 @@ public final class WorldSession {
             source = UUID.fromString(JsonUtil.getString(message.json(), "groupId", ""));
         } catch (IllegalArgumentException invalid) { return; }
         boolean primaryExit = "primary_exit".equals(JsonUtil.getString(message.json(), "reason", ""));
+        boolean reloadSource = JsonUtil.getBoolean(message.json(), "reloadSource", false);
         Minecraft client = Minecraft.getInstance();
         client.execute(() -> {
             NodeContext context = NodeContext.get();
@@ -154,6 +158,7 @@ public final class WorldSession {
                             && (client.level != null || HANDOFF_PREPARATION.isPrepared())) {
                         accepted = HANDOFF_PREPARATION.prepare(id, source, () -> {
                             pendingSplit = id;
+                            pendingSourceReload = null;
                             pendingSplitDeadline = System.currentTimeMillis() + 180_000;
                             SwitchTelemetry.begin("primary_exit", id.toString());
                             // 必须先在切换作用域内断开旧游戏连接，保留中心控制会话；
@@ -174,14 +179,23 @@ public final class WorldSession {
                 conn.send(message.reply(MessageType.SPLIT_PREPARE, acknowledgement, null));
                 return;
             }
-            if (!isCurrentConnection(conn) || context.clientRole() != ClientRole.SECONDARY
+            // 完整加载岛相连时，中心会要求源组全部玩家暂离，连原主的游戏连接也要关闭。
+            // 原主只能关闭其当前 worker 对应的游戏连接；计算进程和中心连接仍负责最终
+            // 写回/排空，不能误走退出或再次创建一个写者。普通分离仍只通知副客户端。
+            boolean sourcePrimary = reloadSource && context.clientRole() == ClientRole.PRIMARY
+                    && source.equals(context.clientId()) && WorkerProcess.isManagedWorld()
+                    && source.equals(WorkerProcess.activeGroupId()) && WorkerProcess.connection() == conn
+                    && !ClientExitCoordinator.isActive();
+            if (!isCurrentConnection(conn)
+                    || (context.clientRole() != ClientRole.SECONDARY && !sourcePrimary)
                     || !source.equals(context.groupId()) || id.equals(pendingSplit)) return;
             HANDOFF_PREPARATION.prepareSplit(id, source, () -> {
                 pendingSplit = id;
+                pendingSourceReload = sourcePrimary ? id : null;
                 pendingSplitDeadline = System.currentTimeMillis() + 180_000;
                 SwitchTelemetry.begin("split", id.toString());
-                // 全体离组成员都先关闭旧游戏连接（包括尚未指定的新副客户端），
-                // 这样原组的 PLAYER 票据才能撤销，避免等待新主就绪的循环依赖。
+                // 普通分离关闭离组成员；源组重载还包括原主与留组成员。所有被通知的
+                // 玩家都先撤销 PLAYER 票据，避免等待新主就绪的循环依赖。
                 // 与退出使用同一状态机，迟到的普通分离不能覆盖更优先的退出等待。
                 WorldSwitcher.disconnectForSwitchNow(client);
                 client.setScreen(new JoinProgressScreen());
@@ -721,7 +735,7 @@ public final class WorldSession {
         String role = JsonUtil.getString(msg.json(), "role", "");
         if (!"secondary".equals(role) && !"primary".equals(role)) return;
         NodeContext ctx = NodeContext.get();
-        if ("primary".equals(role) && ctx.clientRole() == ClientRole.PRIMARY) return;
+        boolean reuseWorker = JsonUtil.getBoolean(msg.json(), "reuseWorker", false);
         UUID assignedGroup;
         UUID primary;
         try {
@@ -732,10 +746,23 @@ public final class WorldSession {
         if (transaction == null) return;
         String assignedTransaction = JsonUtil.getString(msg.json(), "splitId", "");
         if (!assignedTransaction.isEmpty() && !transaction.toString().equals(assignedTransaction)) return;
+        if (reuseWorker) {
+            // 中心只有收到原 worker 解锁后的 source_ready 才会发送此分支。必须带精确
+            // 事务号，并且只能恢复本轮已暂离的同源原主，不能把一般角色指派当作复用许可。
+            if (!"primary".equals(role) || !primary.equals(assignedGroup)
+                    || !transaction.toString().equals(assignedTransaction)
+                    || !isSourceReloadCurrent(conn, transaction, assignedGroup)) return;
+        } else if ("primary".equals(role) && ctx.clientRole() == ClientRole.PRIMARY) {
+            return;
+        }
         // 跟随新主的旧协议没有splitId，绑定当前等待；退出等待仍禁止重连原source。
         // 在隧道准备阶段保留旧组身份，退出通知才能核对来源并接替尚未登录的回滚。
         var intent = HANDOFF_PREPARATION.reserveConnection(transaction, assignedGroup);
         if (intent == null) return;
+        if (reuseWorker) {
+            resumeSourceWorker(conn, transaction, assignedGroup, intent);
+            return;
+        }
         if ("secondary".equals(role)) {
             ThreadPools.startBlocking("split-follow", () -> {
                 try {
@@ -773,6 +800,53 @@ public final class WorldSession {
             } catch (Exception e) {
                 LOGGER.error("分离晋升前准备权威玩家状态失败", e);
                 failConnectionIntent(conn, intent, "准备分离后的世界失败，请检查日志后重新连接。");
+            }
+        });
+    }
+
+    /** 原主重连的三重绑定：当前控制会话、明确暂离事务、仍在运行的同源计算实例。 */
+    private static boolean isSourceReloadCurrent(ControlConnection conn, UUID transaction, UUID group) {
+        NodeContext context = NodeContext.get();
+        return isCurrentConnection(conn) && transaction.equals(pendingSplit)
+                && transaction.equals(pendingSourceReload) && context.clientRole() == ClientRole.PRIMARY
+                && group.equals(context.clientId()) && group.equals(context.groupId())
+                && WorkerProcess.isManagedWorld() && group.equals(WorkerProcess.activeGroupId())
+                && WorkerProcess.connection() == conn && !ClientExitCoordinator.isActive();
+    }
+
+    /**
+     * 源组排空后复用原 worker。这里只更新运行中元数据并重新建立房主的本地登录桥，
+     * 不调用 prepareAuthoritativeWorld/launchPrepared，不覆盖仍打开的世界文件或另开写者。
+     * 后台准备不消耗连接意图；最终原版登录仍紧邻渲染线程上的 beginConnecting。
+     */
+    private static void resumeSourceWorker(ControlConnection conn, UUID transaction, UUID group,
+                                           GroupHandoffPreparation.ConnectionIntent intent) {
+        ThreadPools.startBlocking("split-source-resume", () -> {
+            try {
+                if (!isSourceReloadCurrent(conn, transaction, group)
+                        || !HANDOFF_PREPARATION.isCurrentConnection(intent)) return;
+                WorkerProcess.synchronizeMetadata().get(30, TimeUnit.SECONDS);
+                if (!isSourceReloadCurrent(conn, transaction, group)
+                        || !HANDOFF_PREPARATION.isCurrentConnection(intent)) return;
+                int bridgePort = WorkerProcess.openLocalPlayerBridge();
+                Minecraft client = Minecraft.getInstance();
+                client.execute(() -> {
+                    // 换服、取消等待、原主真正退出或新交接接替，都使旧后台结果失效。
+                    if (!isSourceReloadCurrent(conn, transaction, group)
+                            || !HANDOFF_PREPARATION.beginConnecting(intent)) return;
+                    try {
+                        LOGGER.info("源组分离排空已完成，原主复用现有计算进程重连: split={} group={}",
+                                transaction, group);
+                        WorldSwitcher.markTunnelPort(bridgePort);
+                        WorldSwitcher.switchToTunnel(client, bridgePort, NodeContext.get().playerName());
+                    } catch (RuntimeException failure) {
+                        LOGGER.error("分离后原主恢复游戏连接失败", failure);
+                        failConnectionIntent(conn, intent, "无法恢复原组游戏连接，请检查日志后重新连接。");
+                    }
+                });
+            } catch (Exception failure) {
+                LOGGER.error("分离后原主复用计算进程准备失败", failure);
+                failConnectionIntent(conn, intent, "无法恢复原组游戏连接，请检查日志后重新连接。");
             }
         });
     }

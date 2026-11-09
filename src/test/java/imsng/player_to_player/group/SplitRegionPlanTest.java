@@ -58,6 +58,48 @@ class SplitRegionPlanTest {
                 List.of(region(0, 5, 0, 5)), List.of(), List.of()).isEmpty());
     }
 
+    @Test
+    void generationBridgeCanBeReservedWholeWithoutPretendingItIsAlreadyTwoIslands() {
+        Set<ChunkKey> tracked = rectangle(-23, 55, -24, 57);
+        List<SplitRegion> demand = List.of(region(-24, 24, -25, 23), region(8, 56, 10, 58));
+        assertTrue(SplitRegionPlan.plan(tracked, List.of(demand.get(1)),
+                List.of(demand.get(0)), List.of()).isEmpty());
+        List<SplitRegion> rebuilt = SplitRegionPlan.planReload(tracked, demand, List.of()).orElseThrow();
+        assertEquals(List.of(region(-24, 56, -25, 58)), rebuilt,
+                "必须把留组区域和生成桥一起预约，等全部旧玩家/holder退出后才提交");
+        assertTrue(tracked.stream().allMatch(key -> rebuilt.stream().anyMatch(r -> r.contains(key))));
+    }
+
+    @Test
+    void fullReloadCannotDropIndependentTicketsOrAnUnboundedReservation() {
+        Set<ChunkKey> tracked = Set.of(new ChunkKey(DIM, 0, 0), new ChunkKey(DIM, 20, 20));
+        List<SplitRegion> demand = List.of(region(0, 0, 0, 0), region(20, 20, 20, 20));
+        assertTrue(SplitRegionPlan.planReload(tracked, demand,
+                List.of(new SplitRegion("minecraft:the_end", 0, 0, 0, 0))).isEmpty(),
+                "玩家断开不能撤销独立的传送门/强加载票据，即使位于其他维度也不能假定全组会排空");
+        assertTrue(SplitRegionPlan.planReload(tracked,
+                List.of(region(0, 0, 0, 0), region(2000, 2000, 0, 0)), List.of()).isEmpty());
+        assertTrue(SplitRegionPlan.planReload(Set.of(), demand, List.of()).isEmpty());
+    }
+
+    @Test
+    void fullReloadReservesEachDimensionSeparately() {
+        Set<ChunkKey> tracked = Set.of(new ChunkKey(DIM, 0, 0), new ChunkKey("minecraft:the_nether", 8, 8));
+        List<SplitRegion> result = SplitRegionPlan.planReload(tracked,
+                List.of(region(-1, 1, -1, 1)), List.of()).orElseThrow();
+        assertEquals(2, result.size());
+        assertTrue(tracked.stream().allMatch(key -> result.stream().anyMatch(r -> r.contains(key))));
+    }
+
+    @Test
+    void reloadDoesNotResolveAnOverlapOfTheNecessaryLiveLoadingEdges() {
+        SplitRegion source = region(-14, 14, -15, 13);
+        assertFalse(SplitRegionPlan.reloadDemandSeparated(List.of(region(10, 38, -14, 14)),
+                List.of(source)), "必需边缘仍相连时不应反复断开玩家再合并");
+        assertTrue(SplitRegionPlan.reloadDemandSeparated(List.of(region(18, 46, 20, 48)),
+                List.of(source)), "现场坐标的必需边缘可分开，只有历史12格世代依赖仍把两方连接");
+    }
+
     private static SplitRegion region(int minX, int maxX, int minZ, int maxZ) {
         return new SplitRegion(DIM, minX, maxX, minZ, maxZ);
     }

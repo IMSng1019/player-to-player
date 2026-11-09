@@ -1,7 +1,6 @@
 package imsng.player_to_player.runtime;
 
 import java.io.IOException;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -228,8 +227,7 @@ public final class RuntimeInstallation {
     }
 
     private static void move(Path from, Path to) throws IOException {
-        try { Files.move(from, to, StandardCopyOption.ATOMIC_MOVE); }
-        catch (AtomicMoveNotSupportedException unsupported) { Files.move(from, to); }
+        RuntimeDirectoryMove.move(from, to);
     }
 
     /** 仅清理本次创建且已验证的暂存树，不跟随链接，不递归清理用户存档或旧运行目录。 */
